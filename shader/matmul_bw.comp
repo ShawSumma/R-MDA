@@ -1,0 +1,50 @@
+#version 450
+// Backward of c[m, n] = a[m, k] @ b[k, n], given dc[m, n]:
+//   mode == 0: da[m, k] = dc[m, n] @ b[k, n]^T   (sum_n dc[m, n] * b[k, n])
+//   mode == 1: db[k, n] = a[m, k]^T @ dc[m, n]   (sum_m a[m, k] * dc[m, n])
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer buf_a {
+    float a[];
+};
+layout(std430, binding = 1) readonly buffer buf_b {
+    float b[];
+};
+layout(std430, binding = 2) readonly buffer buf_dc {
+    float dc[];
+};
+layout(std430, binding = 3) writeonly buffer buf_dout {
+    float dout[];
+};
+layout(push_constant) uniform pc {
+    uint m;
+    uint n;
+    uint k;
+    uint mode;
+};
+
+void main() {
+    if (mode == 0) {
+        uint row = gl_GlobalInvocationID.y;
+        uint col = gl_GlobalInvocationID.x;
+        if (row >= m || col >= k) {
+            return;
+        }
+        float acc = 0.0;
+        for (uint j = 0; j < n; j++) {
+            acc += dc[row * n + j] * b[col * n + j];
+        }
+        dout[row * k + col] = acc;
+    } else {
+        uint row = gl_GlobalInvocationID.y;
+        uint col = gl_GlobalInvocationID.x;
+        if (row >= k || col >= n) {
+            return;
+        }
+        float acc = 0.0;
+        for (uint i = 0; i < m; i++) {
+            acc += a[i * k + row] * dc[i * n + col];
+        }
+        dout[row * n + col] = acc;
+    }
+}

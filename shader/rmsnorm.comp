@@ -1,0 +1,86 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+// RMSNorm over the last dim, per row. y = x / rms(x) * g, rms = sqrt(mean(x^2)+eps).
+// One workgroup per row; threads cooperate on the reduction over d.
+//   op 0: forward.   reads x[row, d], g[d]; writes y[row, d]; stashes rms in rms_buf[row].
+//   op 1: backward.  reads x, g, dy (in y buffer), rms_buf; writes dx (in x buffer)
+//         and accumulates dg (atomic add into g_grad).
+// dx_i = (g_i*dy_i)/r - (x_i/(r^3 * D)) * sum_k(x_k * g_k * dy_k)
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer buf_x {
+    float x[];
+};
+layout(std430, binding = 1) buffer buf_g {
+    float g[];
+};
+layout(std430, binding = 2) buffer buf_y {
+    float y[];
+};
+layout(std430, binding = 3) buffer buf_rms {
+    float rms_buf[];
+};
+layout(std430, binding = 4) buffer buf_dg {
+    float dg[];
+};
+layout(push_constant) uniform pc {
+    uint rows;
+    uint d;
+    uint op;
+};
+
+shared float red[256];
+
+float reduce_sum(float v, uint lid) {
+    red[lid] = v;
+    barrier();
+    for (uint o = 128; o > 0; o >>= 1) {
+        if (lid < o) {
+            red[lid] += red[lid + o];
+        }
+        barrier();
+    }
+    return red[0];
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (row >= rows) {
+        return;
+    }
+    uint base = row * d;
+
+    float ss = 0.0;
+    for (uint i = lid; i < d; i += 256) {
+        ss += x[base + i] * x[base + i];
+    }
+    ss = reduce_sum(ss, lid);
+    float r = sqrt(ss / float(d) + 1e-5);
+
+    if (op == 0) {
+        if (lid == 0) {
+            rms_buf[row] = r;
+        }
+        for (uint i = lid; i < d; i += 256) {
+            y[base + i] = x[base + i] / r * g[i];
+        }
+    } else {
+        r = rms_buf[row];
+        // s = sum_k x_k * g_k * dy_k
+        float s = 0.0;
+        for (uint i = lid; i < d; i += 256) {
+            s += x[base + i] * g[i] * y[base + i];
+        }
+        s = reduce_sum(s, lid);
+        for (uint i = lid; i < d; i += 256) {
+            float dyi = y[base + i];
+            float xi = x[base + i];
+            float dgi = xi / r * dyi;
+            x[base + i] = (g[i] * dyi) / r - xi / (r * r * r * float(d)) * s;
+            // accumulate dg across rows via non-atomic per-row write is unsafe;
+            // host zeroes dg and we add with atomic.
+            atomicAdd(dg[i], dgi);
+        }
+    }
+}

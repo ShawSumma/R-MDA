@@ -1,0 +1,93 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+// Masked cross-entropy for diffusion denoising. One workgroup per row (position).
+// logits[row, vocab]; target[row] = true token id; mask[row] = 1 on masked positions
+// (where loss is counted), 0 elsewhere; weight[row] = 1/t loss weight.
+//   op 0 forward:  per-row softmax, loss[row] = -mask*weight*log(p[target]).
+//                  Also writes grad into logits in-place: dlogits = mask*weight*(p - onehot).
+//   The forward already produces the gradient (CE has a clean closed form), so there
+//   is no separate backward kernel -- logits buffer holds dlogits on return.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer buf_logits {
+    float logits[];
+};
+layout(std430, binding = 1) readonly buffer buf_target {
+    uint target[];
+};
+layout(std430, binding = 2) readonly buffer buf_mask {
+    float mask[];
+};
+layout(std430, binding = 3) readonly buffer buf_weight {
+    float weight[];
+};
+layout(std430, binding = 4) buffer buf_loss {
+    float loss[];
+};
+layout(push_constant) uniform pc {
+    uint rows;
+    uint vocab;
+};
+
+shared float red[256];
+
+float reduce_max(float v, uint lid) {
+    red[lid] = v;
+    barrier();
+    for (uint o = 128; o > 0; o >>= 1) {
+        if (lid < o) {
+            red[lid] = max(red[lid], red[lid + o]);
+        }
+        barrier();
+    }
+    return red[0];
+}
+
+float reduce_sum(float v, uint lid) {
+    red[lid] = v;
+    barrier();
+    for (uint o = 128; o > 0; o >>= 1) {
+        if (lid < o) {
+            red[lid] += red[lid + o];
+        }
+        barrier();
+    }
+    return red[0];
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (row >= rows) {
+        return;
+    }
+    uint base = row * vocab;
+
+    float mx = -1e30;
+    for (uint i = lid; i < vocab; i += 256) {
+        mx = max(mx, logits[base + i]);
+    }
+    mx = reduce_max(mx, lid);
+
+    float se = 0.0;
+    for (uint i = lid; i < vocab; i += 256) {
+        se += exp(logits[base + i] - mx);
+    }
+    se = reduce_sum(se, lid);
+    float logz = mx + log(se);
+
+    float m = mask[row];
+    float wt = weight[row];
+    uint tgt = target[row];
+
+    if (lid == 0) {
+        float logp_tgt = logits[base + tgt] - logz;
+        loss[row] = -m * wt * logp_tgt;
+    }
+    // gradient: dlogits_i = m * wt * (softmax_i - [i == tgt])
+    for (uint i = lid; i < vocab; i += 256) {
+        float p = exp(logits[base + i] - logz);
+        float oneh = (i == tgt) ? 1.0 : 0.0;
+        logits[base + i] = m * wt * (p - oneh);
+    }
+}

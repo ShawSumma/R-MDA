@@ -1,0 +1,45 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+// Token + position embedding. ids laid out flat as [b, t] (row = b*seqlen + t).
+//   op 0 forward:  out[row, :] = tok_emb[ids[row], :] + pos_emb[row % seqlen, :]
+//   op 1 backward: scatter dout (in out buffer) into tok_emb and pos_emb grads
+//                  (atomic add; a token id and a position may repeat across rows).
+// On backward the tok_emb/pos_emb buffers hold gradient accumulators (host zeroes).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer buf_ids {
+    uint ids[];
+};
+layout(std430, binding = 1) buffer buf_tok {
+    float tok_emb[];
+};
+layout(std430, binding = 2) buffer buf_pos {
+    float pos_emb[];
+};
+layout(std430, binding = 3) buffer buf_out {
+    float outp[];
+};
+layout(push_constant) uniform pc {
+    uint bt;
+    uint d;
+    uint seqlen;
+    uint op;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= bt * d) {
+        return;
+    }
+    uint row = idx / d;
+    uint col = idx % d;
+    uint t = row % seqlen;
+    uint tok = ids[row];
+    if (op == 0) {
+        outp[idx] = tok_emb[tok * d + col] + pos_emb[t * d + col];
+    } else {
+        float g = outp[idx];
+        atomicAdd(tok_emb[tok * d + col], g);
+        atomicAdd(pos_emb[t * d + col], g);
+    }
+}

@@ -1,0 +1,59 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+// adaLN-Zero modulation: h[b, t, c] = x[b, t, c] * (1 + scale[b, c]) + shift[b, c].
+// scale/shift are per (batch, channel) -- broadcast across the sequence (t).
+//   op 0 forward:  out = x * (1 + scale) + shift.
+//   op 1 backward: given dout (in out buffer), write
+//       dx = dout * (1 + scale)                 (into dx buffer)
+//       dscale[b, c] += sum_t dout * x          (atomic over t)
+//       dshift[b, c] += sum_t dout              (atomic over t)
+// One invocation per (b*t, c). seqlen lets us map row -> batch.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer buf_x {
+    float x[];
+};
+layout(std430, binding = 1) readonly buffer buf_scale {
+    float scale[];
+};
+layout(std430, binding = 2) readonly buffer buf_shift {
+    float shift[];
+};
+layout(std430, binding = 3) buffer buf_out {
+    float outp[];
+};
+layout(std430, binding = 4) buffer buf_dx {
+    float dx[];
+};
+layout(std430, binding = 5) buffer buf_dscale {
+    float dscale[];
+};
+layout(std430, binding = 6) buffer buf_dshift {
+    float dshift[];
+};
+layout(push_constant) uniform pc {
+    uint bt;
+    uint d;
+    uint seqlen;
+    uint op;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= bt * d) {
+        return;
+    }
+    uint row = idx / d;
+    uint col = idx % d;
+    uint b = row / seqlen;
+    uint sc_idx = b * d + col;
+
+    if (op == 0) {
+        outp[idx] = x[idx] * (1.0 + scale[sc_idx]) + shift[sc_idx];
+    } else {
+        float dout = outp[idx];
+        dx[idx] = dout * (1.0 + scale[sc_idx]);
+        atomicAdd(dscale[sc_idx], dout * x[idx]);
+        atomicAdd(dshift[sc_idx], dout);
+    }
+}
