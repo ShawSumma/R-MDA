@@ -56,7 +56,7 @@ static inline void vkc_ck(VkResult vkc_r, const char *file, size_t line) {
 static uint32_t vkc_memtype(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags want) {
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(pd, &mp);
-    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i = i + 1) {
         if ((bits & (1u << i)) != 0 && (mp.memoryTypes[i].propertyFlags & want) == want) {
             return i;
         }
@@ -99,7 +99,7 @@ static vkc_t vkc_init(void) {
     VkQueueFamilyProperties *qf = malloc(nqf * sizeof(VkQueueFamilyProperties));
     vkGetPhysicalDeviceQueueFamilyProperties(c.pd, &nqf, qf);
     c.qfi = 0;
-    for (uint32_t i = 0; i < nqf; i++) {
+    for (uint32_t i = 0; i < nqf; i = i + 1) {
         if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
             c.qfi = i;
             break;
@@ -214,7 +214,7 @@ static vkc_kernel_t vkc_load(vkc_t *c, const char *spv, uint32_t nbuf, uint32_t 
     VKC_CK(vkCreateShaderModule(c->dev, &smi, 0, &sm));
 
     VkDescriptorSetLayoutBinding *b = calloc(nbuf, sizeof(VkDescriptorSetLayoutBinding));
-    for (uint32_t i = 0; i < nbuf; i++) {
+    for (uint32_t i = 0; i < nbuf; i = i + 1) {
         b[i] = (VkDescriptorSetLayoutBinding) {
             .binding = i,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -271,7 +271,7 @@ static void vkc_run(vkc_t *c, vkc_kernel_t *k, vkc_buf_t **bufs, uint32_t gx, ui
 
     VkWriteDescriptorSet *w = calloc(k->nbuf, sizeof(VkWriteDescriptorSet));
     VkDescriptorBufferInfo *bi = calloc(k->nbuf, sizeof(VkDescriptorBufferInfo));
-    for (uint32_t i = 0; i < k->nbuf; i++) {
+    for (uint32_t i = 0; i < k->nbuf; i = i + 1) {
         bi[i] = (VkDescriptorBufferInfo) {
             .buffer = bufs[i]->buf,
             .range = bufs[i]->sz,

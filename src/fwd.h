@@ -17,59 +17,89 @@
 typedef struct fwd_scratch fwd_scratch_t;
 
 struct fwd_scratch {
-    vkc_buf_t x;             // [bt, d] running residual stream
-    vkc_buf_t cond;          // [b, d] timestep conditioning
-    vkc_buf_t tmp;           // [bt, d] scratch
-    vkc_buf_t tmp2;          // [bt, d] scratch
-    vkc_buf_t pre;           // [bt, hidden] elem stash / ffn scratch
-    vkc_buf_t hbuf;          // [bt, hidden] ffn hidden
-    vkc_buf_t rms_stash;     // [bt] rms values
-    vkc_buf_t dg_dummy;      // [d] unused grad sink for rmsnorm fwd
+    // [bt, d] running residual stream
+    vkc_buf_t x;
+    // [b, d] timestep conditioning
+    vkc_buf_t cond;
+    // [bt, d] scratch
+    vkc_buf_t tmp;
+    // [bt, d] scratch
+    vkc_buf_t tmp2;
+    // [bt, hidden] elem stash / ffn scratch
+    vkc_buf_t pre;
+    // [bt, hidden] ffn hidden
+    vkc_buf_t hbuf;
+    // [bt] rms values
+    vkc_buf_t rms_stash;
+    // [d] unused grad sink for rmsnorm fwd
+    vkc_buf_t dg_dummy;
     // wkv per-(b,head,t,dh) packed buffers
     vkc_buf_t pk;
     vkc_buf_t pv;
     vkc_buf_t pr;
     vkc_buf_t pw;
     vkc_buf_t pa;
-    vkc_buf_t po;            // wkv output packed (forward direction)
-    vkc_buf_t po2;           // wkv output packed (backward direction, bidirectional)
-    vkc_buf_t sstate;        // saved states for bwd (forward pass)
-    vkc_buf_t sstate2;       // saved states for bwd (backward pass)
+    // wkv output packed (forward direction)
+    vkc_buf_t po;
+    // wkv output packed (backward direction, bidirectional)
+    vkc_buf_t po2;
+    // saved states for bwd (forward pass)
+    vkc_buf_t sstate;
+    // saved states for bwd (backward pass)
+    vkc_buf_t sstate2;
     // logits + loss
-    vkc_buf_t logits;        // [bt, vocab]
-    vkc_buf_t logits_save;   // [bt, vocab] pre-CE snapshot (for inference)
-    vkc_buf_t loss;          // [bt]
+    // [bt, vocab]
+    vkc_buf_t logits;
+    // [bt, vocab] pre-CE snapshot (for inference)
+    vkc_buf_t logits_save;
+    // [bt]
+    vkc_buf_t loss;
     // batch inputs (as gpu buffers)
     vkc_buf_t ids;
     vkc_buf_t target;
     vkc_buf_t mask;
     vkc_buf_t weight;
     // backward scratch
-    vkc_buf_t dx_head;       // [bt, d]
-    vkc_buf_t dnorm;         // [bt, d]
-    vkc_buf_t dtmp;          // [bt, d]
-    vkc_buf_t dtmp2;         // [bt, d]
-    vkc_buf_t dh;            // [bt, hid]
-    vkc_buf_t dh2;           // [bt, hid]
+    // [bt, d]
+    vkc_buf_t dx_head;
+    // [bt, d]
+    vkc_buf_t dnorm;
+    // [bt, d]
+    vkc_buf_t dtmp;
+    // [bt, d]
+    vkc_buf_t dtmp2;
+    // [bt, hid]
+    vkc_buf_t dh;
+    // [bt, hid]
+    vkc_buf_t dh2;
     vkc_buf_t dpk;
     vkc_buf_t dpv;
     vkc_buf_t dpr;
     vkc_buf_t dpw;
     vkc_buf_t dpa;
-    vkc_buf_t dpk2;          // second-direction WKV grads (bidirectional)
+    // second-direction WKV grads (bidirectional)
+    vkc_buf_t dpk2;
     vkc_buf_t dpv2;
     vkc_buf_t dpr2;
     vkc_buf_t dpw2;
     vkc_buf_t dpa2;
-    vkc_buf_t dwkv;          // [bt, d]
-    float *dxh;              // host: grad of residual stream (legacy)
-    vkc_buf_t dxh_buf;       // [bt, d] grad of residual stream, kept on GPU
+    // [bt, d]
+    vkc_buf_t dwkv;
+    // host: grad of residual stream (legacy)
+    float *dxh;
+    // [bt, d] grad of residual stream, kept on GPU
+    vkc_buf_t dxh_buf;
     // adaLN timestep conditioning scratch
-    vkc_buf_t ada6;          // [batch, 6d] projection of cond
-    vkc_buf_t dada6;         // [batch, 6d] its gradient
-    vkc_buf_t dcond;         // [batch, d] grad of cond
-    vkc_buf_t ada_scale;     // [batch, d] extracted scale slice
-    vkc_buf_t ada_shift;     // [batch, d] extracted shift slice
+    // [batch, 6d] projection of cond
+    vkc_buf_t ada6;
+    // [batch, 6d] its gradient
+    vkc_buf_t dada6;
+    // [batch, d] grad of cond
+    vkc_buf_t dcond;
+    // [batch, d] extracted scale slice
+    vkc_buf_t ada_scale;
+    // [batch, d] extracted shift slice
+    vkc_buf_t ada_shift;
 };
 
 static fwd_scratch_t fwd_alloc(model_t *m) {
@@ -257,9 +287,9 @@ static void pack_heads(model_t *m, vkc_buf_t *src, vkc_buf_t *dst) {
     uint32_t dh = d / hd;
     float *s = src->ptr;
     float *o = dst->ptr;
-    for (uint32_t b = 0; b < cfg.batch; b++) {
-        for (uint32_t h = 0; h < hd; h++) {
-            for (uint32_t t = 0; t < cfg.seqlen; t++) {
+    for (uint32_t b = 0; b < cfg.batch; b = b + 1) {
+        for (uint32_t h = 0; h < hd; h = h + 1) {
+            for (uint32_t t = 0; t < cfg.seqlen; t = t + 1) {
                 uint32_t src_i = (b * cfg.seqlen + t) * d + h * dh;
                 uint32_t dst_i = ((b * hd + h) * cfg.seqlen + t) * dh;
                 memcpy(o + dst_i, s + src_i, dh * sizeof(float));
@@ -275,9 +305,9 @@ static void unpack_heads(model_t *m, vkc_buf_t *src, vkc_buf_t *dst) {
     uint32_t dh = d / hd;
     float *s = src->ptr;
     float *o = dst->ptr;
-    for (uint32_t b = 0; b < cfg.batch; b++) {
-        for (uint32_t h = 0; h < hd; h++) {
-            for (uint32_t t = 0; t < cfg.seqlen; t++) {
+    for (uint32_t b = 0; b < cfg.batch; b = b + 1) {
+        for (uint32_t h = 0; h < hd; h = h + 1) {
+            for (uint32_t t = 0; t < cfg.seqlen; t = t + 1) {
                 uint32_t dst_i = (b * cfg.seqlen + t) * d + h * dh;
                 uint32_t src_i = ((b * hd + h) * cfg.seqlen + t) * dh;
                 memcpy(o + dst_i, s + src_i, dh * sizeof(float));
@@ -289,7 +319,7 @@ static void unpack_heads(model_t *m, vkc_buf_t *src, vkc_buf_t *dst) {
 // sigmoid/clamp a buffer in place on the host (for w in (0,1), a in (0,1))
 static void host_sigmoid(vkc_buf_t *b, uint32_t n) {
     float *p = b->ptr;
-    for (uint32_t i = 0; i < n; i++) {
+    for (uint32_t i = 0; i < n; i = i + 1) {
         p[i] = 1.0f / (1.0f + expf(-p[i]));
     }
 }
@@ -299,14 +329,14 @@ static void host_sigmoid(vkc_buf_t *b, uint32_t n) {
 // projection (eigenvalues in [0, a]); without it the state recurrence diverges.
 static void host_norm_heads(vkc_buf_t *buf, uint32_t n_vec, uint32_t dh) {
     float *p = buf->ptr;
-    for (uint32_t v = 0; v < n_vec; v++) {
+    for (uint32_t v = 0; v < n_vec; v = v + 1) {
         float *vec = p + v * dh;
         float ss = 0.0f;
-        for (uint32_t e = 0; e < dh; e++) {
+        for (uint32_t e = 0; e < dh; e = e + 1) {
             ss += vec[e] * vec[e];
         }
         float inv = 1.0f / (sqrtf(ss) + 1e-6f);
-        for (uint32_t e = 0; e < dh; e++) {
+        for (uint32_t e = 0; e < dh; e = e + 1) {
             vec[e] *= inv;
         }
     }
@@ -315,15 +345,15 @@ static void host_norm_heads(vkc_buf_t *buf, uint32_t n_vec, uint32_t dh) {
 // same, but also store each per-head vector's 1/||.|| into inv_norm[v]. The
 // backward of k_hat = k/||k|| needs this scale: dk = (dk_hat - k_hat*(k_hat.dk_hat))/||k||.
 static void host_norm_heads_save(float *p, float *inv_norm, uint32_t n_vec, uint32_t dh) {
-    for (uint32_t v = 0; v < n_vec; v++) {
+    for (uint32_t v = 0; v < n_vec; v = v + 1) {
         float *vec = p + v * dh;
         float ss = 0.0f;
-        for (uint32_t e = 0; e < dh; e++) {
+        for (uint32_t e = 0; e < dh; e = e + 1) {
             ss += vec[e] * vec[e];
         }
         float inv = 1.0f / (sqrtf(ss) + 1e-6f);
         inv_norm[v] = inv;
-        for (uint32_t e = 0; e < dh; e++) {
+        for (uint32_t e = 0; e < dh; e = e + 1) {
             vec[e] *= inv;
         }
     }
@@ -342,7 +372,8 @@ static void rmsnorm_fwd(model_t *m, vkc_buf_t *x, vkc_buf_t *g, vkc_buf_t *out,
         g,
         out,
         stash,
-        &m->layers[0].n1->w,   // dg sink, unused on fwd
+        // dg sink, unused on fwd
+        &m->layers[0].n1->w,
     };
     vkc_run(m->c, &m->k_rms, bufs, rows, 1, 1, &pc);
 }
@@ -376,7 +407,7 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
     //  plain pre-norm RWKV. The adaLN path is wired but cond=0 means no-op.)
 
     // 2. blocks
-    for (uint32_t l = 0; l < cfg.n_layer; l++) {
+    for (uint32_t l = 0; l < cfg.n_layer; l = l + 1) {
         mlayer_t *ly = &m->layers[l];
 
         // --- time mixing ---
@@ -460,7 +491,8 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
             &sc->sstate2,
         };
         vkc_run(m->c, &m->k_wkv_f, wb2, cfg.batch * hd, 1, 1, &wpc2);
-        vec_op(m, &sc->po, &sc->po2, bt * d, 3);  // average the two directions
+        // average the two directions
+        vec_op(m, &sc->po, &sc->po2, bt * d, 3);
         // unpack po -> tmp2 ([bt, d])
         gpu_repack(m, &sc->po, &sc->tmp2, bt, hd, dh, cfg.seqlen, 1);
         // output projection wo, add residual: x += wo(tmp2)
@@ -468,7 +500,7 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         {
             float *x = sc->x.ptr;
             float *o = sc->tmp.ptr;
-            for (uint32_t i = 0; i < bt * d; i++) {
+            for (uint32_t i = 0; i < bt * d; i = i + 1) {
                 x[i] += o[i];
             }
         }
@@ -491,7 +523,7 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         {
             float *hb = sc->hbuf.ptr;
             float *up = sc->pre.ptr;
-            for (uint32_t i = 0; i < bt * cfg.ffn_hidden; i++) {
+            for (uint32_t i = 0; i < bt * cfg.ffn_hidden; i = i + 1) {
                 hb[i] = hb[i] * up[i];
             }
         }
@@ -500,7 +532,7 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         {
             float *x = sc->x.ptr;
             float *o = sc->tmp2.ptr;
-            for (uint32_t i = 0; i < bt * d; i++) {
+            for (uint32_t i = 0; i < bt * d; i = i + 1) {
                 x[i] += o[i];
             }
         }
@@ -532,7 +564,7 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
     float *mk = sc->mask.ptr;
     double total = 0.0;
     double cnt = 0.0;
-    for (uint32_t i = 0; i < bt; i++) {
+    for (uint32_t i = 0; i < bt; i = i + 1) {
         total += lp[i];
         cnt += mk[i];
     }

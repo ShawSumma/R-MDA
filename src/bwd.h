@@ -9,14 +9,15 @@
 #include "fwd.h"
 
 // matmul backward helper: given dC, produce dA (mode 0) and accumulate dB into g.
-static void mm_dA(model_t *m, vkc_buf_t *b, vkc_buf_t *dc, vkc_buf_t *da,
-    uint32_t rows, uint32_t n, uint32_t k) {
-    struct {
-        uint32_t m;
-        uint32_t n;
-        uint32_t k;
-        uint32_t mode;
-    } pc = {
+static void mm_dA(
+    model_t *m,
+    vkc_buf_t *b,
+    vkc_buf_t *dc,
+    vkc_buf_t *da,
+    uint32_t rows,
+    uint32_t n,
+    uint32_t k) {
+    mm_bw_pc_t pc = {
         .m = rows,
         .n = n,
         .k = k,
@@ -31,14 +32,15 @@ static void mm_dA(model_t *m, vkc_buf_t *b, vkc_buf_t *dc, vkc_buf_t *da,
     vkc_run(m->c, &m->k_mm_bw, bufs, (k + 15) / 16, (rows + 15) / 16, 1, &pc);
 }
 
-static void mm_dB(model_t *m, vkc_buf_t *a, vkc_buf_t *dc, vkc_buf_t *db,
-    uint32_t rows, uint32_t n, uint32_t k) {
-    struct {
-        uint32_t m;
-        uint32_t n;
-        uint32_t k;
-        uint32_t mode;
-    } pc = {
+static void mm_dB(
+    model_t *m,
+    vkc_buf_t *a,
+    vkc_buf_t *dc,
+    vkc_buf_t *db,
+    uint32_t rows,
+    uint32_t n,
+    uint32_t k) {
+    mm_bw_pc_t pc = {
         .m = rows,
         .n = n,
         .k = k,
@@ -61,8 +63,8 @@ static void mm_dB(model_t *m, vkc_buf_t *a, vkc_buf_t *dc, vkc_buf_t *db,
 static void host_add(vkc_buf_t *dst, vkc_buf_t *src, uint32_t n) {
     float *d = dst->ptr;
     float *s = src->ptr;
-    for (uint32_t i = 0; i < n; i++) {
-        d[i] += s[i];
+    for (uint32_t i = 0; i < n; i = i + 1) {
+        d[i] = d[i] + s[i];
     }
 }
 

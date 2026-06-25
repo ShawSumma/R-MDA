@@ -9,14 +9,17 @@
 #include <math.h>
 
 #define M_VOCAB 256
-#define M_VOCAB_IN 257       // + MASK id
+// vocab fed to the model: the 256 byte values plus one MASK id.
+#define M_VOCAB_IN 257
 #define M_DIFF_STEPS 1000
-#define M_MAX_PARAMS 256     // registry capacity
+// registry capacity (max distinct parameter tensors).
+#define M_MAX_PARAMS 256
 
 typedef struct mcfg mcfg_t;
 
 struct mcfg {
-    uint32_t d;              // model dim
+    // model dim
+    uint32_t d;
     uint32_t n_layer;
     uint32_t n_head;
     uint32_t seqlen;
@@ -32,8 +35,42 @@ struct param {
     vkc_buf_t g;
     vkc_buf_t m;
     vkc_buf_t v;
-    uint32_t n;             // element count
+    // element count
+    uint32_t n;
     const char *name;
+};
+
+// Push constants for the AdamW kernel: one update over n elements.
+typedef struct adam_pc adam_pc_t;
+
+struct adam_pc {
+    uint32_t n;
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float wd;
+    float bc1;
+    float bc2;
+};
+
+// Push constants for the sum-of-squares kernel: op 0 reduces, op 1 scales by scale.
+typedef struct sumsq_pc sumsq_pc_t;
+
+struct sumsq_pc {
+    uint32_t n;
+    uint32_t op;
+    float scale;
+};
+
+// Push constants for the matmul-backward kernel: mode 0 makes dA, mode 1 makes dB.
+typedef struct mm_bw_pc mm_bw_pc_t;
+
+struct mm_bw_pc {
+    uint32_t m;
+    uint32_t n;
+    uint32_t k;
+    uint32_t mode;
 };
 
 typedef struct mlayer mlayer_t;
@@ -87,7 +124,7 @@ struct model {
 };
 
 static void randn_fill(float *p, uint32_t n, float std) {
-    for (uint32_t i = 0; i < n; i++) {
+    for (uint32_t i = 0; i < n; i = i + 1) {
         float u1 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
         float u2 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
         p[i] = std * sqrtf(-2.0f * logf(u1)) * cosf(6.2831853f * u2);
@@ -95,9 +132,14 @@ static void randn_fill(float *p, uint32_t n, float std) {
 }
 
 // register a new parameter (weights + grad + moments), returns a stable pointer.
-static param_t *param_new(model_t *m, uint32_t n, float init_std, float init_const,
+static param_t *param_new(
+    model_t *m,
+    uint32_t n,
+    float init_std,
+    float init_const,
     const char *name) {
-    param_t *p = &m->params[m->n_params++];
+    param_t *p = &m->params[m->n_params];
+    m->n_params = m->n_params + 1;
     p->n = n;
     p->name = name;
     p->w = vkc_alloc(m->c, n * sizeof(float));
@@ -108,7 +150,7 @@ static param_t *param_new(model_t *m, uint32_t n, float init_std, float init_con
     if (init_std > 0.0f) {
         randn_fill(wp, n, init_std);
     } else {
-        for (uint32_t i = 0; i < n; i++) {
+        for (uint32_t i = 0; i < n; i = i + 1) {
             wp[i] = init_const;
         }
     }
@@ -147,7 +189,7 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
     m->head = param_new(m, d * M_VOCAB, s, 0.0f, "head");
 
     m->layers = malloc(cfg.n_layer * sizeof(mlayer_t));
-    for (uint32_t l = 0; l < cfg.n_layer; l++) {
+    for (uint32_t l = 0; l < cfg.n_layer; l = l + 1) {
         mlayer_t *ly = &m->layers[l];
         ly->wk = param_new(m, d * d, s, 0.0f, "wk");
         ly->wv = param_new(m, d * d, s, 0.0f, "wv");
@@ -168,8 +210,8 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
 
 static uint64_t model_param_count(const model_t *m) {
     uint64_t total = 0;
-    for (uint32_t i = 0; i < m->n_params; i++) {
-        total += m->params[i].n;
+    for (uint32_t i = 0; i < m->n_params; i = i + 1) {
+        total = total + m->params[i].n;
     }
     return total;
 }

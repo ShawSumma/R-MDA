@@ -11,31 +11,53 @@
 typedef struct act act_t;
 
 struct act {
-    float *x_in;        // [bt*d] residual entering layer
-    float *n1;          // rmsnorm(x_in)
-    float *shift;       // tokenshift(n1)  (input to k/v/r/w/a projections)
-    float *pk;          // packed normalized k  [bt*d]
+    // [bt*d] residual entering layer
+    float *x_in;
+    // rmsnorm(x_in)
+    float *n1;
+    // tokenshift(n1)  (input to k/v/r/w/a projections)
+    float *shift;
+    // packed normalized k  [bt*d]
+    float *pk;
     float *pv;
     float *pr;
-    float *pw;          // sigmoid'd, packed
-    float *pa;          // sigmoid'd, packed
-    float *pw_pre;      // pre-sigmoid w (unpacked) for sigmoid' on bwd
+    // sigmoid'd, packed
+    float *pw;
+    // sigmoid'd, packed
+    float *pa;
+    // pre-sigmoid w (unpacked) for sigmoid' on bwd
+    float *pw_pre;
     float *pa_pre;
-    float *wkv;         // unpacked wkv output [bt*d]
-    float *x_mid;       // residual after time-mix
-    float *n2;          // rmsnorm(x_mid)
-    float *gate_pre;    // pre-silu gate [bt*hid]
-    float *gate;        // silu(gate)
-    float *up;          // up proj [bt*hid]
-    float *sstate;      // saved wkv states (forward pass)
-    float *sstate2;     // saved wkv states (backward pass, bidirectional)
-    float *rms1;        // rms value of the time-mix norm [bt]
-    float *rms2;        // rms value of the ffn norm [bt]
-    float *kinv;        // 1/||k_pre|| per (b,h,t) [bt*hd]
-    float *n1_pre;      // rmsnorm(x) BEFORE adaLN modulation (time-mix)
-    float *n2_pre;      // rmsnorm(x_mid) BEFORE adaLN modulation (ffn)
-    float *ada6;        // [batch, 6d] this block's modulation projection
-    float *cond;        // [batch, d] the timestep cond fed to this block's ada
+    // unpacked wkv output [bt*d]
+    float *wkv;
+    // residual after time-mix
+    float *x_mid;
+    // rmsnorm(x_mid)
+    float *n2;
+    // pre-silu gate [bt*hid]
+    float *gate_pre;
+    // silu(gate)
+    float *gate;
+    // up proj [bt*hid]
+    float *up;
+    // saved wkv states (forward pass)
+    float *sstate;
+    // saved wkv states (backward pass, bidirectional)
+    float *sstate2;
+    // rms value of the time-mix norm [bt]
+    float *rms1;
+    // rms value of the ffn norm [bt]
+    float *rms2;
+    // 1/||k_pre|| per (b,h,t) [bt*hd]
+    float *kinv;
+    // rmsnorm(x) BEFORE adaLN modulation (time-mix)
+    float *n1_pre;
+    // rmsnorm(x_mid) BEFORE adaLN modulation (ffn)
+    float *n2_pre;
+    // [batch, 6d] this block's modulation projection
+    float *ada6;
+    // [batch, d] the timestep cond fed to this block's ada
+    float *cond;
 };
 
 typedef struct trainer trainer_t;
@@ -44,9 +66,11 @@ struct trainer {
     model_t *m;
     fwd_scratch_t sc;
     act_t *acts;
-    float *x_final_n;   // rmsnorm(x) before head
+    // rmsnorm(x) before head
+    float *x_final_n;
     uint32_t step;
-    float last_raw_ce;  // unweighted mean CE on masked tokens (nats), low-noise metric
+    // unweighted mean CE on masked tokens (nats), low-noise metric
+    float last_raw_ce;
 };
 
 static float *halloc(uint32_t n) {
@@ -66,7 +90,7 @@ static trainer_t trainer_make(model_t *m) {
         .x_final_n = halloc(bt * d),
         .step = 0,
     };
-    for (uint32_t l = 0; l < cfg.n_layer; l++) {
+    for (uint32_t l = 0; l < cfg.n_layer; l = l + 1) {
         act_t *a = &tr.acts[l];
         a->x_in = halloc(bt * d);
         a->n1 = halloc(bt * d);
@@ -135,11 +159,12 @@ static void compute_cond(trainer_t *tr) {
     mcfg_t cfg = m->cfg;
     uint32_t d = cfg.d;
     float *wt = tr->sc.weight.ptr;
-    float *emb = tr->sc.tmp.ptr;        // reuse tmp as [batch, d] embedding staging
-    for (uint32_t b = 0; b < cfg.batch; b++) {
+    // reuse tmp as [batch, d] embedding staging
+    float *emb = tr->sc.tmp.ptr;
+    for (uint32_t b = 0; b < cfg.batch; b = b + 1) {
         float t = 1.0f / (wt[b * cfg.seqlen] + 1e-9f);
         float *row = emb + b * d;
-        for (uint32_t i = 0; i < d; i++) {
+        for (uint32_t i = 0; i < d; i = i + 1) {
             float freq = expf(-logf(10000.0f) * (float)(i / 2) / (float)(d / 2));
             float ang = t * freq;
             row[i] = ((i % 2) == 0) ? sinf(ang) : cosf(ang);
@@ -155,7 +180,7 @@ static void ada_slice(trainer_t *tr, uint32_t which, float *dst) {
     mcfg_t cfg = tr->m->cfg;
     uint32_t d = cfg.d;
     float *a6 = tr->sc.ada6.ptr;
-    for (uint32_t b = 0; b < cfg.batch; b++) {
+    for (uint32_t b = 0; b < cfg.batch; b = b + 1) {
         memcpy(dst + b * d, a6 + b * 6 * d + which * d, d * sizeof(float));
     }
 }
@@ -191,7 +216,7 @@ static float train_step(trainer_t *tr) {
     uint32_t nstate = cfg.batch * hd * cfg.seqlen * dh * dh;
 
     // zero all grads
-    for (uint32_t i = 0; i < m->n_params; i++) {
+    for (uint32_t i = 0; i < m->n_params; i = i + 1) {
         host_zero(&m->params[i].g, m->params[i].n);
     }
 
@@ -204,7 +229,7 @@ static float train_step(trainer_t *tr) {
     // its backward -- task #37). Computed but not yet consumed.
     compute_cond(tr);
 
-    for (uint32_t l = 0; l < cfg.n_layer; l++) {
+    for (uint32_t l = 0; l < cfg.n_layer; l = l + 1) {
         mlayer_t *ly = &m->layers[l];
         act_t *a = &tr->acts[l];
         buf_to_host(&sc->x, a->x_in, bt * d);
@@ -233,7 +258,8 @@ static float train_step(trainer_t *tr) {
         mm(m, &sc->tmp2, &ly->wa->w, &sc->pa, bt, d, d);
         buf_to_host(&sc->pw, a->pw_pre, bt * d);
         buf_to_host(&sc->pa, a->pa_pre, bt * d);
-        vec_op(m, &sc->pw, &sc->pw, bt * d, 2);   // sigmoid on GPU
+        // sigmoid on GPU
+        vec_op(m, &sc->pw, &sc->pw, bt * d, 2);
         vec_op(m, &sc->pa, &sc->pa, bt * d, 2);
 
         // pack k,v,r,w,a to [b,head,t,dh] on GPU, normalize k
@@ -263,20 +289,24 @@ static float train_step(trainer_t *tr) {
         buf_to_host(&sc->sstate2, a->sstate2, nstate);
 
         // combine the two directions: po += po2 (sum), then unpack
-        vec_op(m, &sc->po, &sc->po2, bt * d, 3);  // average the two directions
+        // average the two directions
+        vec_op(m, &sc->po, &sc->po2, bt * d, 3);
         gpu_repack(m, &sc->po, &sc->tmp2, bt, hd, dh, cfg.seqlen, 1);
         buf_to_host(&sc->tmp2, a->wkv, bt * d);
 
         // wo projection + residual
         mm(m, &sc->tmp2, &ly->wo->w, &sc->tmp, bt, d, d);
-        vec_op(m, &sc->x, &sc->tmp, bt * d, 0);   // x += wo(wkv)
+        // x += wo(wkv)
+        vec_op(m, &sc->x, &sc->tmp, bt * d, 0);
         buf_to_host(&sc->x, a->x_mid, bt * d);
 
         // ffn: n2 = rmsnorm(x_mid), then adaLN modulate (scale2=slot2, shift2=slot3)
         rmsnorm_fwd(m, &sc->x, &ly->n2->w, &sc->tmp, &sc->rms_stash, bt, d);
-        buf_to_host(&sc->tmp, a->n2_pre, bt * d);    // pre-adaLN (for adaln bwd)
+        // pre-adaLN (for adaln bwd)
+        buf_to_host(&sc->tmp, a->n2_pre, bt * d);
         ada_apply(tr, &sc->tmp, &sc->ada_scale, &sc->ada_shift, 2, 3);
-        buf_to_host(&sc->tmp, a->n2, bt * d);        // post-adaLN (ffn gate/up input)
+        // post-adaLN (ffn gate/up input)
+        buf_to_host(&sc->tmp, a->n2, bt * d);
         buf_to_host(&sc->rms_stash, a->rms2, bt);
         mm(m, &sc->tmp, &ly->w_gate->w, &sc->hbuf, bt, hid, d);
         buf_to_host(&sc->hbuf, a->gate_pre, bt * hid);
@@ -286,9 +316,11 @@ static float train_step(trainer_t *tr) {
         buf_to_host(&sc->hbuf, a->gate, bt * hid);
         mm(m, &sc->tmp, &ly->w_up->w, &sc->pre, bt, hid, d);
         buf_to_host(&sc->pre, a->up, bt * hid);
-        vec_op(m, &sc->hbuf, &sc->pre, bt * hid, 1);   // gate *= up
+        // gate *= up
+        vec_op(m, &sc->hbuf, &sc->pre, bt * hid, 1);
         mm(m, &sc->hbuf, &ly->w_down->w, &sc->tmp2, bt, d, hid);
-        vec_op(m, &sc->x, &sc->tmp2, bt * d, 0);        // x += down(h)
+        // x += down(h)
+        vec_op(m, &sc->x, &sc->tmp2, bt * d, 0);
     }
 
     // head
@@ -305,14 +337,17 @@ static float train_step(trainer_t *tr) {
     float *wt = sc->weight.ptr;
     double total = 0.0;
     double cnt = 0.0;
-    double raw = 0.0;   // unweighted CE on masked tokens (much less noisy than 1/t-weighted)
-    for (uint32_t i = 0; i < bt; i++) {
+    // unweighted CE on masked tokens (much less noisy than 1/t-weighted)
+    double raw = 0.0;
+    for (uint32_t i = 0; i < bt; i = i + 1) {
         total += lp[i];
         cnt += mk[i];
-        raw += lp[i] / (wt[i] + 1e-9);   // lp = mask*weight*CE -> /weight = mask*CE
+        // lp = mask*weight*CE -> /weight = mask*CE
+        raw += lp[i] / (wt[i] + 1e-9);
     }
     float loss = (float)(total / (cnt + 1e-6));
-    tr->last_raw_ce = (float)(raw / (cnt + 1e-6));   // mean unweighted CE (nats/masked-token)
+    // mean unweighted CE (nats/masked-token)
+    tr->last_raw_ce = (float)(raw / (cnt + 1e-6));
 
     // ===== BACKWARD =====
     // the loss is mean over masked tokens (total/cnt) but the CE kernel produced
@@ -320,24 +355,27 @@ static float train_step(trainer_t *tr) {
     {
         float inv = 1.0f / (float)(cnt + 1e-6);
         float *dl = sc->logits.ptr;
-        for (uint32_t i = 0; i < bt * M_VOCAB; i++) {
+        for (uint32_t i = 0; i < bt * M_VOCAB; i = i + 1) {
             dl[i] *= inv;
         }
     }
     // sc->logits now holds dlogits (the CE kernel wrote it).
     // head: logits = head(x_final_n).  d_head += x_final_n^T dlogits ; dx_n = dlogits head^T
-    host_to_buf(tr->x_final_n, &sc->tmp, bt * d);          // a = x_final_n
+    // a = x_final_n
+    host_to_buf(tr->x_final_n, &sc->tmp, bt * d);
     mm_dB(m, &sc->tmp, &sc->logits, &m->head->g, bt, M_VOCAB, d);
-    mm_dA(m, &m->head->w, &sc->logits, &sc->dx_head, bt, M_VOCAB, d);  // dx_n in dx_head
+    // dx_n in dx_head
+    mm_dA(m, &m->head->w, &sc->logits, &sc->dx_head, bt, M_VOCAB, d);
     // rmsnorm before head backward: x stream grad. need x (final residual) -> recompute? we
     // have a->x at last layer's x_mid + ffn add == sc->x currently still holds final x.
     // dy = dx_head, x = sc->x (final), gain = layers[0].n1
     host_to_buf(sc->dx_head.ptr, &sc->dnorm, bt * d);
     rmsnorm_bwd(m, &sc->x, &m->layers[0].n1->w, &sc->dnorm, &sc->rms_stash, &sc->dg_dummy, bt, d);
     // sc->x now holds dx (grad of final residual stream). copy to dx accumulator.
-    memcpy(sc->dxh_buf.ptr, sc->x.ptr, bt * d * sizeof(float));   // dxh_buf = grad of residual stream
+    // dxh_buf = grad of residual stream
+    memcpy(sc->dxh_buf.ptr, sc->x.ptr, bt * d * sizeof(float));
 
-    for (int li = (int)cfg.n_layer - 1; li >= 0; li--) {
+    for (int li = (int)cfg.n_layer - 1; li >= 0; li = li - 1) {
         mlayer_t *ly = &m->layers[li];
         act_t *a = &tr->acts[li];
 
@@ -350,22 +388,25 @@ static float train_step(trainer_t *tr) {
         //          h = gate*up ; out = w_down(h) ; x = x_mid + out
         // dxh is grad of x (== grad of x_mid via residual, plus grad through ffn path).
         // grad to out == dxh. d_w_down += h^T dxh ; dh = dxh w_down^T
-        host_to_buf(a->gate, &sc->hbuf, bt * hid);   // h_in = gate*up -> recompute
+        // h_in = gate*up -> recompute
+        host_to_buf(a->gate, &sc->hbuf, bt * hid);
         {
             float *hb = sc->hbuf.ptr;
-            for (uint32_t i = 0; i < bt * hid; i++) {
+            for (uint32_t i = 0; i < bt * hid; i = i + 1) {
                 hb[i] = a->gate[i] * a->up[i];
             }
         }
-        memcpy(sc->dtmp.ptr, sc->dxh_buf.ptr, bt * d * sizeof(float));      // dout = dxh
+        // dout = dxh
+        memcpy(sc->dtmp.ptr, sc->dxh_buf.ptr, bt * d * sizeof(float));
         mm_dB(m, &sc->hbuf, &sc->dtmp, &ly->w_down->g, bt, d, hid);
-        mm_dA(m, &ly->w_down->w, &sc->dtmp, &sc->dh, bt, d, hid);   // dh [bt,hid]
+        // dh [bt,hid]
+        mm_dA(m, &ly->w_down->w, &sc->dtmp, &sc->dh, bt, d, hid);
         // h = gate*up : d_gate = dh*up ; d_up = dh*gate
         {
             float *dh = sc->dh.ptr;
             float *dgate = sc->dh2.ptr;
             float *dup = sc->pre.ptr;
-            for (uint32_t i = 0; i < bt * hid; i++) {
+            for (uint32_t i = 0; i < bt * hid; i = i + 1) {
                 dgate[i] = dh[i] * a->up[i];
                 dup[i] = dh[i] * a->gate[i];
             }
@@ -373,10 +414,13 @@ static float train_step(trainer_t *tr) {
         // up = w_up(n2): d_w_up += n2^T dup ; dn2 += w_up^T dup
         host_to_buf(a->n2, &sc->tmp, bt * d);
         mm_dB(m, &sc->tmp, &sc->pre, &ly->w_up->g, bt, hid, d);
-        mm_dA(m, &ly->w_up->w, &sc->pre, &sc->dnorm, bt, hid, d);   // dn2 part1 -> dnorm
+        // dn2 part1 -> dnorm
+        mm_dA(m, &ly->w_up->w, &sc->pre, &sc->dnorm, bt, hid, d);
         // gate = silu(gate_pre): d_gate_pre = d_gate * silu'(gate_pre)
-        host_to_buf(a->gate_pre, &sc->hbuf, bt * hid);   // preact into hbuf
-        host_to_buf(sc->dh2.ptr, &sc->pre, bt * hid);    // d_gate into pre (grad)
+        // preact into hbuf
+        host_to_buf(a->gate_pre, &sc->hbuf, bt * hid);
+        // d_gate into pre (grad)
+        host_to_buf(sc->dh2.ptr, &sc->pre, bt * hid);
         {
             elem_pc_t bpc = (elem_pc_t) { .n = bt * hid, .op = 1 };
             vkc_buf_t *beb[2] = { &sc->pre, &sc->hbuf };
@@ -384,36 +428,43 @@ static float train_step(trainer_t *tr) {
         }
         // gate_pre = w_gate(n2): d_w_gate += n2^T d_gate_pre ; dn2 += w_gate^T d_gate_pre
         mm_dB(m, &sc->tmp, &sc->pre, &ly->w_gate->g, bt, hid, d);
-        mm_dA(m, &ly->w_gate->w, &sc->pre, &sc->dtmp2, bt, hid, d);  // dn2 part2
-        vec_op(m, &sc->dnorm, &sc->dtmp2, bt * d, 0);   // dn2 total (post-adaLN) in dnorm
+        // dn2 part2
+        mm_dA(m, &ly->w_gate->w, &sc->pre, &sc->dtmp2, bt, hid, d);
+        // dn2 total (post-adaLN) in dnorm
+        vec_op(m, &sc->dnorm, &sc->dtmp2, bt * d, 0);
         // adaLN backward for the ffn norm: n2 = n2_pre*(1+scale2)+shift2. dnorm holds
         // d_n2 (dout). Recover d_n2_pre (->dtmp) and scatter dscale2/dshift2 into the
         // per-block dada6 accumulator slots 2,3. (dada6 was zeroed at block start.)
         {
             float *a6 = a->ada6;
             float *scl = sc->ada_scale.ptr;
-            for (uint32_t b = 0; b < cfg.batch; b++) {
+            for (uint32_t b = 0; b < cfg.batch; b = b + 1) {
                 memcpy(scl + b * d, a6 + b * 6 * d + 2 * d, d * sizeof(float));
             }
             host_to_buf(a->n2_pre, &sc->tmp, bt * d);
-            host_zero(&sc->dtmp2, cfg.batch * d);          // dscale2 out
-            host_zero(&sc->dh2, cfg.batch * d);            // dshift2 out (dh2 is [bt,hid]>=d)
-            host_zero(&sc->dh, bt * d);                    // d_n2_pre out (separate)
+            // dscale2 out
+            host_zero(&sc->dtmp2, cfg.batch * d);
+            // dshift2 out (dh2 is [bt,hid]>=d)
+            host_zero(&sc->dh2, cfg.batch * d);
+            // d_n2_pre out (separate)
+            host_zero(&sc->dh, bt * d);
             adaln_pc_t apc = (adaln_pc_t) { .bt = bt, .d = d, .seqlen = cfg.seqlen, .op = 1 };
             vkc_buf_t *ab[7] = { &sc->tmp, &sc->ada_scale, &sc->ada_scale, &sc->dnorm, &sc->dh, &sc->dtmp2, &sc->dh2 };
             vkc_run(m->c, &m->k_adaln, ab, (bt * d + 255) / 256, 1, 1, &apc);
             float *dd = sc->dada6.ptr;
             float *dsc = sc->dtmp2.ptr;
             float *dsh = sc->dh2.ptr;
-            for (uint32_t b = 0; b < cfg.batch; b++) {
+            for (uint32_t b = 0; b < cfg.batch; b = b + 1) {
                 memcpy(dd + b * 6 * d + 2 * d, dsc + b * d, d * sizeof(float));
                 memcpy(dd + b * 6 * d + 3 * d, dsh + b * d, d * sizeof(float));
             }
-            memcpy(sc->dnorm.ptr, sc->dh.ptr, bt * d * sizeof(float));   // dnorm = d_n2_pre
+            // dnorm = d_n2_pre
+            memcpy(sc->dnorm.ptr, sc->dh.ptr, bt * d * sizeof(float));
         }
         // n2 = rmsnorm(x_mid): backward -> dx_mid. need x_mid in a buffer.
         host_to_buf(a->x_mid, &sc->tmp2, bt * d);
-        host_to_buf(sc->dnorm.ptr, &sc->dtmp, bt * d);  // dy
+        // dy
+        host_to_buf(sc->dnorm.ptr, &sc->dtmp, bt * d);
         host_to_buf(a->rms2, &sc->rms_stash, bt);
         rmsnorm_bwd(m, &sc->tmp2, &ly->n2->w, &sc->dtmp, &sc->rms_stash, &ly->n2->g, bt, d);
         // dx from ffn-norm path; add to dxh (residual: x_mid feeds both) -- GPU
@@ -421,10 +472,13 @@ static float train_step(trainer_t *tr) {
 
         // ---- time-mix backward ----
         // out_tm = wo(wkv_unpacked) ; x_mid = x_in + out_tm. grad to out_tm == dxh.
-        host_to_buf(a->wkv, &sc->tmp2, bt * d);       // wkv_unpacked
-        memcpy(sc->dtmp.ptr, sc->dxh_buf.ptr, bt * d * sizeof(float));      // d_out_tm
+        // wkv_unpacked
+        host_to_buf(a->wkv, &sc->tmp2, bt * d);
+        // d_out_tm
+        memcpy(sc->dtmp.ptr, sc->dxh_buf.ptr, bt * d * sizeof(float));
         mm_dB(m, &sc->tmp2, &sc->dtmp, &ly->wo->g, bt, d, d);
-        mm_dA(m, &ly->wo->w, &sc->dtmp, &sc->dwkv, bt, d, d);     // d wkv_unpacked [bt,d]
+        // d wkv_unpacked [bt,d]
+        mm_dA(m, &ly->wo->w, &sc->dtmp, &sc->dwkv, bt, d, d);
         gpu_repack(m, &sc->dwkv, &sc->tmp, bt, hd, dh, cfg.seqlen, 0);
         memcpy(sc->dwkv.ptr, sc->tmp.ptr, bt * d * sizeof(float));
         // output was 0.5*(po+po2), so each direction's grad is 0.5*dwkv -> halve it
@@ -471,17 +525,18 @@ static float train_step(trainer_t *tr) {
         // kinv index is the same (b*hd+h)*seq+t, so they align.
         {
             float *dpk = sc->dpk.ptr;
-            float *khat = a->pk;            // packed, unit-norm k
+            // packed, unit-norm k
+            float *khat = a->pk;
             uint32_t nvec = bt * hd;
-            for (uint32_t vct = 0; vct < nvec; vct++) {
+            for (uint32_t vct = 0; vct < nvec; vct = vct + 1) {
                 float *dv = dpk + vct * dh;
                 float *kv = khat + vct * dh;
                 float dot = 0.0f;
-                for (uint32_t e = 0; e < dh; e++) {
+                for (uint32_t e = 0; e < dh; e = e + 1) {
                     dot += kv[e] * dv[e];
                 }
                 float inv = a->kinv[vct];
-                for (uint32_t e = 0; e < dh; e++) {
+                for (uint32_t e = 0; e < dh; e = e + 1) {
                     dv[e] = (dv[e] - kv[e] * dot) * inv;
                 }
             }
@@ -495,7 +550,7 @@ static float train_step(trainer_t *tr) {
         {
             float *dpw = sc->dpw.ptr;
             float *dpa = sc->dpa.ptr;
-            for (uint32_t i = 0; i < bt * d; i++) {
+            for (uint32_t i = 0; i < bt * d; i = i + 1) {
                 float sw = a->pw[i];
                 float sa = a->pa[i];
                 dpw[i] *= sw * (1.0f - sw);
@@ -503,19 +558,25 @@ static float train_step(trainer_t *tr) {
             }
         }
         // each projection p = proj(shift): d_wX += shift^T dp ; d_shift += sum wX^T dp
-        host_to_buf(a->shift, &sc->tmp, bt * d);   // shift input
-        host_zero(&sc->dnorm, bt * d);             // accumulate d_shift here
+        // shift input
+        host_to_buf(a->shift, &sc->tmp, bt * d);
+        // accumulate d_shift here
+        host_zero(&sc->dnorm, bt * d);
         vkc_buf_t *dps[5] = { &sc->dpk, &sc->dpv, &sc->dpr, &sc->dpw, &sc->dpa };
         param_t *wps[5] = { ly->wk, ly->wv, ly->wr, ly->ww, ly->wa };
-        for (int j = 0; j < 5; j++) {
+        for (int j = 0; j < 5; j = j + 1) {
             mm_dB(m, &sc->tmp, dps[j], &wps[j]->g, bt, d, d);
             mm_dA(m, &wps[j]->w, dps[j], &sc->dtmp2, bt, d, d);
-            vec_op(m, &sc->dnorm, &sc->dtmp2, bt * d, 0);   // accumulate d_shift on GPU
+            // accumulate d_shift on GPU
+            vec_op(m, &sc->dnorm, &sc->dtmp2, bt * d, 0);
         }
         // tokenshift backward: input n1, mix shift_mix, dout=d_shift -> dx(n1), dmix
-        host_to_buf(a->n1, &sc->tmp, bt * d);       // tokenshift input
-        host_to_buf(sc->dnorm.ptr, &sc->tmp2, bt * d);  // dout = d_shift
-        host_zero(&sc->dtmp, bt * d);               // dx output
+        // tokenshift input
+        host_to_buf(a->n1, &sc->tmp, bt * d);
+        // dout = d_shift
+        host_to_buf(sc->dnorm.ptr, &sc->tmp2, bt * d);
+        // dx output
+        host_zero(&sc->dtmp, bt * d);
         {
             ts_pc_t btpc = (ts_pc_t) { .bt = bt, .d = d, .seqlen = cfg.seqlen, .op = 1 };
             vkc_buf_t *tsbb[5] = { &sc->tmp, &ly->shift_mix->w, &sc->tmp2, &sc->dtmp, &ly->shift_mix->g };
@@ -524,7 +585,7 @@ static float train_step(trainer_t *tr) {
         // adaLN backward: n1 = n1_pre*(1+scale1)+shift1. dtmp holds d_n1 (dout).
         {
             float *a6 = a->ada6; float *scl = sc->ada_scale.ptr;
-            for (uint32_t b = 0; b < cfg.batch; b++) {
+            for (uint32_t b = 0; b < cfg.batch; b = b + 1) {
                 memcpy(scl + b * d, a6 + b * 6 * d + 0 * d, d * sizeof(float));
             }
             host_to_buf(a->n1_pre, &sc->tmp, bt * d);
@@ -536,7 +597,7 @@ static float train_step(trainer_t *tr) {
             vkc_run(m->c, &m->k_adaln, ab, (bt * d + 255) / 256, 1, 1, &apc);
             // scatter into slots 0,1 (FFN already filled 2,3 -- do NOT re-zero dada6)
             float *dd = sc->dada6.ptr; float *dsc = sc->dnorm.ptr; float *dsh = sc->dtmp2.ptr;
-            for (uint32_t b = 0; b < cfg.batch; b++) {
+            for (uint32_t b = 0; b < cfg.batch; b = b + 1) {
                 memcpy(dd + b * 6 * d + 0 * d, dsc + b * d, d * sizeof(float));
                 memcpy(dd + b * 6 * d + 1 * d, dsh + b * d, d * sizeof(float));
             }
@@ -545,10 +606,10 @@ static float train_step(trainer_t *tr) {
             mm_dA(m, &ly->ada->w, &sc->dada6, &sc->dcond, cfg.batch, 6 * d, d);
             {
                 float *emb = sc->tmp2.ptr; float *wt = sc->weight.ptr;
-                for (uint32_t b = 0; b < cfg.batch; b++) {
+                for (uint32_t b = 0; b < cfg.batch; b = b + 1) {
                     float t = 1.0f / (wt[b * cfg.seqlen] + 1e-9f);
                     float *row = emb + b * d;
-                    for (uint32_t i = 0; i < d; i++) {
+                    for (uint32_t i = 0; i < d; i = i + 1) {
                         float freq = expf(-logf(10000.0f) * (float)(i / 2) / (float)(d / 2));
                         float ang = t * freq;
                         row[i] = ((i % 2) == 0) ? sinf(ang) : cosf(ang);

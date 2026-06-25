@@ -45,14 +45,21 @@ static float frand(void) {
 //   mask[b*seqlen]     : 1.0 where the position was masked (loss is counted there)
 //   weight[b*seqlen]   : 1/t loss weight (per sequence, broadcast over positions)
 // t is sampled per sequence in [t_min, 1]; each token masked independently w.p. t.
-static void make_batch(const corpus_t *cp, uint32_t batch, uint32_t seqlen,
-    uint32_t *ids_in, uint32_t *target, float *mask, float *weight) {
+static void make_batch(
+    const corpus_t *cp,
+    uint32_t batch,
+    uint32_t seqlen,
+    uint32_t *ids_in,
+    uint32_t *target,
+    float *mask,
+    float *weight) {
     float t_min = 0.02f;
-    for (uint32_t b = 0; b < batch; b++) {
+    for (uint32_t b = 0; b < batch; b = b + 1) {
         size_t start = (size_t)(frand() * (float)(cp->len - seqlen - 1));
         float t = t_min + (1.0f - t_min) * frand();
-        float w = 1.0f / t;   // uncapped: weight cap mid-training destabilized; clip handles variance
-        for (uint32_t s = 0; s < seqlen; s++) {
+        // 1/t loss weight, uncapped; the gradient clip handles the variance.
+        float w = 1.0f / t;
+        for (uint32_t s = 0; s < seqlen; s = s + 1) {
             uint32_t pos = b * seqlen + s;
             unsigned char byte = cp->bytes[start + s];
             target[pos] = byte;
