@@ -1,0 +1,224 @@
+// tokenizer.h -- Unigram language-model subword tokenizer (the SentencePiece-style
+// probabilistic model, not BPE). The vocab is a set of token strings, each with a
+// log-probability. Encoding a string is the maximum-likelihood segmentation under
+// that unigram model, found by Viterbi. The trainer that produces the vocab lives
+// in train_tokenizer.c; this header is the runtime: load, encode, decode.
+//
+// Vocab file format (text, written by the trainer):
+//   line 1:        <vocab_count>
+//   lines 2..N+1:  <log_prob> <byte_length> <space> <raw_token_bytes>
+// Token bytes are written raw (may contain any byte except newline is escaped as
+// \n, backslash as \\), so the loader unescapes them.
+#ifndef TOKENIZER_H
+#define TOKENIZER_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#define TOK_MAX_LEN 32
+
+typedef struct tok_entry tok_entry_t;
+
+struct tok_entry {
+    char *bytes;
+    uint32_t len;
+    float logp;
+};
+
+typedef struct tokenizer tokenizer_t;
+
+struct tokenizer {
+    tok_entry_t *entries;
+    uint32_t count;
+    // first_of[c] is the index of the first entry whose first byte is c, or count
+    // if none; entries are sorted by first byte then by string, so a token lookup
+    // can scan a narrow range. Built by tokenizer_index.
+    uint32_t first_of[257];
+};
+
+static void tok_unescape(const char *src, char *dst, uint32_t *len_out) {
+    uint32_t j = 0;
+    for (uint32_t i = 0; src[i] != '\0'; i = i + 1) {
+        if (src[i] == '\\' && src[i + 1] == 'n') {
+            dst[j] = '\n';
+            j = j + 1;
+            i = i + 1;
+        } else if (src[i] == '\\' && src[i + 1] == '\\') {
+            dst[j] = '\\';
+            j = j + 1;
+            i = i + 1;
+        } else {
+            dst[j] = src[i];
+            j = j + 1;
+        }
+    }
+    dst[j] = '\0';
+    *len_out = j;
+}
+
+static void tok_escape(const char *src, uint32_t len, FILE *f) {
+    for (uint32_t i = 0; i < len; i = i + 1) {
+        if (src[i] == '\n') {
+            fputs("\\n", f);
+        } else if (src[i] == '\\') {
+            fputs("\\\\", f);
+        } else {
+            fputc(src[i], f);
+        }
+    }
+}
+
+static int tok_compare(const void *pa, const void *pb) {
+    const tok_entry_t *a = pa;
+    const tok_entry_t *b = pb;
+    uint32_t n = (a->len < b->len) ? a->len : b->len;
+    int c = memcmp(a->bytes, b->bytes, n);
+    if (c != 0) {
+        return c;
+    }
+    if (a->len < b->len) {
+        return -1;
+    }
+    if (a->len > b->len) {
+        return 1;
+    }
+    return 0;
+}
+
+// build first_of[] after entries are sorted by (first byte, string).
+static void tokenizer_index(tokenizer_t *t) {
+    qsort(t->entries, t->count, sizeof(tok_entry_t), tok_compare);
+    uint32_t e = 0;
+    for (uint32_t c = 0; c < 257; c = c + 1) {
+        while (e < t->count && (unsigned char)t->entries[e].bytes[0] < c) {
+            e = e + 1;
+        }
+        t->first_of[c] = e;
+    }
+}
+
+static tokenizer_t tokenizer_load(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        perror(path);
+        exit(1);
+    }
+    tokenizer_t t;
+    if (fscanf(f, "%u\n", &t.count) != 1) {
+        fprintf(stderr, "bad vocab file\n");
+        exit(1);
+    }
+    t.entries = malloc(t.count * sizeof(tok_entry_t));
+    char line[TOK_MAX_LEN * 4 + 64];
+    for (uint32_t i = 0; i < t.count; i = i + 1) {
+        float logp = 0.0f;
+        uint32_t blen = 0;
+        // read "<logp> <len> " then the rest of the line verbatim. %u stops at the
+        // space, so we step over exactly one separator and take the rest as the raw
+        // (escaped) token -- tokens may themselves start with or contain spaces.
+        if (fscanf(f, "%f %u", &logp, &blen) != 2) {
+            fprintf(stderr, "bad vocab entry %u\n", i);
+            exit(1);
+        }
+        fgetc(f);
+        if (fgets(line, sizeof(line), f) == NULL) {
+            fprintf(stderr, "bad vocab entry %u\n", i);
+            exit(1);
+        }
+        size_t ll = strlen(line);
+        if (ll > 0 && line[ll - 1] == '\n') {
+            line[ll - 1] = '\0';
+        }
+        char *raw = malloc(TOK_MAX_LEN + 1);
+        uint32_t rlen = 0;
+        tok_unescape(line, raw, &rlen);
+        t.entries[i].bytes = raw;
+        t.entries[i].len = rlen;
+        t.entries[i].logp = logp;
+    }
+    fclose(f);
+    tokenizer_index(&t);
+    return t;
+}
+
+// look up the entry index for an exact token string, or -1 if absent.
+static int32_t tokenizer_find(const tokenizer_t *t, const char *s, uint32_t len) {
+    unsigned char c = (unsigned char)s[0];
+    uint32_t lo = t->first_of[c];
+    uint32_t hi = t->first_of[c + 1];
+    for (uint32_t i = lo; i < hi; i = i + 1) {
+        if (t->entries[i].len == len && memcmp(t->entries[i].bytes, s, len) == 0) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+// Viterbi maximum-likelihood segmentation of text[0..len) into token ids. Writes
+// up to max_out ids into out and returns the count. Every single byte must exist
+// as a token (the trainer guarantees this) so a segmentation always exists.
+static uint32_t tokenizer_encode(
+    const tokenizer_t *t,
+    const char *text,
+    uint32_t len,
+    uint32_t *out,
+    uint32_t max_out) {
+    float *best = malloc((len + 1) * sizeof(float));
+    int32_t *back_id = malloc((len + 1) * sizeof(int32_t));
+    uint32_t *back_pos = malloc((len + 1) * sizeof(uint32_t));
+    for (uint32_t i = 0; i <= len; i = i + 1) {
+        best[i] = -1e30f;
+        back_id[i] = -1;
+        back_pos[i] = 0;
+    }
+    best[0] = 0.0f;
+    for (uint32_t i = 0; i < len; i = i + 1) {
+        if (best[i] <= -1e29f) {
+            continue;
+        }
+        uint32_t max_len = TOK_MAX_LEN;
+        if (i + max_len > len) {
+            max_len = len - i;
+        }
+        for (uint32_t l = 1; l <= max_len; l = l + 1) {
+            int32_t id = tokenizer_find(t, text + i, l);
+            if (id < 0) {
+                continue;
+            }
+            float score = best[i] + t->entries[id].logp;
+            if (score > best[i + l]) {
+                best[i + l] = score;
+                back_id[i + l] = id;
+                back_pos[i + l] = i;
+            }
+        }
+    }
+    uint32_t tmp_count = 0;
+    uint32_t *tmp = malloc((len + 1) * sizeof(uint32_t));
+    uint32_t pos = len;
+    while (pos > 0) {
+        tmp[tmp_count] = (uint32_t)back_id[pos];
+        tmp_count = tmp_count + 1;
+        pos = back_pos[pos];
+    }
+    uint32_t n = (tmp_count < max_out) ? tmp_count : max_out;
+    for (uint32_t i = 0; i < n; i = i + 1) {
+        out[i] = tmp[tmp_count - 1 - i];
+    }
+    free(best);
+    free(back_id);
+    free(back_pos);
+    free(tmp);
+    return n;
+}
+
+static void tokenizer_free(tokenizer_t *t) {
+    for (uint32_t i = 0; i < t->count; i = i + 1) {
+        free(t->entries[i].bytes);
+    }
+    free(t->entries);
+}
+
+#endif
