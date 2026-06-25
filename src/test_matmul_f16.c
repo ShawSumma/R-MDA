@@ -30,9 +30,9 @@ static double now_sec(void) {
     return t.tv_sec + t.tv_nsec / 1e9;
 }
 
-typedef struct mm_pc mm_pc_t;
+typedef struct mm_pc_t mm_pc_t;
 
-struct mm_pc {
+struct mm_pc_t {
     uint32_t m;
     uint32_t n;
     uint32_t k;
@@ -59,12 +59,12 @@ int main(void) {
     float *bp = b32.ptr;
     half *ahp = a16.ptr;
     half *bhp = b16.ptr;
-    for (uint32_t i = 0; i < m * k; i = i + 1) {
+    for (uint32_t i = 0; i < m * k; ++i) {
         float v = (float)(rand() % 1000 - 500) / 500.0f;
         ap[i] = v;
         ahp[i] = to_half(v);
     }
-    for (uint32_t i = 0; i < k * n; i = i + 1) {
+    for (uint32_t i = 0; i < k * n; ++i) {
         float v = (float)(rand() % 1000 - 500) / 500.0f;
         bp[i] = v;
         bhp[i] = to_half(v);
@@ -93,7 +93,7 @@ int main(void) {
     float *cc = c16.ptr;
     double max_rel = 0.0;
     double mean_rel = 0.0;
-    for (uint32_t i = 0; i < m * n; i = i + 1) {
+    for (uint32_t i = 0; i < m * n; ++i) {
         double denom = fabs(cs[i]) + 1e-4;
         double rel = fabs(cs[i] - cc[i]) / denom;
         mean_rel = mean_rel + rel;
@@ -106,12 +106,12 @@ int main(void) {
 
     int iters = 200;
     double t0 = now_sec();
-    for (int it = 0; it < iters; it = it + 1) {
+    for (int it = 0; it < iters; ++it) {
         vkc_run(&c, &scalar, sb, (n + 15) / 16, (m + 15) / 16, 1, &pc);
     }
     double t_scalar = (now_sec() - t0) / iters;
     t0 = now_sec();
-    for (int it = 0; it < iters; it = it + 1) {
+    for (int it = 0; it < iters; ++it) {
         vkc_run(&c, &coop, cb, n / 32, m / 32, 1, &pc);
     }
     double t_coop = (now_sec() - t0) / iters;

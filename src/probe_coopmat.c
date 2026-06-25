@@ -46,7 +46,7 @@ int main(void) {
     uint32_t count = 0;
     get_props(c.pd, &count, NULL);
     VkCooperativeMatrixPropertiesKHR *props = malloc(count * sizeof(VkCooperativeMatrixPropertiesKHR));
-    for (uint32_t i = 0; i < count; i = i + 1) {
+    for (uint32_t i = 0; i < count; ++i) {
         props[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
         props[i].pNext = NULL;
     }
@@ -54,7 +54,7 @@ int main(void) {
 
     printf("cooperative-matrix configs: %u\n", count);
     printf("  MxNxK   A    B    C    Result  scope\n");
-    for (uint32_t i = 0; i < count; i = i + 1) {
+    for (uint32_t i = 0; i < count; ++i) {
         VkCooperativeMatrixPropertiesKHR *p = &props[i];
         printf(
             "  %2ux%2ux%2u  %-4s %-4s %-4s %-4s    %s\n",

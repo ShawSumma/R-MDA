@@ -1,0 +1,161 @@
+#version 450
+// Chunked RWKV-7 WKV forward. One workgroup per (b,h); the sequence is processed in
+// chunks of CHUNK steps. Within a chunk the heavy work is matmul-shaped (over [CHUNK x
+// DH] tiles), and only T/CHUNK chunk-state carries are sequential -- vs the serial
+// kernel's T barrier-bound single steps. Verified bit-identical to wkv7_fwd against the
+// C reference in notes/wkv7_chunked_reference.c (the factored per-column-decay form).
+//
+// Recurrence (per (b,h), state S is [DH x DH]):
+//   Sk_t[j]  = sum_i S_{t-1}[i,j] k_t[i]
+//   S_t[i,j] = w_t[j] S_{t-1}[i,j] - a_t k_t[i] Sk_t[j] + a_t k_t[i] v_t[j]
+//   out_t[j] = sum_i r_t[i] S_t[i,j]
+// w decays columns (j); the k-dot is over rows (i); a_t is a per-step scalar.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer BK { float K[]; };
+layout(std430, binding = 1) readonly  buffer BV { float V[]; };
+layout(std430, binding = 2) readonly  buffer BR { float R[]; };
+layout(std430, binding = 3) readonly  buffer BW { float W[]; };
+layout(std430, binding = 4) readonly  buffer BA { float A[]; };
+layout(std430, binding = 5) writeonly buffer BO { float O[]; };
+layout(std430, binding = 6) writeonly buffer BS { float Sout[]; };
+
+layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir, save; };
+
+const uint CHUNK = 16;
+const uint MAXDH = 64;
+
+shared float S[MAXDH * MAXDH];   // carried chunk-start state [DH x DH]
+// per-chunk per-step vectors [CHUNK x DH]
+shared float ck[CHUNK * MAXDH];
+shared float cv[CHUNK * MAXDH];
+shared float cr[CHUNK * MAXDH];
+shared float cw[CHUNK * MAXDH];  // inclusive cumulative column decay within the chunk
+shared float ca[CHUNK];          // per-step scalar a
+shared float U[CHUNK * MAXDH];   // rank-1 column writes
+shared float Snew[MAXDH * MAXDH];
+shared float KK[CHUNK * CHUNK];  // Gram k_u . k_s  (computed once per chunk)
+shared float RK[CHUNK * CHUNK];  // Gram r_u . k_s
+shared float RS[CHUNK * MAXDH];  // r_u . S0[:,j]   (carry readout, [CHUNK x DH])
+shared float CS[CHUNK * MAXDH];  // S0[:,j] . k_u   (carry Sk, [CHUNK x DH])
+
+void main() {
+    uint bh = gl_WorkGroupID.x;
+    uint b = bh / Hd;
+    uint h = bh % Hd;
+    uint lid = gl_LocalInvocationID.x;
+    uint DHl = DH;
+    if (bh >= Bsz * Hd) {
+        return;
+    }
+    uint wgs = gl_WorkGroupSize.x;
+
+    for (uint i = lid; i < DHl * DHl; i += wgs) {
+        S[i] = 0.0;
+    }
+    barrier();
+
+    uint base = (b * Hd + h) * T * DHl;
+    uint nchunk = T / CHUNK;
+
+    for (uint c = 0; c < nchunk; c += 1) {
+        // load this chunk's k,v,r,w,a and build the inclusive cumulative column decay.
+        for (uint u = 0; u < CHUNK; u += 1) {
+            uint ti = c * CHUNK + u;
+            uint t = (dir == 0) ? ti : (T - 1 - ti);
+            uint row = base + t * DHl;
+            for (uint d = lid; d < DHl; d += wgs) {
+                ck[u * DHl + d] = K[row + d];
+                cv[u * DHl + d] = V[row + d];
+                cr[u * DHl + d] = R[row + d];
+                cw[u * DHl + d] = W[row + d];
+            }
+            if (lid == 0) {
+                ca[u] = A[row];
+            }
+        }
+        barrier();
+        // prefix-product the decay down the chunk per column j (thread per column).
+        for (uint j = lid; j < DHl; j += wgs) {
+            float p = 1.0;
+            for (uint u = 0; u < CHUNK; u += 1) {
+                p = p * cw[u * DHl + j];
+                cw[u * DHl + j] = p;   // now inclusive cumulative
+            }
+        }
+        // Gram matrices once per chunk: KK[u][s]=k_u.k_s, RK[u][s]=r_u.k_s (thread per (u,s)).
+        for (uint p = lid; p < CHUNK * CHUNK; p += wgs) {
+            uint u = p / CHUNK;
+            uint sp = p - u * CHUNK;
+            float kk = 0.0;
+            float rk = 0.0;
+            for (uint i = 0; i < DHl; i += 1) {
+                kk += ck[u * DHl + i] * ck[sp * DHl + i];
+                rk += cr[u * DHl + i] * ck[sp * DHl + i];
+            }
+            KK[p] = kk;
+            RK[p] = rk;
+        }
+        // carry readouts once per chunk: CS[u][j]=sum_i S0[i,j] k_u[i]; RS[u][j]=sum_i r_u[i] S0[i,j].
+        for (uint p = lid; p < CHUNK * DHl; p += wgs) {
+            uint u = p / DHl;
+            uint j = p - u * DHl;
+            float cs = 0.0;
+            float rs = 0.0;
+            for (uint i = 0; i < DHl; i += 1) {
+                cs += S[i * DHl + j] * ck[u * DHl + i];
+                rs += cr[u * DHl + i] * S[i * DHl + j];
+            }
+            CS[p] = cs;
+            RS[p] = rs;
+        }
+        barrier();
+
+        // sequential over the CHUNK steps; the heavy dots are now shared-memory lookups.
+        for (uint u = 0; u < CHUNK; u += 1) {
+            float a = ca[u];
+            for (uint j = lid; j < DHl; j += wgs) {
+                float cwex = (u == 0) ? 1.0 : cw[(u - 1) * DHl + j];
+                float carrySk = cwex * CS[u * DHl + j];
+                float intra = 0.0;
+                for (uint sp = 0; sp < u; sp += 1) {
+                    intra += KK[u * CHUNK + sp] * U[sp * DHl + j] * (cwex / cw[sp * DHl + j]);
+                }
+                U[u * DHl + j] = a * (cv[u * DHl + j] - carrySk - intra);
+            }
+            barrier();
+        }
+        // readout for every step (now that all U are known): out_u[j] = cw[u][j]*RS[u][j]
+        //   + sum_{s<=u} RK[u][s] U[s][j] (cw[u][j]/cw[s][j]).
+        for (uint u = 0; u < CHUNK; u += 1) {
+            uint ti = c * CHUNK + u;
+            uint t = (dir == 0) ? ti : (T - 1 - ti);
+            uint orow = base + t * DHl;
+            for (uint j = lid; j < DHl; j += wgs) {
+                float acc = cw[u * DHl + j] * RS[u * DHl + j];
+                for (uint sp = 0; sp <= u; sp += 1) {
+                    acc += RK[u * CHUNK + sp] * U[sp * DHl + j] * (cw[u * DHl + j] / cw[sp * DHl + j]);
+                }
+                O[orow + j] = acc;
+            }
+        }
+        barrier();
+
+        // carry: S_new[i,j] = cw[C-1][j]*S0[i,j] + sum_s k_s[i] U[s][j] (cw[C-1][j]/cw[s][j])
+        for (uint idx = lid; idx < DHl * DHl; idx += wgs) {
+            uint i = idx / DHl;
+            uint j = idx - i * DHl;
+            float last = cw[(CHUNK - 1) * DHl + j];
+            float v = last * S[idx];
+            for (uint sp = 0; sp < CHUNK; sp += 1) {
+                v += ck[sp * DHl + i] * U[sp * DHl + j] * (last / cw[sp * DHl + j]);
+            }
+            Snew[idx] = v;
+        }
+        barrier();
+        for (uint idx = lid; idx < DHl * DHl; idx += wgs) {
+            S[idx] = Snew[idx];
+        }
+        barrier();
+    }
+}

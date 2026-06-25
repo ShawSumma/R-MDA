@@ -11,9 +11,9 @@
 // registry capacity (max distinct parameter tensors).
 #define M_MAX_PARAMS 256
 
-typedef struct mcfg mcfg_t;
+typedef struct mcfg_t mcfg_t;
 
-struct mcfg {
+struct mcfg_t {
     // model dim
     uint32_t d;
     uint32_t n_layer;
@@ -27,9 +27,9 @@ struct mcfg {
 };
 
 // One trainable tensor: the weights plus its grad and AdamW moments, all same size.
-typedef struct param param_t;
+typedef struct param_t param_t;
 
-struct param {
+struct param_t {
     vkc_buf_t w;
     vkc_buf_t g;
     vkc_buf_t m;
@@ -42,9 +42,9 @@ struct param {
 };
 
 // Push constants for the AdamW kernel: one update over n elements.
-typedef struct adam_pc adam_pc_t;
+typedef struct adam_pc_t adam_pc_t;
 
-struct adam_pc {
+struct adam_pc_t {
     uint32_t n;
     float lr;
     float beta1;
@@ -56,27 +56,27 @@ struct adam_pc {
 };
 
 // Push constants for the sum-of-squares kernel: op 0 reduces, op 1 scales by scale.
-typedef struct sumsq_pc sumsq_pc_t;
+typedef struct sumsq_pc_t sumsq_pc_t;
 
-struct sumsq_pc {
+struct sumsq_pc_t {
     uint32_t n;
     uint32_t op;
     float scale;
 };
 
 // Push constants for the matmul-backward kernel: mode 0 makes dA, mode 1 makes dB.
-typedef struct mm_bw_pc mm_bw_pc_t;
+typedef struct mm_bw_pc_t mm_bw_pc_t;
 
-struct mm_bw_pc {
+struct mm_bw_pc_t {
     uint32_t m;
     uint32_t n;
     uint32_t k;
     uint32_t mode;
 };
 
-typedef struct mlayer mlayer_t;
+typedef struct mlayer_t mlayer_t;
 
-struct mlayer {
+struct mlayer_t {
     param_t *wk;
     param_t *wv;
     param_t *wr;
@@ -92,9 +92,9 @@ struct mlayer {
     param_t *ada;
 };
 
-typedef struct model model_t;
+typedef struct model_t model_t;
 
-struct model {
+struct model_t {
     vkc_t *c;
     mcfg_t cfg;
 
@@ -104,6 +104,7 @@ struct model {
     vkc_kernel_t k_wkv_b;
     vkc_kernel_t k_mm;
     vkc_kernel_t k_mm16;
+    vkc_kernel_t k_mm16w;
     vkc_kernel_t k_cast;
     vkc_kernel_t k_mm_bw;
     vkc_kernel_t k_elem;
@@ -128,10 +129,12 @@ struct model {
     // set whenever fp32 weights change; the fp16 mirrors are re-cast lazily on the
     // next forward. Inference casts once; training sets it each optimizer step.
     int dirty16;
+    // when set, model_forward stops after logits (no CE loss) -- for generation.
+    int infer;
 };
 
 static void randn_fill(float *p, uint32_t n, float std) {
-    for (uint32_t i = 0; i < n; i = i + 1) {
+    for (uint32_t i = 0; i < n; ++i) {
         float u1 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
         float u2 = (rand() + 1.0f) / (RAND_MAX + 2.0f);
         p[i] = std * sqrtf(-2.0f * logf(u1)) * cosf(6.2831853f * u2);
@@ -158,7 +161,7 @@ static param_t *param_new(
     if (init_std > 0.0f) {
         randn_fill(wp, n, init_std);
     } else {
-        for (uint32_t i = 0; i < n; i = i + 1) {
+        for (uint32_t i = 0; i < n; ++i) {
             wp[i] = init_const;
         }
     }
@@ -178,6 +181,7 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
     m->k_wkv_b = vkc_load(c, "build/wkv7_bwd.spv", 12, 16);
     m->k_mm = vkc_load(c, "build/matmul.spv", 3, 12);
     m->k_mm16 = vkc_load(c, "build/matmul_f16.spv", 3, 12);
+    m->k_mm16w = vkc_load(c, "build/matmul_f16_wide.spv", 3, 12);
     m->k_cast = vkc_load(c, "build/cast_f16.spv", 4, 8);
     m->k_mm_bw = vkc_load(c, "build/matmul_bw.spv", 4, 16);
     m->k_elem = vkc_load(c, "build/elem.spv", 2, 8);
@@ -185,7 +189,7 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
     m->k_adaln = vkc_load(c, "build/adaln.spv", 7, 16);
     m->k_ce = vkc_load(c, "build/softmax_ce.spv", 5, 8);
     m->k_adamw = vkc_load(c, "build/adamw.spv", 4, 32);
-    m->k_vec = vkc_load(c, "build/vecops.spv", 2, 8);
+    m->k_vec = vkc_load(c, "build/vecops.spv", 2, 12);
     m->k_repack = vkc_load(c, "build/repack.spv", 2, 20);
     m->k_sumsq = vkc_load(c, "build/sumsq.spv", 2, 12);
     m->k_normheads = vkc_load(c, "build/normheads.spv", 2, 12);
@@ -200,7 +204,7 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
     m->head = param_new(m, d * cfg.vocab, s, 0.0f, "head");
 
     m->layers = malloc(cfg.n_layer * sizeof(mlayer_t));
-    for (uint32_t l = 0; l < cfg.n_layer; l = l + 1) {
+    for (uint32_t l = 0; l < cfg.n_layer; ++l) {
         mlayer_t *ly = &m->layers[l];
         ly->wk = param_new(m, d * d, s, 0.0f, "wk");
         ly->wv = param_new(m, d * d, s, 0.0f, "wv");
@@ -222,7 +226,7 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
 
 static uint64_t model_param_count(const model_t *m) {
     uint64_t total = 0;
-    for (uint32_t i = 0; i < m->n_params; i = i + 1) {
+    for (uint32_t i = 0; i < m->n_params; ++i) {
         total = total + m->params[i].n;
     }
     return total;

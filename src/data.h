@@ -15,9 +15,9 @@
 extern uint32_t data_vocab;
 extern uint32_t data_mask_id;
 
-typedef struct corpus corpus_t;
+typedef struct corpus_t corpus_t;
 
-struct corpus {
+struct corpus_t {
     uint32_t *ids;
     size_t len;
     tokenizer_t tok;
@@ -57,7 +57,7 @@ static corpus_t corpus_load(const char *path) {
             chunk = (uint32_t)((size_t)n - pos);
         }
         uint32_t got = tokenizer_encode(&tok, bytes + pos, chunk, tmp, window);
-        for (uint32_t i = 0; i < got; i = i + 1) {
+        for (uint32_t i = 0; i < got; ++i) {
             ids[total] = tmp[i];
             total = total + 1;
         }
@@ -95,12 +95,12 @@ static void make_batch(
     float *mask,
     float *weight) {
     float t_min = 0.02f;
-    for (uint32_t b = 0; b < batch; b = b + 1) {
+    for (uint32_t b = 0; b < batch; ++b) {
         size_t start = (size_t)(frand() * (float)(cp->len - seqlen - 1));
         float t = t_min + (1.0f - t_min) * frand();
         // 1/t loss weight, uncapped; the gradient clip handles the variance.
         float w = 1.0f / t;
-        for (uint32_t s = 0; s < seqlen; s = s + 1) {
+        for (uint32_t s = 0; s < seqlen; ++s) {
             uint32_t pos = b * seqlen + s;
             uint32_t token = cp->ids[start + s];
             target[pos] = token;

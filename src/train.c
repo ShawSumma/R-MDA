@@ -11,7 +11,7 @@ static void adamw_all(model_t *m, float lr, uint32_t step) {
     float b2 = 0.999f;
     float bc1 = 1.0f - powf(b1, (float)step);
     float bc2 = 1.0f - powf(b2, (float)step);
-    for (uint32_t i = 0; i < m->n_params; i = i + 1) {
+    for (uint32_t i = 0; i < m->n_params; ++i) {
         param_t *p = &m->params[i];
         adam_pc_t pc = (adam_pc_t) {
             .n = p->n,
@@ -40,7 +40,7 @@ static void adamw_all(model_t *m, float lr, uint32_t step) {
 // are read back. Returns the pre-clip norm.
 static float clip_grads(model_t *m, vkc_buf_t *partials, float clip) {
     double ss = 0.0;
-    for (uint32_t i = 0; i < m->n_params; i = i + 1) {
+    for (uint32_t i = 0; i < m->n_params; ++i) {
         uint32_t n = m->params[i].n;
         uint32_t ng = (n + 255) / 256;
         sumsq_pc_t pc = (sumsq_pc_t) {
@@ -54,7 +54,7 @@ static float clip_grads(model_t *m, vkc_buf_t *partials, float clip) {
         };
         vkc_run(m->c, &m->k_sumsq, bufs, ng, 1, 1, &pc);
         float *p = partials->ptr;
-        for (uint32_t w = 0; w < ng; w = w + 1) {
+        for (uint32_t w = 0; w < ng; ++w) {
             ss = ss + (double)p[w];
         }
     }
@@ -63,7 +63,7 @@ static float clip_grads(model_t *m, vkc_buf_t *partials, float clip) {
         return norm;
     }
     float scale = clip / (norm + 1e-9f);
-    for (uint32_t i = 0; i < m->n_params; i = i + 1) {
+    for (uint32_t i = 0; i < m->n_params; ++i) {
         uint32_t n = m->params[i].n;
         sumsq_pc_t pc = (sumsq_pc_t) {
             .n = n,
@@ -89,7 +89,7 @@ static void checkpoint_save(model_t *m, uint32_t step) {
         return;
     }
     fwrite(&step, sizeof(uint32_t), 1, f);
-    for (uint32_t i = 0; i < m->n_params; i = i + 1) {
+    for (uint32_t i = 0; i < m->n_params; ++i) {
         param_t *p = &m->params[i];
         fwrite(p->w.ptr, sizeof(float), p->n, f);
         fwrite(p->m.ptr, sizeof(float), p->n, f);
@@ -109,7 +109,7 @@ static uint32_t checkpoint_load(model_t *m) {
         fclose(f);
         return 0;
     }
-    for (uint32_t i = 0; i < m->n_params; i = i + 1) {
+    for (uint32_t i = 0; i < m->n_params; ++i) {
         param_t *p = &m->params[i];
         fread(p->w.ptr, sizeof(float), p->n, f);
         fread(p->m.ptr, sizeof(float), p->n, f);
@@ -159,7 +159,7 @@ int main(void) {
     double ema_bpb = 0.0;
     int ema_init = 0;
 
-    for (uint32_t s = start + 1; s <= max_steps; s = s + 1) {
+    for (uint32_t s = start + 1; s <= max_steps; ++s) {
         make_batch(
             &cp,
             cfg.batch,

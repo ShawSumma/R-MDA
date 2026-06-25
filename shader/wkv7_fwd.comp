@@ -17,7 +17,7 @@ layout(std430,binding=6) writeonly buffer BS { float Sout[]; }; // [T, DH*DH] pr
 
 layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir, save; };
 
-shared float S[64*64];     // [DH x DH] state for this (b,h)
+shared float S[64*65];     // [DH x DH] state for this (b,h)
 shared float kk[64], vv[64], rr[64], ww[64], aa[64];
 shared float Sk[64];       // S^T k  (length DH)
 shared float part[256];    // partial sums for the 4-way reductions
@@ -31,7 +31,7 @@ void main(){
     if(bh >= Bsz*Hd) return;
 
     // zero state rows owned by this thread (thread `lid` owns rows lid, lid+64, ...)
-    for(uint i=lid;i<DHl*DHl;i+=gl_WorkGroupSize.x) S[i]=0.0;
+    for(uint i=lid;i<DHl*DHl;i+=gl_WorkGroupSize.x) S[(i>>6)*65u+(i&63u)]=0.0;
     barrier();
 
     // base offset into the per-(b,h) [T,DH] arrays
@@ -48,14 +48,14 @@ void main(){
         barrier();
         // save the pre-update state S_{t-1} for the backward pass
         if(save==1){ uint sb=(b*Hd+h)*T*DHl*DHl + t*DHl*DHl;
-            for(uint i=lid;i<DHl*DHl;i+=gl_WorkGroupSize.x) Sout[sb+i]=S[i]; barrier(); }
+            for(uint i=lid;i<DHl*DHl;i+=gl_WorkGroupSize.x) Sout[sb+i]=S[(i>>6)*65u+(i&63u)]; barrier(); }
         // Sk[j] = sum_i S[i,j]*k_i. 256 threads = 4 lanes per column j: lane g sums
         // its quarter of i, then the 4 partials combine. (DH=64, group=4.)
         {
             uint g = lid / DHl;            // lane 0..3
             uint j = lid % DHl;            // column 0..DH-1
             float s = 0.0;
-            for(uint i=g; i<DHl; i+=4u) s += S[i*DHl+j]*kk[i];
+            for(uint i=g; i<DHl; i+=4u) s += S[i*65u+j]*kk[i];
             part[lid] = s;
         }
         barrier();
@@ -66,8 +66,8 @@ void main(){
         float a_t = aa[0];   // scalar in-context lr (per-head scalar)
         // update: each thread updates its rows. S[i,j] = w_j*S[i,j] - a*k_i*Sk[j] + a*k_i*v_j
         for(uint idx=lid; idx<DHl*DHl; idx+=gl_WorkGroupSize.x){
-            uint i=idx/DHl, j=idx%DHl;
-            S[idx] = ww[j]*S[idx] - a_t*kk[i]*Sk[j] + a_t*kk[i]*vv[j];
+            uint i=idx >> 6, j=idx & 63u;
+            S[(idx>>6)*65u + (idx&63u)] = ww[j]*S[(idx>>6)*65u + (idx&63u)] - a_t*kk[i]*Sk[j] + a_t*kk[i]*vv[j];
         }
         barrier();
         // out_t[j] = sum_i r_i * S[i,j], same 4-lane-per-column reduction.
@@ -75,7 +75,7 @@ void main(){
             uint g = lid / DHl;
             uint j = lid % DHl;
             float o = 0.0;
-            for(uint i=g; i<DHl; i+=4u) o += rr[i]*S[i*DHl+j];
+            for(uint i=g; i<DHl; i+=4u) o += rr[i]*S[i*65u+j];
             part[lid] = o;
         }
         barrier();

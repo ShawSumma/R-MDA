@@ -1,46 +1,39 @@
 #version 450
-// c[m, n] = a[m, k] @ b[k, n], using cooperative-matrix (matrix-core) ops.
-// A and B are fp16; the accumulator and C are fp32 (the f16/f16/f32 config the
-// hardware exposes). Each subgroup computes one 16x16 tile of C by stepping over
-// K in 16-wide chunks. Dispatch one subgroup per tile: global = (n/16, m/16).
-// On this UMA part the matmul is memory-bandwidth-bound, so a larger reuse tile did
-// not help; the simple one-tile-per-subgroup kernel is kept for clarity.
+// fp16 cooperative-matrix matmul, register-blocked. Each subgroup computes a 16-row x
+// 64-col output strip = 4 accumulator tiles, loading the A 16x16 fragment once per
+// K-step and reusing it across the 4 B-tiles (no shared memory; RDNA3 L2 handles reuse).
+// 4 subgroups per workgroup -> 64-row x 64-col output block. This 64x64 block keeps the
+// GPU filled on the model's many SMALL per-layer matmuls (512x640 etc) -- a coarser
+// 256-wide block starves those (too few workgroups). Requires wave32 (set at pipeline
+// creation), m & n multiples of 64. Verified bit-identical to the scalar matmul.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-
-layout(local_size_x = 32) in;
-
-layout(std430, binding = 0) readonly buffer buf_a {
-    float16_t a[];
-};
-layout(std430, binding = 1) readonly buffer buf_b {
-    float16_t b[];
-};
-layout(std430, binding = 2) writeonly buffer buf_c {
-    float c[];
-};
-layout(push_constant) uniform pc {
-    uint m;
-    uint n;
-    uint k;
-};
-
-const uint TILE = 16;
-
+#extension GL_KHR_shader_subgroup_basic : require
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer BA { float16_t A[]; };
+layout(std430, binding = 1) readonly buffer BB { float16_t B[]; };
+layout(std430, binding = 2) writeonly buffer BC { float C[]; };
+layout(push_constant) uniform pc { uint m, n, k; };
+const uint T = 16;
 void main() {
-    uint row0 = gl_WorkGroupID.y * TILE;
-    uint col0 = gl_WorkGroupID.x * TILE;
-
-    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc =
-        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
-
-    for (uint kk = 0; kk < k; kk = kk + TILE) {
-        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> ma;
-        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> mb;
-        coopMatLoad(ma, a, (row0 * k + kk), k, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(mb, b, (kk * n + col0), n, gl_CooperativeMatrixLayoutRowMajor);
-        acc = coopMatMulAdd(ma, mb, acc);
+    uint sg = gl_SubgroupID;
+    uint row0 = gl_WorkGroupID.y * 64u + sg * 16u;
+    uint col0 = gl_WorkGroupID.x * 64u;
+    coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator> ac[4];
+    for (int i = 0; i < 4; i = i + 1) {
+        ac[i] = coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator>(0.0);
     }
-    coopMatStore(acc, c, (row0 * n + col0), n, gl_CooperativeMatrixLayoutRowMajor);
+    for (uint kk = 0; kk < k; kk = kk + T) {
+        coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseA> ma;
+        coopMatLoad(ma, A, row0 * k + kk, k, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint t = 0; t < 4u; t = t + 1) {
+            coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseB> mb;
+            coopMatLoad(mb, B, kk * n + col0 + t * 16u, n, gl_CooperativeMatrixLayoutRowMajor);
+            ac[t] = coopMatMulAdd(ma, mb, ac[t]);
+        }
+    }
+    for (uint t = 0; t < 4u; t = t + 1) {
+        coopMatStore(ac[t], C, row0 * n + col0 + t * 16u, n, gl_CooperativeMatrixLayoutRowMajor);
+    }
 }

@@ -14,9 +14,9 @@
 // wkv7 indexes base=(b*head+h)*t*dh + ti*dh + e. These differ, so we repack on
 // the host (small, fp32, fine for now). Done in wkv_pack/unpack below.
 
-typedef struct fwd_scratch fwd_scratch_t;
+typedef struct fwd_scratch_t fwd_scratch_t;
 
-struct fwd_scratch {
+struct fwd_scratch_t {
     // [bt, d] running residual stream
     vkc_buf_t x;
     // [b, d] timestep conditioning
@@ -166,39 +166,39 @@ static fwd_scratch_t fwd_alloc(model_t *m) {
 }
 
 // push-constant structs matching each shader
-typedef struct mm_pc mm_pc_t;
-struct mm_pc {
+typedef struct mm_pc_t mm_pc_t;
+struct mm_pc_t {
     uint32_t m;
     uint32_t n;
     uint32_t k;
 };
-typedef struct cast_pc cast_pc_t;
-struct cast_pc {
+typedef struct cast_pc_t cast_pc_t;
+struct cast_pc_t {
     uint32_t n;
     uint32_t op;
 };
-typedef struct normheads_pc normheads_pc_t;
-struct normheads_pc {
+typedef struct normheads_pc_t normheads_pc_t;
+struct normheads_pc_t {
     uint32_t n_vec;
     uint32_t dh;
     uint32_t op;
 };
-typedef struct emb_pc emb_pc_t;
-struct emb_pc {
+typedef struct emb_pc_t emb_pc_t;
+struct emb_pc_t {
     uint32_t bt;
     uint32_t d;
     uint32_t seqlen;
     uint32_t op;
 };
-typedef struct ts_pc ts_pc_t;
-struct ts_pc {
+typedef struct ts_pc_t ts_pc_t;
+struct ts_pc_t {
     uint32_t bt;
     uint32_t d;
     uint32_t seqlen;
     uint32_t op;
 };
-typedef struct wkv_pc wkv_pc_t;
-struct wkv_pc {
+typedef struct wkv_pc_t wkv_pc_t;
+struct wkv_pc_t {
     uint32_t bsz;
     uint32_t hd;
     uint32_t t;
@@ -206,34 +206,50 @@ struct wkv_pc {
     uint32_t dir;
     uint32_t save;
 };
-typedef struct elem_pc elem_pc_t;
-struct elem_pc {
+// wkv backward push constant: same fields as the forward minus `save`.
+typedef struct wkv_bwd_pc_t wkv_bwd_pc_t;
+struct wkv_bwd_pc_t {
+    uint32_t bsz;
+    uint32_t hd;
+    uint32_t t;
+    uint32_t dh;
+    uint32_t dir;
+};
+typedef struct elem_pc_t elem_pc_t;
+struct elem_pc_t {
     uint32_t n;
     uint32_t op;
 };
-typedef struct rms_pc rms_pc_t;
-struct rms_pc {
+typedef struct rms_pc_t rms_pc_t;
+struct rms_pc_t {
     uint32_t rows;
     uint32_t d;
     uint32_t op;
 };
-typedef struct ce_pc ce_pc_t;
-struct ce_pc {
+typedef struct ce_pc_t ce_pc_t;
+struct ce_pc_t {
     uint32_t rows;
     uint32_t vocab;
 };
-typedef struct adaln_pc adaln_pc_t;
-struct adaln_pc {
+// argmax kernel push constant: per-row top-1 over the vocab logits.
+typedef struct argmax_pc_t argmax_pc_t;
+struct argmax_pc_t {
+    uint32_t rows;
+    uint32_t vocab;
+};
+typedef struct adaln_pc_t adaln_pc_t;
+struct adaln_pc_t {
     uint32_t bt;
     uint32_t d;
     uint32_t seqlen;
     uint32_t op;
 };
 
-typedef struct vec_pc vec_pc_t;
-struct vec_pc {
+typedef struct vec_pc_t vec_pc_t;
+struct vec_pc_t {
     uint32_t n;
     uint32_t op;
+    float scale;
 };
 
 // GPU elementwise: op 0 -> a += b, op 1 -> a *= b. Replaces host loops over
@@ -242,6 +258,7 @@ static void vec_op(model_t *m, vkc_buf_t *a, vkc_buf_t *b, uint32_t n, uint32_t 
     vec_pc_t pc = (vec_pc_t) {
         .n = n,
         .op = op,
+        .scale = 0.0f,
     };
     vkc_buf_t *bufs[2] = {
         a,
@@ -250,8 +267,19 @@ static void vec_op(model_t *m, vkc_buf_t *a, vkc_buf_t *b, uint32_t n, uint32_t 
     vkc_run(m->c, &m->k_vec, bufs, (n + 255) / 256, 1, 1, &pc);
 }
 
-typedef struct repack_pc repack_pc_t;
-struct repack_pc {
+// scalar multiply a *= scale on the GPU (op 7; b unused).
+static void vec_scale(model_t *m, vkc_buf_t *a, uint32_t n, float scale) {
+    vec_pc_t pc = (vec_pc_t) {
+        .n = n,
+        .op = 7,
+        .scale = scale,
+    };
+    vkc_buf_t *bufs[2] = { a, a };
+    vkc_run(m->c, &m->k_vec, bufs, (n + 255) / 256, 1, 1, &pc);
+}
+
+typedef struct repack_pc_t repack_pc_t;
+struct repack_pc_t {
     uint32_t bt;
     uint32_t hd;
     uint32_t dh;
@@ -320,7 +348,7 @@ static void refresh_w16(model_t *m) {
         return;
     }
     vkc_begin(m->c);
-    for (uint32_t i = 0; i < m->n_params; i = i + 1) {
+    for (uint32_t i = 0; i < m->n_params; ++i) {
         param_t *p = &m->params[i];
         cast_buf(m, &p->w, &p->w16, p->n, 0);
     }
@@ -342,8 +370,14 @@ static void mm16_pre(model_t *m, vkc_buf_t *a16, param_t *p, vkc_buf_t *out,
         &p->w16,
         out,
     };
-    // each workgroup computes a 32x32 output block (2x2 of 16x16 tiles).
-    vkc_run(m->c, &m->k_mm16, bufs, n / 16, rows / 16, 1, &pc);
+    // shape-dispatch: the wide 256x64 block maximizes reuse on large-n matmuls (the
+    // vocab head), but starves on small per-layer matmuls (too few workgroups). Use it
+    // only when n is large and rows is a multiple of 256; otherwise the 64x64 block.
+    if (n >= 4096 && (rows % 256) == 0) {
+        vkc_run(m->c, &m->k_mm16w, bufs, n / 64, rows / 256, 1, &pc);
+    } else {
+        vkc_run(m->c, &m->k_mm16, bufs, n / 64, rows / 64, 1, &pc);
+    }
 }
 
 // fp16 matmul: casts the fp32 activation a into the shared a16 scratch, then runs.
@@ -364,9 +398,9 @@ static void pack_heads(model_t *m, vkc_buf_t *src, vkc_buf_t *dst) {
     uint32_t dh = d / hd;
     float *s = src->ptr;
     float *o = dst->ptr;
-    for (uint32_t b = 0; b < cfg.batch; b = b + 1) {
-        for (uint32_t h = 0; h < hd; h = h + 1) {
-            for (uint32_t t = 0; t < cfg.seqlen; t = t + 1) {
+    for (uint32_t b = 0; b < cfg.batch; ++b) {
+        for (uint32_t h = 0; h < hd; ++h) {
+            for (uint32_t t = 0; t < cfg.seqlen; ++t) {
                 uint32_t src_i = (b * cfg.seqlen + t) * d + h * dh;
                 uint32_t dst_i = ((b * hd + h) * cfg.seqlen + t) * dh;
                 memcpy(o + dst_i, s + src_i, dh * sizeof(float));
@@ -382,9 +416,9 @@ static void unpack_heads(model_t *m, vkc_buf_t *src, vkc_buf_t *dst) {
     uint32_t dh = d / hd;
     float *s = src->ptr;
     float *o = dst->ptr;
-    for (uint32_t b = 0; b < cfg.batch; b = b + 1) {
-        for (uint32_t h = 0; h < hd; h = h + 1) {
-            for (uint32_t t = 0; t < cfg.seqlen; t = t + 1) {
+    for (uint32_t b = 0; b < cfg.batch; ++b) {
+        for (uint32_t h = 0; h < hd; ++h) {
+            for (uint32_t t = 0; t < cfg.seqlen; ++t) {
                 uint32_t dst_i = (b * cfg.seqlen + t) * d + h * dh;
                 uint32_t src_i = ((b * hd + h) * cfg.seqlen + t) * dh;
                 memcpy(o + dst_i, s + src_i, dh * sizeof(float));
@@ -396,7 +430,7 @@ static void unpack_heads(model_t *m, vkc_buf_t *src, vkc_buf_t *dst) {
 // sigmoid/clamp a buffer in place on the host (for w in (0,1), a in (0,1))
 static void host_sigmoid(vkc_buf_t *b, uint32_t n) {
     float *p = b->ptr;
-    for (uint32_t i = 0; i < n; i = i + 1) {
+    for (uint32_t i = 0; i < n; ++i) {
         p[i] = 1.0f / (1.0f + expf(-p[i]));
     }
 }
@@ -406,14 +440,14 @@ static void host_sigmoid(vkc_buf_t *b, uint32_t n) {
 // projection (eigenvalues in [0, a]); without it the state recurrence diverges.
 static void host_norm_heads(vkc_buf_t *buf, uint32_t n_vec, uint32_t dh) {
     float *p = buf->ptr;
-    for (uint32_t v = 0; v < n_vec; v = v + 1) {
+    for (uint32_t v = 0; v < n_vec; ++v) {
         float *vec = p + v * dh;
         float ss = 0.0f;
-        for (uint32_t e = 0; e < dh; e = e + 1) {
+        for (uint32_t e = 0; e < dh; ++e) {
             ss += vec[e] * vec[e];
         }
         float inv = 1.0f / (sqrtf(ss) + 1e-6f);
-        for (uint32_t e = 0; e < dh; e = e + 1) {
+        for (uint32_t e = 0; e < dh; ++e) {
             vec[e] *= inv;
         }
     }
@@ -422,15 +456,15 @@ static void host_norm_heads(vkc_buf_t *buf, uint32_t n_vec, uint32_t dh) {
 // same, but also store each per-head vector's 1/||.|| into inv_norm[v]. The
 // backward of k_hat = k/||k|| needs this scale: dk = (dk_hat - k_hat*(k_hat.dk_hat))/||k||.
 static void host_norm_heads_save(float *p, float *inv_norm, uint32_t n_vec, uint32_t dh) {
-    for (uint32_t v = 0; v < n_vec; v = v + 1) {
+    for (uint32_t v = 0; v < n_vec; ++v) {
         float *vec = p + v * dh;
         float ss = 0.0f;
-        for (uint32_t e = 0; e < dh; e = e + 1) {
+        for (uint32_t e = 0; e < dh; ++e) {
             ss += vec[e] * vec[e];
         }
         float inv = 1.0f / (sqrtf(ss) + 1e-6f);
         inv_norm[v] = inv;
-        for (uint32_t e = 0; e < dh; e = e + 1) {
+        for (uint32_t e = 0; e < dh; ++e) {
             vec[e] *= inv;
         }
     }
@@ -507,10 +541,10 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
     //  plain pre-norm RWKV. The adaLN path is wired but cond=0 means no-op.)
 
     // 2. blocks
-    for (uint32_t l = 0; l < cfg.n_layer; l = l + 1) {
+    for (uint32_t l = 0; l < cfg.n_layer; ++l) {
         mlayer_t *ly = &m->layers[l];
 
-        // --- time mixing ---
+        // time mixing
         // h = rmsnorm(x, n1) -> tmp
         rmsnorm_fwd(m, &sc->x, &ly->n1->w, &sc->tmp, &sc->rms_stash, bt, d);
         // token-shift tmp -> tmp2
@@ -529,8 +563,7 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         };
         vkc_run(m->c, &m->k_tshift, tsb, (bt * d + 255) / 256, 1, 1, &tpc);
 
-        // project to k,v,r,w,a from tmp2: all five share the same activation, so
-        // cast it to fp16 once and reuse it across the five matmuls.
+        // project to k,v,r,w,a from tmp2: cast the shared activation to fp16 once.
         cast_buf(m, &sc->tmp2, &sc->a16, bt * d, 0);
         mm16_pre(m, &sc->a16, ly->wk, &sc->pk, bt, d, d);
         mm16_pre(m, &sc->a16, ly->wv, &sc->pv, bt, d, d);
@@ -548,18 +581,16 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         // For clarity, pack each buffer through host into the same buffer.
         // k:
         {
-            // GPU repack (bit-identical to host pack_heads), copying back on the
-            // GPU (op 5) instead of a host memcpy over mapped memory.
+            // GPU repack (bit-identical to host pack_heads) writing each packed result
+            // straight into a distinct scratch buffer (the backward grad buffers, free
+            // in the forward), so wkv reads them without a copy-back. pk is repacked in
+            // place via tmp since it also needs the per-head norm next.
             gpu_repack(m, &sc->pk, &sc->tmp, bt, hd, dh, cfg.seqlen, 0);
             vec_op(m, &sc->pk, &sc->tmp, bt * d, 5);
-            gpu_repack(m, &sc->pv, &sc->tmp, bt, hd, dh, cfg.seqlen, 0);
-            vec_op(m, &sc->pv, &sc->tmp, bt * d, 5);
-            gpu_repack(m, &sc->pr, &sc->tmp, bt, hd, dh, cfg.seqlen, 0);
-            vec_op(m, &sc->pr, &sc->tmp, bt * d, 5);
-            gpu_repack(m, &sc->pw, &sc->tmp, bt, hd, dh, cfg.seqlen, 0);
-            vec_op(m, &sc->pw, &sc->tmp, bt * d, 5);
-            gpu_repack(m, &sc->pa, &sc->tmp, bt, hd, dh, cfg.seqlen, 0);
-            vec_op(m, &sc->pa, &sc->tmp, bt * d, 5);
+            gpu_repack(m, &sc->pv, &sc->dpv, bt, hd, dh, cfg.seqlen, 0);
+            gpu_repack(m, &sc->pr, &sc->dpr, bt, hd, dh, cfg.seqlen, 0);
+            gpu_repack(m, &sc->pw, &sc->dpw, bt, hd, dh, cfg.seqlen, 0);
+            gpu_repack(m, &sc->pa, &sc->dpa, bt, hd, dh, cfg.seqlen, 0);
             // unit-norm the removal/replacement key per head on the GPU -> stable
             // delta rule (inv unused in forward; bind rms_stash as the slot).
             norm_heads(m, &sc->pk, &sc->rms_stash, cfg.batch * hd * cfg.seqlen, dh, 0);
@@ -574,23 +605,28 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         };
         vkc_buf_t *wb[7] = {
             &sc->pk,
-            &sc->pv,
-            &sc->pr,
-            &sc->pw,
-            &sc->pa,
+            &sc->dpv,
+            &sc->dpr,
+            &sc->dpw,
+            &sc->dpa,
             &sc->po,
             &sc->sstate,
         };
+        // the two bidirectional passes are independent (different outputs), so let
+        // them overlap: no barrier after the first. The second keeps its barrier so
+        // the averaging below waits for both.
+        vkc_set_nobar(m->c, 1);
         vkc_run(m->c, &m->k_wkv_f, wb, cfg.batch * hd, 1, 1, &wpc);
+        vkc_set_nobar(m->c, 0);
         // bidirectional: also run right-to-left and sum the outputs
         wkv_pc_t wpc2 = wpc;
         wpc2.dir = 1;
         vkc_buf_t *wb2[7] = {
             &sc->pk,
-            &sc->pv,
-            &sc->pr,
-            &sc->pw,
-            &sc->pa,
+            &sc->dpv,
+            &sc->dpr,
+            &sc->dpw,
+            &sc->dpa,
             &sc->po2,
             &sc->sstate2,
         };
@@ -603,9 +639,11 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         mm16(m, sc, &sc->tmp2, ly->wo, &sc->tmp, bt, d, d);
         vec_op(m, &sc->x, &sc->tmp, bt * d, 0);
 
-        // --- channel mixing (ffn) ---
+        // channel mixing (ffn)
         rmsnorm_fwd(m, &sc->x, &ly->n2->w, &sc->tmp, &sc->rms_stash, bt, d);
-        mm16(m, sc, &sc->tmp, ly->w_gate, &sc->hbuf, bt, cfg.ffn_hidden, d);
+        // gate and up share the same input (tmp): cast it to fp16 once for both matmuls.
+        cast_buf(m, &sc->tmp, &sc->a16, bt * d, 0);
+        mm16_pre(m, &sc->a16, ly->w_gate, &sc->hbuf, bt, cfg.ffn_hidden, d);
         // silu(hbuf) in place
         elem_pc_t spc = (elem_pc_t) {
             .n = bt * cfg.ffn_hidden,
@@ -617,7 +655,7 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         };
         vkc_run(m->c, &m->k_elem, seb, (bt * cfg.ffn_hidden + 255) / 256, 1, 1, &spc);
         // up projection, multiply (silu(gate) * up) on the GPU
-        mm16(m, sc, &sc->tmp, ly->w_up, &sc->pre, bt, cfg.ffn_hidden, d);
+        mm16_pre(m, &sc->a16, ly->w_up, &sc->pre, bt, cfg.ffn_hidden, d);
         vec_op(m, &sc->hbuf, &sc->pre, bt * cfg.ffn_hidden, 1);
         // down projection -> tmp2, add residual on the GPU
         mm16(m, sc, &sc->hbuf, ly->w_down, &sc->tmp2, bt, d, cfg.ffn_hidden);
@@ -631,6 +669,12 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
     // snapshot logits before CE overwrites them with dlogits (for inference),
     // copied on the GPU instead of a large host memcpy over mapped memory.
     vec_op(m, &sc->logits_save, &sc->logits, bt * m->cfg.vocab, 5);
+
+    // inference (generation) only needs the logits -- skip the CE loss + host reduce.
+    if (m->infer) {
+        vkc_flush(m->c);
+        return 0.0f;
+    }
 
     // 4. masked CE loss (also writes dlogits into logits)
     ce_pc_t cpc = (ce_pc_t) {
@@ -654,7 +698,7 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
     float *mk = sc->mask.ptr;
     double total = 0.0;
     double cnt = 0.0;
-    for (uint32_t i = 0; i < bt; i = i + 1) {
+    for (uint32_t i = 0; i < bt; ++i) {
         total += lp[i];
         cnt += mk[i];
     }

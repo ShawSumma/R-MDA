@@ -12,6 +12,7 @@ layout(std430, binding = 1) readonly buffer buf_b {
 layout(push_constant) uniform pc {
     uint n;
     uint op;
+    float scale;
 };
 
 void main() {
@@ -29,7 +30,11 @@ void main() {
         a[i] = 0.5 * (a[i] + b[i]);        // op 3: average (for bidirectional mean)
     } else if (op == 4) {
         a[i] *= 0.5;                       // op 4: in-place halve (b unused)
-    } else {
+    } else if (op == 5) {
         a[i] = b[i];                       // op 5: copy b into a
+    } else if (op == 6) {
+        a[i] *= b[i] * (1.0 - b[i]);       // op 6: a *= sigmoid'(.) given b = sigmoid
+    } else {
+        a[i] *= scale;                     // op 7: a *= scale (b unused)
     }
 }

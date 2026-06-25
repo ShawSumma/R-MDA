@@ -11,19 +11,19 @@
 
 #define VKC_CK(x) vkc_ck((x), __FILE__, __LINE__)
 
-typedef struct vkc_buf vkc_buf_t;
-typedef struct vkc vkc_t;
-typedef struct vkc_kernel vkc_kernel_t;
+typedef struct vkc_buf_t vkc_buf_t;
+typedef struct vkc_t vkc_t;
+typedef struct vkc_kernel_t vkc_kernel_t;
 typedef struct vkc_read_spv_t vkc_read_spv_t;
 
-struct vkc_buf {
+struct vkc_buf_t {
     VkBuffer buf;
     VkDeviceMemory mem;
     void *ptr;
     VkDeviceSize sz;
 };
 
-struct vkc {
+struct vkc_t {
     VkInstance inst;
     VkPhysicalDevice pd;
     VkDevice dev;
@@ -37,9 +37,12 @@ struct vkc {
     // submit + queue-wait-idle round trip, which dominates with many small kernels.
     VkCommandBuffer rec;
     int recording;
+    // when set, recorded dispatches skip the trailing barrier -- use only for runs of
+    // mutually independent dispatches (e.g. the two bidirectional wkv passes).
+    int nobar;
 };
 
-struct vkc_kernel {
+struct vkc_kernel_t {
     VkPipeline pipe;
     VkPipelineLayout pl;
     VkDescriptorSetLayout dsl;
@@ -62,7 +65,7 @@ static inline void vkc_ck(VkResult vkc_r, const char *file, size_t line) {
 static uint32_t vkc_memtype(VkPhysicalDevice pd, uint32_t bits, VkMemoryPropertyFlags want) {
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(pd, &mp);
-    for (uint32_t i = 0; i < mp.memoryTypeCount; i = i + 1) {
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
         if ((bits & (1u << i)) != 0 && (mp.memoryTypes[i].propertyFlags & want) == want) {
             return i;
         }
@@ -105,7 +108,7 @@ static vkc_t vkc_init(void) {
     VkQueueFamilyProperties *qf = malloc(nqf * sizeof(VkQueueFamilyProperties));
     vkGetPhysicalDeviceQueueFamilyProperties(c.pd, &nqf, qf);
     c.qfi = 0;
-    for (uint32_t i = 0; i < nqf; i = i + 1) {
+    for (uint32_t i = 0; i < nqf; ++i) {
         if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
             c.qfi = i;
             break;
@@ -137,9 +140,15 @@ static vkc_t vkc_init(void) {
         .storageBuffer16BitAccess = VK_TRUE,
         .uniformAndStorageBuffer16BitAccess = VK_TRUE,
     };
+    VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_ctl = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES,
+        .pNext = &storage16,
+        .subgroupSizeControl = VK_TRUE,
+        .computeFullSubgroups = VK_TRUE,
+    };
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
-        .pNext = &storage16,
+        .pNext = &subgroup_ctl,
         .shaderBufferFloat32AtomicAdd = VK_TRUE,
     };
     const char *dev_ext[2] = {
@@ -239,7 +248,7 @@ static vkc_kernel_t vkc_load(vkc_t *c, const char *spv, uint32_t nbuf, uint32_t 
     VKC_CK(vkCreateShaderModule(c->dev, &smi, 0, &sm));
 
     VkDescriptorSetLayoutBinding *b = calloc(nbuf, sizeof(VkDescriptorSetLayoutBinding));
-    for (uint32_t i = 0; i < nbuf; i = i + 1) {
+    for (uint32_t i = 0; i < nbuf; ++i) {
         b[i] = (VkDescriptorSetLayoutBinding) {
             .binding = i,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -269,10 +278,18 @@ static vkc_kernel_t vkc_load(vkc_t *c, const char *spv, uint32_t nbuf, uint32_t 
     };
     VKC_CK(vkCreatePipelineLayout(c->dev, &pli, 0, &k.pl));
 
+    // pin the subgroup to 32 lanes (wave32). RDNA3 WMMA / cooperative-matrix runs in
+    // wave32; the device defaults to wave64, which breaks multi-subgroup kernels that
+    // assume 32-lane waves. Requiring 32 makes gl_SubgroupID counts deterministic.
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .requiredSubgroupSize = 32,
+    };
     VkComputePipelineCreateInfo cpi = (VkComputePipelineCreateInfo) {
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = (VkPipelineShaderStageCreateInfo) {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = &rss,
             .stage = VK_SHADER_STAGE_COMPUTE_BIT,
             .module = sm,
             .pName = "main",
@@ -296,7 +313,7 @@ static void vkc_run(vkc_t *c, vkc_kernel_t *k, vkc_buf_t **bufs, uint32_t gx, ui
 
     VkWriteDescriptorSet *w = calloc(k->nbuf, sizeof(VkWriteDescriptorSet));
     VkDescriptorBufferInfo *bi = calloc(k->nbuf, sizeof(VkDescriptorBufferInfo));
-    for (uint32_t i = 0; i < k->nbuf; i = i + 1) {
+    for (uint32_t i = 0; i < k->nbuf; ++i) {
         bi[i] = (VkDescriptorBufferInfo) {
             .buffer = bufs[i]->buf,
             .range = bufs[i]->sz,
@@ -324,6 +341,9 @@ static void vkc_run(vkc_t *c, vkc_kernel_t *k, vkc_buf_t **bufs, uint32_t gx, ui
             vkCmdPushConstants(c->rec, k->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, k->push_sz, push);
         }
         vkCmdDispatch(c->rec, gx, gy, gz);
+        if (c->nobar) {
+            return;
+        }
         VkMemoryBarrier mb = (VkMemoryBarrier) {
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
@@ -378,8 +398,15 @@ static void vkc_run(vkc_t *c, vkc_kernel_t *k, vkc_buf_t **bufs, uint32_t gx, ui
     vkFreeDescriptorSets(c->dev, c->dpool, 1, &ds);
 }
 
+// mark subsequent recorded dispatches as barrier-free (for independent runs); pass 0
+// to restore the default per-dispatch barrier.
+static void vkc_set_nobar(vkc_t *c, int on) {
+    c->nobar = on;
+}
+
 // begin recording a batch of dispatches into one command buffer.
 static void vkc_begin(vkc_t *c) {
+    c->nobar = 0;
     VkCommandBufferAllocateInfo cbi = (VkCommandBufferAllocateInfo) {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = c->cpool,

@@ -63,7 +63,7 @@ static void mm_dB(
 static void host_add(vkc_buf_t *dst, vkc_buf_t *src, uint32_t n) {
     float *d = dst->ptr;
     float *s = src->ptr;
-    for (uint32_t i = 0; i < n; i = i + 1) {
+    for (uint32_t i = 0; i < n; ++i) {
         d[i] = d[i] + s[i];
     }
 }

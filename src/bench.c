@@ -41,11 +41,11 @@ int main(void) {
 
     uint32_t warmup = 3;
     uint32_t iters = 20;
-    for (uint32_t i = 0; i < warmup; i = i + 1) {
+    for (uint32_t i = 0; i < warmup; ++i) {
         model_forward(m, &sc);
     }
     double t0 = now_sec();
-    for (uint32_t i = 0; i < iters; i = i + 1) {
+    for (uint32_t i = 0; i < iters; ++i) {
         model_forward(m, &sc);
     }
     double dt = (now_sec() - t0) / iters;

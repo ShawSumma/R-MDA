@@ -13,7 +13,7 @@ static uint32_t load_ckpt(model_t *m) {
     }
     uint32_t step = 0;
     fread(&step, sizeof(uint32_t), 1, f);
-    for (uint32_t i = 0; i < m->n_params; i = i + 1) {
+    for (uint32_t i = 0; i < m->n_params; ++i) {
         param_t *p = &m->params[i];
         fread(p->w.ptr, sizeof(float), p->n, f);
         fread(p->m.ptr, sizeof(float), p->n, f);
@@ -31,7 +31,7 @@ static void forward_logits(model_t *m, fwd_scratch_t *sc) {
 // argmax over a vocab-sized row of logits.
 static uint32_t argmax_row(float *row, uint32_t vocab) {
     uint32_t best = 0;
-    for (uint32_t v = 1; v < vocab; v = v + 1) {
+    for (uint32_t v = 1; v < vocab; ++v) {
         if (row[v] > row[best]) {
             best = v;
         }
@@ -70,7 +70,7 @@ int main(void) {
     uint32_t bucket_correct[3] = {0, 0, 0};
     uint32_t bucket_total[3] = {0, 0, 0};
     int n_batch = 8;
-    for (int it = 0; it < n_batch; it = it + 1) {
+    for (int it = 0; it < n_batch; ++it) {
         make_batch(
             &cp,
             cfg.batch,
@@ -87,7 +87,7 @@ int main(void) {
         uint32_t *ids = sc.ids.ptr;
         uint32_t *target = sc.target.ptr;
         float *logits = sc.logits_save.ptr;
-        for (uint32_t i = 0; i < cfg.batch * cfg.seqlen; i = i + 1) {
+        for (uint32_t i = 0; i < cfg.batch * cfg.seqlen; ++i) {
             // CE is per-token; convert to per-byte by spreading each token's loss
             // over its byte length, so bits/byte stays comparable across vocabs.
             uint32_t blen = cp.tok.entries[target[i]].len;
@@ -133,15 +133,15 @@ int main(void) {
     uint32_t correct = 0;
     uint32_t total = 0;
     printf("actual : ");
-    for (uint32_t s = 0; s < cfg.seqlen; s = s + 1) {
+    for (uint32_t s = 0; s < cfg.seqlen; ++s) {
         tok_entry_t *e = &cp.tok.entries[target[s]];
         fwrite(e->bytes, 1, e->len, stdout);
     }
     printf("\nmodel  : ");
-    for (uint32_t s = 0; s < cfg.seqlen; s = s + 1) {
+    for (uint32_t s = 0; s < cfg.seqlen; ++s) {
         if (ids[s] != data_mask_id) {
             tok_entry_t *e = &cp.tok.entries[target[s]];
-            for (uint32_t k = 0; k < e->len; k = k + 1) {
+            for (uint32_t k = 0; k < e->len; ++k) {
                 putchar(' ');
             }
             continue;

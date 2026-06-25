@@ -1,0 +1,44 @@
+#version 450
+// per-row argmax over a [rows x vocab] logits buffer: outputs the top-1 token id and
+// its logit (confidence) per row. One workgroup per row, reducing in shared memory.
+// Avoids a host loop over the 16k-wide logits (the UMA write-combined-read trap).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer L { float logits[]; };
+layout(std430, binding = 1) writeonly buffer T { uint tok[]; };
+layout(std430, binding = 2) writeonly buffer C { float conf[]; };
+layout(push_constant) uniform pc { uint rows; uint vocab; };
+shared float sval[256];
+shared uint sidx[256];
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= rows) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * vocab;
+    float best = -1e30;
+    uint bi = 0;
+    for (uint v = tid; v < vocab; v += gl_WorkGroupSize.x) {
+        float x = logits[base + v];
+        if (x > best) {
+            best = x;
+            bi = v;
+        }
+    }
+    sval[tid] = best;
+    sidx[tid] = bi;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride = stride / 2u) {
+        if (tid < stride) {
+            if (sval[tid + stride] > sval[tid]) {
+                sval[tid] = sval[tid + stride];
+                sidx[tid] = sidx[tid + stride];
+            }
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        tok[row] = sidx[0];
+        conf[row] = sval[0];
+    }
+}

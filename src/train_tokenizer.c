@@ -23,9 +23,9 @@
 #define PRUNE_KEEP 0.75
 #define NEG_INF (-1e30)
 
-typedef struct cand cand_t;
+typedef struct cand_t cand_t;
 
-struct cand {
+struct cand_t {
     char bytes[TOK_MAX_LEN];
     uint32_t len;
     double logp;
@@ -33,9 +33,9 @@ struct cand {
     double score;
 };
 
-typedef struct corpus corpus_t;
+typedef struct corpus_t corpus_t;
 
-struct corpus {
+struct corpus_t {
     unsigned char *bytes;
     size_t len;
 };
@@ -63,11 +63,10 @@ static double rand_unit(void) {
     return (double)rand() / ((double)RAND_MAX + 1.0);
 }
 
-// ---- substring hash map (counting during seeding) --------------------------
+// substring hash map (counting during seeding)
+typedef struct subhash_t subhash_t;
 
-typedef struct subhash subhash_t;
-
-struct subhash {
+struct subhash_t {
     char *keys;
     uint8_t *klen;
     double *count;
@@ -89,7 +88,7 @@ static subhash_t subhash_make(uint32_t cap) {
 
 static void subhash_add(subhash_t *h, const char *s, uint32_t len) {
     uint32_t x = 2166136261u;
-    for (uint32_t j = 0; j < len; j = j + 1) {
+    for (uint32_t j = 0; j < len; ++j) {
         x = (x ^ (unsigned char)s[j]) * 16777619u;
     }
     uint32_t slot = x & h->mask;
@@ -106,8 +105,7 @@ static void subhash_add(subhash_t *h, const char *s, uint32_t len) {
     h->count[slot] = 1.0;
 }
 
-// ---- candidate seeding -----------------------------------------------------
-
+// candidate seeding
 static int cand_by_score_desc(const void *pa, const void *pb) {
     const cand_t *a = pa;
     const cand_t *b = pb;
@@ -130,12 +128,12 @@ static uint32_t seed_candidates(corpus_t *cp, cand_t *out) {
         scan = SEED_SCAN_BYTES;
     }
     fprintf(stderr, "seeding: hashing substrings (len 2..%u) over %zu bytes...\n", SEED_MAX_LEN, scan);
-    for (size_t i = 0; i < scan; i = i + 1) {
+    for (size_t i = 0; i < scan; ++i) {
         uint32_t cap_len = SEED_MAX_LEN;
         if (i + cap_len > scan) {
             cap_len = (uint32_t)(scan - i);
         }
-        for (uint32_t l = 2; l <= cap_len; l = l + 1) {
+        for (uint32_t l = 2; l <= cap_len; ++l) {
             subhash_add(&h, (const char *)cp->bytes + i, l);
         }
     }
@@ -143,7 +141,7 @@ static uint32_t seed_candidates(corpus_t *cp, cand_t *out) {
     uint32_t pool_cap = 1u << 21;
     cand_t *pool = malloc(pool_cap * sizeof(cand_t));
     uint32_t pool_n = 0;
-    for (uint32_t slot = 0; slot < h.cap; slot = slot + 1) {
+    for (uint32_t slot = 0; slot < h.cap; ++slot) {
         if (h.used[slot] == 0 || h.count[slot] < 2.0) {
             continue;
         }
@@ -169,7 +167,7 @@ static uint32_t seed_candidates(corpus_t *cp, cand_t *out) {
 
     uint32_t keep = (pool_n < SEED_KEEP) ? pool_n : SEED_KEEP;
     uint32_t n = 0;
-    for (uint32_t b = 0; b < 256; b = b + 1) {
+    for (uint32_t b = 0; b < 256; ++b) {
         out[n].bytes[0] = (char)b;
         out[n].len = 1;
         out[n].expected = 1.0;
@@ -177,7 +175,7 @@ static uint32_t seed_candidates(corpus_t *cp, cand_t *out) {
         out[n].score = 0.0;
         n = n + 1;
     }
-    for (uint32_t i = 0; i < keep; i = i + 1) {
+    for (uint32_t i = 0; i < keep; ++i) {
         out[n] = pool[i];
         n = n + 1;
     }
@@ -185,22 +183,21 @@ static uint32_t seed_candidates(corpus_t *cp, cand_t *out) {
 
     // initialize logp from the seed counts (normalized), then EM refines them.
     double total = 0.0;
-    for (uint32_t i = 0; i < n; i = i + 1) {
+    for (uint32_t i = 0; i < n; ++i) {
         total = total + out[i].expected;
     }
-    for (uint32_t i = 0; i < n; i = i + 1) {
+    for (uint32_t i = 0; i < n; ++i) {
         out[i].logp = log(out[i].expected / total);
     }
     return n;
 }
 
-// ---- EM over the current candidate set -------------------------------------
-
+// EM over the current candidate set
 // find a candidate index for the exact substring s[0..len) by linear probe in a
 // transient hash built each EM round; returns -1 if absent.
-typedef struct lookup lookup_t;
+typedef struct lookup_t lookup_t;
 
-struct lookup {
+struct lookup_t {
     int32_t *slot_id;
     char *keys;
     uint8_t *klen;
@@ -221,12 +218,12 @@ static lookup_t lookup_build(cand_t *cands, uint32_t n) {
     lk.keys = calloc((size_t)cap * TOK_MAX_LEN, 1);
     lk.klen = calloc(cap, 1);
     lk.used = calloc(cap, 1);
-    for (uint32_t i = 0; i < cap; i = i + 1) {
+    for (uint32_t i = 0; i < cap; ++i) {
         lk.slot_id[i] = -1;
     }
-    for (uint32_t i = 0; i < n; i = i + 1) {
+    for (uint32_t i = 0; i < n; ++i) {
         uint32_t x = 2166136261u;
-        for (uint32_t j = 0; j < cands[i].len; j = j + 1) {
+        for (uint32_t j = 0; j < cands[i].len; ++j) {
             x = (x ^ (unsigned char)cands[i].bytes[j]) * 16777619u;
         }
         uint32_t slot = x & lk.mask;
@@ -250,7 +247,7 @@ static void lookup_free(lookup_t *lk) {
 
 static int32_t lookup_find(const lookup_t *lk, const char *s, uint32_t len) {
     uint32_t x = 2166136261u;
-    for (uint32_t j = 0; j < len; j = j + 1) {
+    for (uint32_t j = 0; j < len; ++j) {
         x = (x ^ (unsigned char)s[j]) * 16777619u;
     }
     uint32_t slot = x & lk->mask;
@@ -273,13 +270,13 @@ static double em_chunk(
     uint32_t len) {
     double *alpha = malloc((len + 1) * sizeof(double));
     double *beta = malloc((len + 1) * sizeof(double));
-    for (uint32_t i = 0; i <= len; i = i + 1) {
+    for (uint32_t i = 0; i <= len; ++i) {
         alpha[i] = NEG_INF;
         beta[i] = NEG_INF;
     }
     alpha[0] = 0.0;
     // forward: alpha[j] = log-sum-exp over tokens ending at j.
-    for (uint32_t i = 0; i < len; i = i + 1) {
+    for (uint32_t i = 0; i < len; ++i) {
         if (alpha[i] <= NEG_INF + 1.0) {
             continue;
         }
@@ -287,7 +284,7 @@ static double em_chunk(
         if (i + cap_len > len) {
             cap_len = len - i;
         }
-        for (uint32_t l = 1; l <= cap_len; l = l + 1) {
+        for (uint32_t l = 1; l <= cap_len; ++l) {
             int32_t id = lookup_find(lk, (const char *)text + i, l);
             if (id < 0) {
                 continue;
@@ -310,12 +307,12 @@ static double em_chunk(
     }
     // backward: beta[i] = log-sum-exp over tokens starting at i.
     beta[len] = 0.0;
-    for (int32_t i = (int32_t)len - 1; i >= 0; i = i - 1) {
+    for (int32_t i = (int32_t)len - 1; i >= 0; --i) {
         uint32_t cap_len = TOK_MAX_LEN;
         if ((uint32_t)i + cap_len > len) {
             cap_len = len - (uint32_t)i;
         }
-        for (uint32_t l = 1; l <= cap_len; l = l + 1) {
+        for (uint32_t l = 1; l <= cap_len; ++l) {
             int32_t id = lookup_find(lk, (const char *)text + i, l);
             if (id < 0) {
                 continue;
@@ -334,7 +331,7 @@ static double em_chunk(
         }
     }
     // posterior of token (i, l): alpha[i] + logp + beta[i+l] - total. accumulate.
-    for (uint32_t i = 0; i < len; i = i + 1) {
+    for (uint32_t i = 0; i < len; ++i) {
         if (alpha[i] <= NEG_INF + 1.0) {
             continue;
         }
@@ -342,7 +339,7 @@ static double em_chunk(
         if (i + cap_len > len) {
             cap_len = len - i;
         }
-        for (uint32_t l = 1; l <= cap_len; l = l + 1) {
+        for (uint32_t l = 1; l <= cap_len; ++l) {
             int32_t id = lookup_find(lk, (const char *)text + i, l);
             if (id < 0) {
                 continue;
@@ -360,7 +357,7 @@ static double em_chunk(
 // one EM round: reset expected counts, run forward-backward over several random
 // chunks, then renormalize logp from the expected counts (the M-step).
 static void em_round(cand_t *cands, uint32_t n, corpus_t *cp, const lookup_t *lk) {
-    for (uint32_t i = 0; i < n; i = i + 1) {
+    for (uint32_t i = 0; i < n; ++i) {
         cands[i].expected = 0.0;
     }
     uint32_t chunk = 4096;
@@ -373,10 +370,10 @@ static void em_round(cand_t *cands, uint32_t n, corpus_t *cp, const lookup_t *lk
         done = done + chunk;
     }
     double total = 0.0;
-    for (uint32_t i = 0; i < n; i = i + 1) {
+    for (uint32_t i = 0; i < n; ++i) {
         total = total + cands[i].expected;
     }
-    for (uint32_t i = 0; i < n; i = i + 1) {
+    for (uint32_t i = 0; i < n; ++i) {
         double c = cands[i].expected;
         if (c < 1e-9) {
             c = 1e-9;
@@ -386,8 +383,7 @@ static void em_round(cand_t *cands, uint32_t n, corpus_t *cp, const lookup_t *lk
     fprintf(stderr, "  EM round: loglik %.1f over %zu bytes, vocab %u\n", ll, done, n);
 }
 
-// ---- pruning ---------------------------------------------------------------
-
+// pruning
 static int cand_by_expected_asc(const void *pa, const void *pb) {
     const cand_t *a = pa;
     const cand_t *b = pb;
@@ -421,7 +417,7 @@ static uint32_t prune(cand_t *cands, uint32_t n, uint32_t target) {
     // the first `drop` entries never removes a single byte unless drop exceeds the
     // multi-byte count -- guard that.
     uint32_t multibyte = 0;
-    for (uint32_t i = 0; i < n; i = i + 1) {
+    for (uint32_t i = 0; i < n; ++i) {
         if (cands[i].len > 1) {
             multibyte = multibyte + 1;
         }
@@ -440,7 +436,7 @@ static void write_vocab(const char *path, cand_t *cands, uint32_t n) {
         exit(1);
     }
     fprintf(f, "%u\n", n);
-    for (uint32_t i = 0; i < n; i = i + 1) {
+    for (uint32_t i = 0; i < n; ++i) {
         fprintf(f, "%.6f %u ", (float)cands[i].logp, cands[i].len);
         tok_escape(cands[i].bytes, cands[i].len, f);
         fputc('\n', f);
@@ -460,7 +456,7 @@ int main(void) {
 
     while (1) {
         lookup_t lk = lookup_build(cands, n);
-        for (uint32_t it = 0; it < EM_ITERS_PER_ROUND; it = it + 1) {
+        for (uint32_t it = 0; it < EM_ITERS_PER_ROUND; ++it) {
             em_round(cands, n, &cp, &lk);
         }
         lookup_free(&lk);

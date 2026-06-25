@@ -19,9 +19,9 @@
 
 #define TOK_MAX_LEN 32
 
-typedef struct tok_entry tok_entry_t;
+typedef struct tok_entry_t tok_entry_t;
 
-struct tok_entry {
+struct tok_entry_t {
     char *bytes;
     uint32_t len;
     float logp;
@@ -31,16 +31,16 @@ struct tok_entry {
 // that matches a prefix there, in O(token length) with no vocab scan. Each node is
 // 256 child slots (index into nodes, 0 = none) plus the token id that ends at this
 // node (-1 if none). Children use index 0 as "empty" so the root is node 1.
-typedef struct trie_node trie_node_t;
+typedef struct trie_node_t trie_node_t;
 
-struct trie_node {
+struct trie_node_t {
     uint32_t child[256];
     int32_t token;
 };
 
-typedef struct tokenizer tokenizer_t;
+typedef struct tokenizer_t tokenizer_t;
 
-struct tokenizer {
+struct tokenizer_t {
     tok_entry_t *entries;
     uint32_t count;
     trie_node_t *nodes;
@@ -49,7 +49,7 @@ struct tokenizer {
 
 static void tok_unescape(const char *src, char *dst, uint32_t *len_out) {
     uint32_t j = 0;
-    for (uint32_t i = 0; src[i] != '\0'; i = i + 1) {
+    for (uint32_t i = 0; src[i] != '\0'; ++i) {
         if (src[i] == '\\' && src[i + 1] == 'n') {
             dst[j] = '\n';
             j = j + 1;
@@ -68,7 +68,7 @@ static void tok_unescape(const char *src, char *dst, uint32_t *len_out) {
 }
 
 static void tok_escape(const char *src, uint32_t len, FILE *f) {
-    for (uint32_t i = 0; i < len; i = i + 1) {
+    for (uint32_t i = 0; i < len; ++i) {
         if (src[i] == '\n') {
             fputs("\\n", f);
         } else if (src[i] == '\\') {
@@ -93,17 +93,17 @@ static uint32_t trie_new_node(tokenizer_t *t) {
 static void tokenizer_index(tokenizer_t *t) {
     // worst case one node per byte of every token, plus root and the empty slot.
     uint32_t cap = 2;
-    for (uint32_t i = 0; i < t->count; i = i + 1) {
+    for (uint32_t i = 0; i < t->count; ++i) {
         cap = cap + t->entries[i].len;
     }
     t->nodes = malloc(cap * sizeof(trie_node_t));
     t->node_count = 0;
     trie_new_node(t);
     uint32_t root = trie_new_node(t);
-    for (uint32_t i = 0; i < t->count; i = i + 1) {
+    for (uint32_t i = 0; i < t->count; ++i) {
         uint32_t node = root;
         const char *b = t->entries[i].bytes;
-        for (uint32_t k = 0; k < t->entries[i].len; k = k + 1) {
+        for (uint32_t k = 0; k < t->entries[i].len; ++k) {
             unsigned char c = (unsigned char)b[k];
             if (t->nodes[node].child[c] == 0) {
                 uint32_t fresh = trie_new_node(t);
@@ -128,7 +128,7 @@ static tokenizer_t tokenizer_load(const char *path) {
     }
     t.entries = malloc(t.count * sizeof(tok_entry_t));
     char line[TOK_MAX_LEN * 4 + 64];
-    for (uint32_t i = 0; i < t.count; i = i + 1) {
+    for (uint32_t i = 0; i < t.count; ++i) {
         float logp = 0.0f;
         uint32_t blen = 0;
         // read "<logp> <len> " then the rest of the line verbatim. %u stops at the
@@ -172,13 +172,13 @@ static uint32_t tokenizer_encode(
     float *best = malloc((len + 1) * sizeof(float));
     int32_t *back_id = malloc((len + 1) * sizeof(int32_t));
     uint32_t *back_pos = malloc((len + 1) * sizeof(uint32_t));
-    for (uint32_t i = 0; i <= len; i = i + 1) {
+    for (uint32_t i = 0; i <= len; ++i) {
         best[i] = -1e30f;
         back_id[i] = -1;
         back_pos[i] = 0;
     }
     best[0] = 0.0f;
-    for (uint32_t i = 0; i < len; i = i + 1) {
+    for (uint32_t i = 0; i < len; ++i) {
         if (best[i] <= -1e29f) {
             continue;
         }
@@ -187,7 +187,7 @@ static uint32_t tokenizer_encode(
         if (i + max_len > len) {
             max_len = len - i;
         }
-        for (uint32_t l = 1; l <= max_len; l = l + 1) {
+        for (uint32_t l = 1; l <= max_len; ++l) {
             unsigned char c = (unsigned char)text[i + l - 1];
             uint32_t next = t->nodes[node].child[c];
             if (next == 0) {
@@ -215,7 +215,7 @@ static uint32_t tokenizer_encode(
         pos = back_pos[pos];
     }
     uint32_t n = (tmp_count < max_out) ? tmp_count : max_out;
-    for (uint32_t i = 0; i < n; i = i + 1) {
+    for (uint32_t i = 0; i < n; ++i) {
         out[i] = tmp[tmp_count - 1 - i];
     }
     free(best);
@@ -226,7 +226,7 @@ static uint32_t tokenizer_encode(
 }
 
 static void tokenizer_free(tokenizer_t *t) {
-    for (uint32_t i = 0; i < t->count; i = i + 1) {
+    for (uint32_t i = 0; i < t->count; ++i) {
         free(t->entries[i].bytes);
     }
     free(t->entries);
