@@ -100,6 +100,8 @@ struct fwd_scratch {
     vkc_buf_t ada_scale;
     // [batch, d] extracted shift slice
     vkc_buf_t ada_shift;
+    // fp16 cast of a matmul's activation input, sized to the largest (bt * hidden).
+    vkc_buf_t a16;
 };
 
 static fwd_scratch_t fwd_alloc(model_t *m) {
@@ -159,6 +161,7 @@ static fwd_scratch_t fwd_alloc(model_t *m) {
         .dcond = vkc_alloc(c, cfg.batch * d * sizeof(float)),
         .ada_scale = vkc_alloc(c, cfg.batch * d * sizeof(float)),
         .ada_shift = vkc_alloc(c, cfg.batch * d * sizeof(float)),
+        .a16 = vkc_alloc(c, bt * cfg.ffn_hidden * sizeof(uint16_t)),
     };
 }
 
@@ -168,6 +171,17 @@ struct mm_pc {
     uint32_t m;
     uint32_t n;
     uint32_t k;
+};
+typedef struct cast_pc cast_pc_t;
+struct cast_pc {
+    uint32_t n;
+    uint32_t op;
+};
+typedef struct normheads_pc normheads_pc_t;
+struct normheads_pc {
+    uint32_t n_vec;
+    uint32_t dh;
+    uint32_t op;
 };
 typedef struct emb_pc emb_pc_t;
 struct emb_pc {
@@ -277,6 +291,62 @@ static void mm(model_t *m, vkc_buf_t *a, vkc_buf_t *b, vkc_buf_t *out,
     vkc_run(m->c, &m->k_mm, bufs, (n + 15) / 16, (rows + 15) / 16, 1, &pc);
 }
 
+// cast n fp32 values in src to fp16 in dst (op 0) or back (op 1).
+static void cast_buf(model_t *m, vkc_buf_t *src, vkc_buf_t *dst, uint32_t n, uint32_t op) {
+    cast_pc_t pc = (cast_pc_t) {
+        .n = n,
+        .op = op,
+    };
+    vkc_buf_t *bufs[4];
+    if (op == 0) {
+        bufs[0] = src;
+        bufs[1] = dst;
+        bufs[2] = dst;
+        bufs[3] = src;
+    } else {
+        bufs[0] = dst;
+        bufs[1] = src;
+        bufs[2] = src;
+        bufs[3] = dst;
+    }
+    vkc_run(m->c, &m->k_cast, bufs, (n + 255) / 256, 1, 1, &pc);
+}
+
+// refresh every weight's fp16 mirror from its fp32 master, but only when the fp32
+// weights have changed since the last refresh (the dirty16 flag). Batched into one
+// submission. Inference casts once; training marks dirty each optimizer step.
+static void refresh_w16(model_t *m) {
+    if (m->dirty16 == 0) {
+        return;
+    }
+    vkc_begin(m->c);
+    for (uint32_t i = 0; i < m->n_params; i = i + 1) {
+        param_t *p = &m->params[i];
+        cast_buf(m, &p->w, &p->w16, p->n, 0);
+    }
+    vkc_flush(m->c);
+    m->dirty16 = 0;
+}
+
+// fp16 matmul: out[rows, n] = a[rows, k] @ p->w16[k, n], using the matrix cores.
+// The activation a (fp32) is cast into the shared a16 scratch first; the weight is
+// already mirrored in p->w16. Requires rows, n, k to be multiples of 16.
+static void mm16(model_t *m, fwd_scratch_t *sc, vkc_buf_t *a, param_t *p,
+    vkc_buf_t *out, uint32_t rows, uint32_t n, uint32_t k) {
+    cast_buf(m, a, &sc->a16, rows * k, 0);
+    mm_pc_t pc = (mm_pc_t) {
+        .m = rows,
+        .n = n,
+        .k = k,
+    };
+    vkc_buf_t *bufs[3] = {
+        &sc->a16,
+        &p->w16,
+        out,
+    };
+    vkc_run(m->c, &m->k_mm16, bufs, n / 16, rows / 16, 1, &pc);
+}
+
 // pack [bt, d] (laid out b,t,head,dh) -> [b, head, t, dh]. The innermost dh run
 // is contiguous in both layouts, so copy it as a block (mapped GPU memory is
 // write-combined; block memcpy is far faster than element-wise access).
@@ -359,6 +429,23 @@ static void host_norm_heads_save(float *p, float *inv_norm, uint32_t n_vec, uint
     }
 }
 
+// GPU per-head L2 normalization of `buf` (n_vec vectors of length dh), in place.
+// op 1 also writes 1/||.|| per vector into inv; op 0 leaves inv untouched (pass any
+// bound buffer). One workgroup per vector.
+static void norm_heads(model_t *m, vkc_buf_t *buf, vkc_buf_t *inv,
+    uint32_t n_vec, uint32_t dh, uint32_t op) {
+    normheads_pc_t pc = (normheads_pc_t) {
+        .n_vec = n_vec,
+        .dh = dh,
+        .op = op,
+    };
+    vkc_buf_t *bufs[2] = {
+        buf,
+        inv,
+    };
+    vkc_run(m->c, &m->k_normheads, bufs, n_vec, 1, 1, &pc);
+}
+
 // rmsnorm forward writing into `out`
 static void rmsnorm_fwd(model_t *m, vkc_buf_t *x, vkc_buf_t *g, vkc_buf_t *out,
     vkc_buf_t *stash, uint32_t rows, uint32_t d) {
@@ -386,6 +473,12 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
     uint32_t d = cfg.d;
     uint32_t hd = cfg.n_head;
     uint32_t dh = d / hd;
+
+    // mirror the current fp32 weights into their fp16 copies for the matrix cores.
+    refresh_w16(m);
+
+    // record the whole forward as one GPU batch (submitted once at the CE reduce).
+    vkc_begin(m->c);
 
     // 1. embed: x = tok_emb[ids] + pos_emb
     emb_pc_t epc = (emb_pc_t) {
@@ -430,14 +523,14 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         vkc_run(m->c, &m->k_tshift, tsb, (bt * d + 255) / 256, 1, 1, &tpc);
 
         // project to k,v,r,w,a from tmp2
-        mm(m, &sc->tmp2, &ly->wk->w, &sc->pk, bt, d, d);
-        mm(m, &sc->tmp2, &ly->wv->w, &sc->pv, bt, d, d);
-        mm(m, &sc->tmp2, &ly->wr->w, &sc->pr, bt, d, d);
-        mm(m, &sc->tmp2, &ly->ww->w, &sc->pw, bt, d, d);
-        mm(m, &sc->tmp2, &ly->wa->w, &sc->pa, bt, d, d);
-        // w in (0,1), a in (0,1)
-        host_sigmoid(&sc->pw, bt * d);
-        host_sigmoid(&sc->pa, bt * d);
+        mm16(m, sc, &sc->tmp2, ly->wk, &sc->pk, bt, d, d);
+        mm16(m, sc, &sc->tmp2, ly->wv, &sc->pv, bt, d, d);
+        mm16(m, sc, &sc->tmp2, ly->wr, &sc->pr, bt, d, d);
+        mm16(m, sc, &sc->tmp2, ly->ww, &sc->pw, bt, d, d);
+        mm16(m, sc, &sc->tmp2, ly->wa, &sc->pa, bt, d, d);
+        // w in (0,1), a in (0,1): sigmoid on the GPU (op 2), not a host loop.
+        vec_op(m, &sc->pw, &sc->pw, bt * d, 2);
+        vec_op(m, &sc->pa, &sc->pa, bt * d, 2);
 
         // pack k,v,r,w,a to [b,head,t,dh], run wkv7 forward, unpack output
         // (reuse tmp/tmp2 area? need distinct packed buffers -> pk..pa already are)
@@ -446,19 +539,21 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         // For clarity, pack each buffer through host into the same buffer.
         // k:
         {
-            // GPU repack (bit-identical to host pack_heads), then unit-norm k
+            // GPU repack (bit-identical to host pack_heads), copying back on the
+            // GPU (op 5) instead of a host memcpy over mapped memory.
             gpu_repack(m, &sc->pk, &sc->tmp, bt, hd, dh, cfg.seqlen, 0);
-            memcpy(sc->pk.ptr, sc->tmp.ptr, bt * d * sizeof(float));
+            vec_op(m, &sc->pk, &sc->tmp, bt * d, 5);
             gpu_repack(m, &sc->pv, &sc->tmp, bt, hd, dh, cfg.seqlen, 0);
-            memcpy(sc->pv.ptr, sc->tmp.ptr, bt * d * sizeof(float));
+            vec_op(m, &sc->pv, &sc->tmp, bt * d, 5);
             gpu_repack(m, &sc->pr, &sc->tmp, bt, hd, dh, cfg.seqlen, 0);
-            memcpy(sc->pr.ptr, sc->tmp.ptr, bt * d * sizeof(float));
+            vec_op(m, &sc->pr, &sc->tmp, bt * d, 5);
             gpu_repack(m, &sc->pw, &sc->tmp, bt, hd, dh, cfg.seqlen, 0);
-            memcpy(sc->pw.ptr, sc->tmp.ptr, bt * d * sizeof(float));
+            vec_op(m, &sc->pw, &sc->tmp, bt * d, 5);
             gpu_repack(m, &sc->pa, &sc->tmp, bt, hd, dh, cfg.seqlen, 0);
-            memcpy(sc->pa.ptr, sc->tmp.ptr, bt * d * sizeof(float));
-            // unit-norm the removal/replacement key per head -> stable delta rule
-            host_norm_heads(&sc->pk, cfg.batch * hd * cfg.seqlen, dh);
+            vec_op(m, &sc->pa, &sc->tmp, bt * d, 5);
+            // unit-norm the removal/replacement key per head on the GPU -> stable
+            // delta rule (inv unused in forward; bind rms_stash as the slot).
+            norm_heads(m, &sc->pk, &sc->rms_stash, cfg.batch * hd * cfg.seqlen, dh, 0);
         }
         wkv_pc_t wpc = (wkv_pc_t) {
             .bsz = cfg.batch,
@@ -495,19 +590,13 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         vec_op(m, &sc->po, &sc->po2, bt * d, 3);
         // unpack po -> tmp2 ([bt, d])
         gpu_repack(m, &sc->po, &sc->tmp2, bt, hd, dh, cfg.seqlen, 1);
-        // output projection wo, add residual: x += wo(tmp2)
-        mm(m, &sc->tmp2, &ly->wo->w, &sc->tmp, bt, d, d);
-        {
-            float *x = sc->x.ptr;
-            float *o = sc->tmp.ptr;
-            for (uint32_t i = 0; i < bt * d; i = i + 1) {
-                x[i] += o[i];
-            }
-        }
+        // output projection wo, add residual on the GPU: x += wo(tmp2)
+        mm16(m, sc, &sc->tmp2, ly->wo, &sc->tmp, bt, d, d);
+        vec_op(m, &sc->x, &sc->tmp, bt * d, 0);
 
         // --- channel mixing (ffn) ---
         rmsnorm_fwd(m, &sc->x, &ly->n2->w, &sc->tmp, &sc->rms_stash, bt, d);
-        mm(m, &sc->tmp, &ly->w_gate->w, &sc->hbuf, bt, cfg.ffn_hidden, d);
+        mm16(m, sc, &sc->tmp, ly->w_gate, &sc->hbuf, bt, cfg.ffn_hidden, d);
         // silu(hbuf) in place
         elem_pc_t spc = (elem_pc_t) {
             .n = bt * cfg.ffn_hidden,
@@ -518,32 +607,21 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
             &sc->pre,
         };
         vkc_run(m->c, &m->k_elem, seb, (bt * cfg.ffn_hidden + 255) / 256, 1, 1, &spc);
-        // up projection, multiply
-        mm(m, &sc->tmp, &ly->w_up->w, &sc->pre, bt, cfg.ffn_hidden, d);
-        {
-            float *hb = sc->hbuf.ptr;
-            float *up = sc->pre.ptr;
-            for (uint32_t i = 0; i < bt * cfg.ffn_hidden; i = i + 1) {
-                hb[i] = hb[i] * up[i];
-            }
-        }
-        // down projection -> tmp2, add residual
-        mm(m, &sc->hbuf, &ly->w_down->w, &sc->tmp2, bt, d, cfg.ffn_hidden);
-        {
-            float *x = sc->x.ptr;
-            float *o = sc->tmp2.ptr;
-            for (uint32_t i = 0; i < bt * d; i = i + 1) {
-                x[i] += o[i];
-            }
-        }
+        // up projection, multiply (silu(gate) * up) on the GPU
+        mm16(m, sc, &sc->tmp, ly->w_up, &sc->pre, bt, cfg.ffn_hidden, d);
+        vec_op(m, &sc->hbuf, &sc->pre, bt * cfg.ffn_hidden, 1);
+        // down projection -> tmp2, add residual on the GPU
+        mm16(m, sc, &sc->hbuf, ly->w_down, &sc->tmp2, bt, d, cfg.ffn_hidden);
+        vec_op(m, &sc->x, &sc->tmp2, bt * d, 0);
     }
 
     // 3. head: logits = head(rmsnorm(x))   (reuse n1[0] as a final gain? use ones)
     rmsnorm_fwd(m, &sc->x, &m->layers[0].n1->w, &sc->tmp, &sc->rms_stash, bt, d);
-    mm(m, &sc->tmp, &m->head->w, &sc->logits, bt, m->cfg.vocab, d);
+    mm16(m, sc, &sc->tmp, m->head, &sc->logits, bt, m->cfg.vocab, d);
 
-    // snapshot logits before CE overwrites them with dlogits (for inference)
-    memcpy(sc->logits_save.ptr, sc->logits.ptr, bt * m->cfg.vocab * sizeof(float));
+    // snapshot logits before CE overwrites them with dlogits (for inference),
+    // copied on the GPU instead of a large host memcpy over mapped memory.
+    vec_op(m, &sc->logits_save, &sc->logits, bt * m->cfg.vocab, 5);
 
     // 4. masked CE loss (also writes dlogits into logits)
     ce_pc_t cpc = (ce_pc_t) {
@@ -558,6 +636,9 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         &sc->loss,
     };
     vkc_run(m->c, &m->k_ce, cb, bt, 1, 1, &cpc);
+
+    // submit the whole recorded forward and wait, so the host can read the loss.
+    vkc_flush(m->c);
 
     // reduce loss over masked tokens
     float *lp = sc->loss.ptr;

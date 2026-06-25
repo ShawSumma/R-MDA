@@ -31,6 +31,12 @@ struct vkc {
     uint32_t qfi;
     VkCommandPool cpool;
     VkDescriptorPool dpool;
+    // batching: when recording is set, vkc_run records dispatches (separated by a
+    // compute-to-compute barrier) into rec instead of submitting one at a time. A
+    // vkc_flush submits the whole batch once and waits. This removes the per-op
+    // submit + queue-wait-idle round trip, which dominates with many small kernels.
+    VkCommandBuffer rec;
+    int recording;
 };
 
 struct vkc_kernel {
@@ -308,6 +314,35 @@ static void vkc_run(vkc_t *c, vkc_kernel_t *k, vkc_buf_t **bufs, uint32_t gx, ui
     free(w);
     free(bi);
 
+    // batched path: record into the shared command buffer, with a compute-to-compute
+    // barrier so the next (dependent) dispatch observes this one's writes. The set is
+    // not freed here -- the whole descriptor pool is reset at flush. No submit/wait.
+    if (c->recording) {
+        vkCmdBindPipeline(c->rec, VK_PIPELINE_BIND_POINT_COMPUTE, k->pipe);
+        vkCmdBindDescriptorSets(c->rec, VK_PIPELINE_BIND_POINT_COMPUTE, k->pl, 0, 1, &ds, 0, 0);
+        if (k->push_sz != 0) {
+            vkCmdPushConstants(c->rec, k->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, k->push_sz, push);
+        }
+        vkCmdDispatch(c->rec, gx, gy, gz);
+        VkMemoryBarrier mb = (VkMemoryBarrier) {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        vkCmdPipelineBarrier(
+            c->rec,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            1,
+            &mb,
+            0,
+            0,
+            0,
+            0);
+        return;
+    }
+
     VkCommandBufferAllocateInfo cbi = (VkCommandBufferAllocateInfo) {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = c->cpool,
@@ -341,6 +376,42 @@ static void vkc_run(vkc_t *c, vkc_kernel_t *k, vkc_buf_t **bufs, uint32_t gx, ui
     VKC_CK(vkQueueWaitIdle(c->q));
     vkFreeCommandBuffers(c->dev, c->cpool, 1, &cb);
     vkFreeDescriptorSets(c->dev, c->dpool, 1, &ds);
+}
+
+// begin recording a batch of dispatches into one command buffer.
+static void vkc_begin(vkc_t *c) {
+    VkCommandBufferAllocateInfo cbi = (VkCommandBufferAllocateInfo) {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = c->cpool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VKC_CK(vkAllocateCommandBuffers(c->dev, &cbi, &c->rec));
+    VkCommandBufferBeginInfo bb = (VkCommandBufferBeginInfo) {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    VKC_CK(vkBeginCommandBuffer(c->rec, &bb));
+    c->recording = 1;
+}
+
+// submit the recorded batch, wait for it, and reset the command buffer and the
+// descriptor pool (freeing every set allocated during the batch).
+static void vkc_flush(vkc_t *c) {
+    if (c->recording == 0) {
+        return;
+    }
+    VKC_CK(vkEndCommandBuffer(c->rec));
+    VkSubmitInfo si = (VkSubmitInfo) {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &c->rec,
+    };
+    VKC_CK(vkQueueSubmit(c->q, 1, &si, 0));
+    VKC_CK(vkQueueWaitIdle(c->q));
+    vkFreeCommandBuffers(c->dev, c->cpool, 1, &c->rec);
+    VKC_CK(vkResetDescriptorPool(c->dev, c->dpool, 0));
+    c->recording = 0;
 }
 
 #endif

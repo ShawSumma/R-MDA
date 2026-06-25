@@ -27,7 +27,9 @@ void main() {
         a[i] = 1.0 / (1.0 + exp(-a[i]));   // op 2: in-place sigmoid (b unused)
     } else if (op == 3) {
         a[i] = 0.5 * (a[i] + b[i]);        // op 3: average (for bidirectional mean)
-    } else {
+    } else if (op == 4) {
         a[i] *= 0.5;                       // op 4: in-place halve (b unused)
+    } else {
+        a[i] = b[i];                       // op 5: copy b into a
     }
 }

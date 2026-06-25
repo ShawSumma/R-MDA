@@ -5,7 +5,7 @@
 // State S is [DH x DH] (row i, col j). w,a,k,v,r are [DH] per (t).
 // Layout per (b,h): k,v,r,w,a are [T, DH]; out is [T, DH]; we hold S in shared mem.
 // direction: 0 = forward (t=0..T-1), 1 = backward (t=T-1..0).
-layout(local_size_x = 64) in;   // up to DH threads cooperate; DH<=64 per head here
+layout(local_size_x = 256) in;  // threads cooperate on the [DH x DH] state per step
 
 layout(std430,binding=0) readonly  buffer BK { float K[]; };
 layout(std430,binding=1) readonly  buffer BV { float V[]; };
@@ -30,7 +30,7 @@ void main(){
     if(bh >= Bsz*Hd) return;
 
     // zero state rows owned by this thread (thread `lid` owns rows lid, lid+64, ...)
-    for(uint i=lid;i<DHl*DHl;i+=64) S[i]=0.0;
+    for(uint i=lid;i<DHl*DHl;i+=gl_WorkGroupSize.x) S[i]=0.0;
     barrier();
 
     // base offset into the per-(b,h) [T,DH] arrays
@@ -40,29 +40,29 @@ void main(){
         uint t = (dir==0) ? ti : (T-1-ti);
         uint row = base + t*DHl;
         // load this step's vectors cooperatively
-        for(uint d=lid; d<DHl; d+=64){
+        for(uint d=lid; d<DHl; d+=gl_WorkGroupSize.x){
             kk[d]=K[row+d]; vv[d]=V[row+d];
             rr[d]=R[row+d]; ww[d]=W[row+d]; aa[d]=A[row+d];
         }
         barrier();
         // save the pre-update state S_{t-1} for the backward pass
         if(save==1){ uint sb=(b*Hd+h)*T*DHl*DHl + t*DHl*DHl;
-            for(uint i=lid;i<DHl*DHl;i+=64) Sout[sb+i]=S[i]; barrier(); }
+            for(uint i=lid;i<DHl*DHl;i+=gl_WorkGroupSize.x) Sout[sb+i]=S[i]; barrier(); }
         // Sk[j] = sum_i S[i,j]*k_i   (column-dot with k)  -> length DH
-        for(uint j=lid;j<DHl;j+=64){
+        for(uint j=lid;j<DHl;j+=gl_WorkGroupSize.x){
             float s=0.0; for(uint i=0;i<DHl;i++) s+=S[i*DHl+j]*kk[i];
             Sk[j]=s;
         }
         barrier();
         float a_t = aa[0];   // scalar in-context lr (per-head scalar)
         // update: each thread updates its rows. S[i,j] = w_j*S[i,j] - a*k_i*Sk[j] + a*k_i*v_j
-        for(uint idx=lid; idx<DHl*DHl; idx+=64){
+        for(uint idx=lid; idx<DHl*DHl; idx+=gl_WorkGroupSize.x){
             uint i=idx/DHl, j=idx%DHl;
             S[idx] = ww[j]*S[idx] - a_t*kk[i]*Sk[j] + a_t*kk[i]*vv[j];
         }
         barrier();
         // out_t[j] = sum_i r_i * S[i,j]
-        for(uint j=lid;j<DHl;j+=64){
+        for(uint j=lid;j<DHl;j+=gl_WorkGroupSize.x){
             float o=0.0; for(uint i=0;i<DHl;i++) o+=rr[i]*S[i*DHl+j];
             O[row+j]=o;
         }

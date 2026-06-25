@@ -133,7 +133,7 @@ int main(void) {
         .n_head = 10,
         .seqlen = 64,
         .batch = 8,
-        .ffn_hidden = 1707,
+        .ffn_hidden = 1712,
         .vocab = data_vocab,
         .vocab_in = data_vocab + 1,
     };
@@ -143,6 +143,7 @@ int main(void) {
     fprintf(stderr, "params %.2f M | d=%u L=%u H=%u seq=%u batch=%u\n", (double)model_param_count(m) / 1e6, cfg.d, cfg.n_layer, cfg.n_head, cfg.seqlen, cfg.batch);
 
     uint32_t start = checkpoint_load(m);
+    m->dirty16 = 1;
     vkc_buf_t clip_partials = vkc_alloc(&c, 8192 * sizeof(float));
 
     float lr_peak = 3e-5f;
@@ -171,6 +172,7 @@ int main(void) {
         float lr = (s < warmup) ? lr_peak * (float)s / (float)warmup : lr_peak;
         float gnorm = clip_grads(m, &clip_partials, 2.0f);
         adamw_all(m, lr, s);
+        m->dirty16 = 1;
         (void)gnorm;
 
         float bpb = tr.last_raw_ce / 0.6931472f;

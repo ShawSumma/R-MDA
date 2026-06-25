@@ -34,6 +34,8 @@ struct param {
     vkc_buf_t g;
     vkc_buf_t m;
     vkc_buf_t v;
+    // fp16 mirror of w, refreshed once per step for the cooperative-matrix matmul.
+    vkc_buf_t w16;
     // element count
     uint32_t n;
     const char *name;
@@ -101,6 +103,8 @@ struct model {
     vkc_kernel_t k_wkv_f;
     vkc_kernel_t k_wkv_b;
     vkc_kernel_t k_mm;
+    vkc_kernel_t k_mm16;
+    vkc_kernel_t k_cast;
     vkc_kernel_t k_mm_bw;
     vkc_kernel_t k_elem;
     vkc_kernel_t k_rms;
@@ -110,6 +114,7 @@ struct model {
     vkc_kernel_t k_vec;
     vkc_kernel_t k_repack;
     vkc_kernel_t k_sumsq;
+    vkc_kernel_t k_normheads;
 
     param_t *tok_emb;
     param_t *pos_emb;
@@ -120,6 +125,9 @@ struct model {
     // flat registry of all params (for AdamW loop + counting)
     param_t params[M_MAX_PARAMS];
     uint32_t n_params;
+    // set whenever fp32 weights change; the fp16 mirrors are re-cast lazily on the
+    // next forward. Inference casts once; training sets it each optimizer step.
+    int dirty16;
 };
 
 static void randn_fill(float *p, uint32_t n, float std) {
@@ -145,6 +153,7 @@ static param_t *param_new(
     p->g = vkc_alloc(m->c, n * sizeof(float));
     p->m = vkc_alloc(m->c, n * sizeof(float));
     p->v = vkc_alloc(m->c, n * sizeof(float));
+    p->w16 = vkc_alloc(m->c, n * sizeof(uint16_t));
     float *wp = p->w.ptr;
     if (init_std > 0.0f) {
         randn_fill(wp, n, init_std);
@@ -168,6 +177,8 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
     m->k_wkv_f = vkc_load(c, "build/wkv7_fwd.spv", 7, 24);
     m->k_wkv_b = vkc_load(c, "build/wkv7_bwd.spv", 12, 16);
     m->k_mm = vkc_load(c, "build/matmul.spv", 3, 12);
+    m->k_mm16 = vkc_load(c, "build/matmul_f16.spv", 3, 12);
+    m->k_cast = vkc_load(c, "build/cast_f16.spv", 4, 8);
     m->k_mm_bw = vkc_load(c, "build/matmul_bw.spv", 4, 16);
     m->k_elem = vkc_load(c, "build/elem.spv", 2, 8);
     m->k_rms = vkc_load(c, "build/rmsnorm.spv", 5, 12);
@@ -177,6 +188,7 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
     m->k_vec = vkc_load(c, "build/vecops.spv", 2, 8);
     m->k_repack = vkc_load(c, "build/repack.spv", 2, 20);
     m->k_sumsq = vkc_load(c, "build/sumsq.spv", 2, 12);
+    m->k_normheads = vkc_load(c, "build/normheads.spv", 2, 12);
 
     uint32_t d = cfg.d;
     uint32_t hid = cfg.ffn_hidden;
@@ -204,6 +216,7 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
         ly->w_down = param_new(m, hid * d, s, 0.0f, "w_down");
         ly->ada = param_new(m, d * 6 * d, 0.0f, 0.0f, "ada");
     }
+    m->dirty16 = 1;
     return m;
 }
 

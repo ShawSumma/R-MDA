@@ -49,13 +49,14 @@ int main(void) {
         .n_head = 10,
         .seqlen = 64,
         .batch = 8,
-        .ffn_hidden = 1707,
+        .ffn_hidden = 1712,
         .vocab = data_vocab,
         .vocab_in = data_vocab + 1,
     };
     model_t *m = model_init(&c, cfg);
     fwd_scratch_t sc = fwd_alloc(m);
     uint32_t step = load_ckpt(m);
+    m->dirty16 = 1;
     fprintf(stderr, "loaded checkpoint @ step %u\n", step);
 
     // quantitative: average bits/byte and masked-fill accuracy over many held-out
