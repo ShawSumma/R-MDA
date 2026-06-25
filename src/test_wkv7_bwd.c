@@ -26,8 +26,8 @@ struct bwd_push {
 static vkc_t c;
 static vkc_kernel_t kf;
 static vkc_kernel_t kb;
-static uint32_t g_bsz = 1;
-static uint32_t g_hd = 1;
+static uint32_t g_bsz = 2;
+static uint32_t g_hd = 3;
 static uint32_t g_t = 6;
 static uint32_t g_dh = 4;
 

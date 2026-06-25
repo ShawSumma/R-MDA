@@ -40,11 +40,12 @@ void main(){
 
     for(uint ti=0; ti<T; ti++){
         uint t = T-1-ti;            // reverse time
-        for(uint d=lid;d<DH;d+=64){ kk[d]=K[base+t*DH+d]; vv[d]=V[base+t*DH+d];
-            rr[d]=R[base+t*DH+d]; ww[d]=W[base+t*DH+d]; }
+        uint row = base + t*DH;
+        for(uint d=lid;d<DH;d+=64){ kk[d]=K[row+d]; vv[d]=V[row+d];
+            rr[d]=R[row+d]; ww[d]=W[row+d]; }
         for(uint i=lid;i<DH2;i+=64) Sp[i]=Sprev[sbase+t*DH2+i];
         barrier();
-        float a_t=A[base+t*DH+0];
+        float a_t=A[row+0];
         // Sk[j] = sum_i Sp[i,j]*k[i]
         for(uint j=lid;j<DH;j+=64){ float s=0; for(uint i=0;i<DH;i++) s+=Sp[i*DH+j]*kk[i]; Sk[j]=s; }
         barrier();
@@ -53,28 +54,28 @@ void main(){
         // accumulate dR
         for(uint i=lid;i<DH;i+=64){ float dr=0;
             for(uint j=0;j<DH;j++){ float St=ww[j]*Sp[i*DH+j]-a_t*kk[i]*Sk[j]+a_t*kk[i]*vv[j];
-                dr+=St*dO[base+t*DH+j]; }
-            dR[base+t*DH+i]=dr; }
+                dr+=St*dO[row+j]; }
+            dR[row+i]=dr; }
         barrier();
-        for(uint idx=lid;idx<DH2;idx+=64){ uint i=idx/DH,j=idx%DH; dS[idx]+= rr[i]*dO[base+t*DH+j]; }
+        for(uint idx=lid;idx<DH2;idx+=64){ uint i=idx/DH,j=idx%DH; dS[idx]+= rr[i]*dO[row+j]; }
         barrier();
         // Now backprop S_t -> {Sp, w, k, v, a, Sk}.  S_t[i,j]=w[j]Sp[i,j]-a k[i]Sk[j]+a k[i]v[j]
         // dW[j] += sum_i dS[i,j]*Sp[i,j]
-        for(uint j=lid;j<DH;j+=64){ float dw=0; for(uint i=0;i<DH;i++) dw+=dS[i*DH+j]*Sp[i*DH+j]; dW[base+t*DH+j]=dw; }
+        for(uint j=lid;j<DH;j+=64){ float dw=0; for(uint i=0;i<DH;i++) dw+=dS[i*DH+j]*Sp[i*DH+j]; dW[row+j]=dw; }
         // dV[j] += sum_i dS[i,j]*a*k[i]
-        for(uint j=lid;j<DH;j+=64){ float dv=0; for(uint i=0;i<DH;i++) dv+=dS[i*DH+j]*a_t*kk[i]; dV[base+t*DH+j]=dv; }
+        for(uint j=lid;j<DH;j+=64){ float dv=0; for(uint i=0;i<DH;i++) dv+=dS[i*DH+j]*a_t*kk[i]; dV[row+j]=dv; }
         // dSk[j] = sum_i dS[i,j]*(-a*k[i])
         for(uint j=lid;j<DH;j+=64){ float s=0; for(uint i=0;i<DH;i++) s+=dS[i*DH+j]*(-a_t*kk[i]); dSk[j]=s; }
         barrier();
         // dk[i] from two paths: term -a*k[i]*Sk[j] and +a*k[i]*v[j]  AND Sk=Sp^T k so dk via dSk too
         for(uint i=lid;i<DH;i+=64){ float dk=0;
             for(uint j=0;j<DH;j++){ dk += dS[i*DH+j]*(-a_t*Sk[j]+a_t*vv[j]); dk += dSk[j]*Sp[i*DH+j]; }
-            dK[base+t*DH+i]=dk; }
+            dK[row+i]=dk; }
         // dA (scalar): sum over i,j dS[i,j]*( -k[i]Sk[j] + k[i]v[j] )
         { float da=0.0; for(uint idx=lid;idx<DH2;idx+=64){ uint i=idx/DH,j=idx%DH;
             da += dS[idx]*(-kk[i]*Sk[j]+kk[i]*vv[j]); } red[lid]=da; barrier();
           for(uint o=32;o>0;o>>=1){ if(lid<o)red[lid]+=red[lid+o]; barrier(); }
-          if(lid==0) dA[base+t*DH+0]=red[0]; barrier(); }
+          if(lid==0) dA[row+0]=red[0]; barrier(); }
         // propagate to dS_prev: Sp appears in S_t via w[j]Sp[i,j] (diag) and via Sk[j]=sum_i Sp[i,j]k[i].
         // dSp[i,j] = w[j]*dS[i,j] + dSk[j]*k[i]
         for(uint idx=lid;idx<DH2;idx+=64){ uint i=idx/DH,j=idx%DH;

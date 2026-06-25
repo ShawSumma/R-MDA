@@ -11,8 +11,9 @@ GLSLC   := glslc
 SHADERS := $(wildcard shader/*.comp)
 SPV     := $(patsubst shader/%.comp,build/%.spv,$(SHADERS))
 
-# host programs = every src/*.c with a main(). vkc.h is a shared dep.
+# host programs = every src/*.c with a main(). all src/*.h are shared deps.
 SRCS    := $(wildcard src/*.c)
+HDRS    := $(wildcard src/*.h)
 BINS    := $(patsubst src/%.c,build/%,$(SRCS))
 
 .PHONY: all shaders bins clean test
@@ -24,7 +25,7 @@ bins:    $(BINS)
 build/%.spv: shader/%.comp | build
 	$(GLSLC) $< -o $@
 
-build/%: src/%.c src/vkc.h | build
+build/%: src/%.c $(HDRS) | build
 	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
 
 build:

@@ -38,10 +38,11 @@ void main(){
 
     for(uint ti=0; ti<T; ti++){
         uint t = (dir==0) ? ti : (T-1-ti);
+        uint row = base + t*DHl;
         // load this step's vectors cooperatively
         for(uint d=lid; d<DHl; d+=64){
-            kk[d]=K[base+t*DHl+d]; vv[d]=V[base+t*DHl+d];
-            rr[d]=R[base+t*DHl+d]; ww[d]=W[base+t*DHl+d]; aa[d]=A[base+t*DHl+d];
+            kk[d]=K[row+d]; vv[d]=V[row+d];
+            rr[d]=R[row+d]; ww[d]=W[row+d]; aa[d]=A[row+d];
         }
         barrier();
         // save the pre-update state S_{t-1} for the backward pass
@@ -63,7 +64,7 @@ void main(){
         // out_t[j] = sum_i r_i * S[i,j]
         for(uint j=lid;j<DHl;j+=64){
             float o=0.0; for(uint i=0;i<DHl;i++) o+=rr[i]*S[i*DHl+j];
-            O[base+t*DHl+j]=o;
+            O[row+j]=o;
         }
         barrier();
     }
