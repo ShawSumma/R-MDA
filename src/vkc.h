@@ -72,7 +72,7 @@ static vkc_t vkc_init(void) {
 
     VkApplicationInfo app = (VkApplicationInfo) {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        .apiVersion = VK_API_VERSION_1_1,
+        .apiVersion = VK_API_VERSION_1_3,
     };
     VkInstanceCreateInfo ici = (VkInstanceCreateInfo) {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -114,19 +114,38 @@ static vkc_t vkc_init(void) {
         .queueCount = 1,
         .pQueuePriorities = &pri,
     };
+    // feature chain: atomic-float (existing) + cooperative matrix + fp16 shader
+    // arithmetic + 16-bit storage, so the matrix-core matmul can load fp16 buffers.
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopmat = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+        .cooperativeMatrix = VK_TRUE,
+    };
+    VkPhysicalDeviceShaderFloat16Int8Features f16_arith = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+        .pNext = &coopmat,
+        .shaderFloat16 = VK_TRUE,
+    };
+    VkPhysicalDevice16BitStorageFeatures storage16 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+        .pNext = &f16_arith,
+        .storageBuffer16BitAccess = VK_TRUE,
+        .uniformAndStorageBuffer16BitAccess = VK_TRUE,
+    };
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+        .pNext = &storage16,
         .shaderBufferFloat32AtomicAdd = VK_TRUE,
     };
-    const char *dev_ext[1] = {
+    const char *dev_ext[2] = {
         VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
+        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
     };
     VkDeviceCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &atomic_float,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &qci,
-        .enabledExtensionCount = 1,
+        .enabledExtensionCount = 2,
         .ppEnabledExtensionNames = dev_ext,
     };
     VKC_CK(vkCreateDevice(c.pd, &dci, 0, &c.dev));

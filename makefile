@@ -6,7 +6,7 @@
 CC      := cc
 CFLAGS  := -O2 -Isrc
 LDFLAGS := -lvulkan -lm
-GLSLC   := glslc
+GLSLC   := glslc --target-env=vulkan1.3
 
 SHADERS := $(wildcard shader/*.comp)
 SPV     := $(patsubst shader/%.comp,build/%.spv,$(SHADERS))
