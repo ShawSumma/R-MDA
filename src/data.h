@@ -51,7 +51,7 @@ static void make_batch(const corpus_t *cp, uint32_t batch, uint32_t seqlen,
     for (uint32_t b = 0; b < batch; b++) {
         size_t start = (size_t)(frand() * (float)(cp->len - seqlen - 1));
         float t = t_min + (1.0f - t_min) * frand();
-        float w = 1.0f / t;
+        float w = 1.0f / t;   // uncapped: weight cap mid-training destabilized; clip handles variance
         for (uint32_t s = 0; s < seqlen; s++) {
             uint32_t pos = b * seqlen + s;
             unsigned char byte = cp->bytes[start + s];

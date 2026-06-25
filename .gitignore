@@ -3,3 +3,4 @@ models/
 *.spv
 *.o
 data/
+.claude

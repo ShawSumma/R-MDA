@@ -21,6 +21,7 @@ struct bwd_push {
     uint32_t hd;
     uint32_t t;
     uint32_t dh;
+    uint32_t dir;
 };
 
 static vkc_t c;
@@ -99,6 +100,7 @@ int main(void) {
         .hd = g_hd,
         .t = g_t,
         .dh = g_dh,
+        .dir = 0,
     };
     vkc_buf_t *bb[12] = {
         &bk,

@@ -20,7 +20,7 @@ layout(std430,binding=8) writeonly buffer BdV { float dV[]; };
 layout(std430,binding=9) writeonly buffer BdR { float dR[]; };
 layout(std430,binding=10) writeonly buffer BdW{ float dW[]; };
 layout(std430,binding=11) buffer BdA{ float dA[]; };
-layout(push_constant) uniform P { uint Bsz, Hd, T, DH; };
+layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir; };
 
 shared float dS[64*64];     // grad wrt current state S_t
 shared float Sp[64*64];     // S_{t-1} for this step
@@ -39,7 +39,9 @@ void main(){
     barrier();
 
     for(uint ti=0; ti<T; ti++){
-        uint t = T-1-ti;            // reverse time
+        // backward walks opposite to the forward: for a dir==0 (L->R) forward we
+        // go reverse-time (T-1..0); for a dir==1 (R->L) forward we go forward-time.
+        uint t = (dir==0) ? (T-1-ti) : ti;
         uint row = base + t*DH;
         for(uint d=lid;d<DH;d+=64){ kk[d]=K[row+d]; vv[d]=V[row+d];
             rr[d]=R[row+d]; ww[d]=W[row+d]; }

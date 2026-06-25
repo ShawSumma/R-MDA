@@ -71,6 +71,9 @@ struct model {
     vkc_kernel_t k_adaln;
     vkc_kernel_t k_ce;
     vkc_kernel_t k_adamw;
+    vkc_kernel_t k_vec;
+    vkc_kernel_t k_repack;
+    vkc_kernel_t k_sumsq;
 
     param_t *tok_emb;
     param_t *pos_emb;
@@ -130,6 +133,9 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
     m->k_adaln = vkc_load(c, "build/adaln.spv", 7, 16);
     m->k_ce = vkc_load(c, "build/softmax_ce.spv", 5, 8);
     m->k_adamw = vkc_load(c, "build/adamw.spv", 4, 32);
+    m->k_vec = vkc_load(c, "build/vecops.spv", 2, 8);
+    m->k_repack = vkc_load(c, "build/repack.spv", 2, 20);
+    m->k_sumsq = vkc_load(c, "build/sumsq.spv", 2, 12);
 
     uint32_t d = cfg.d;
     uint32_t hid = cfg.ffn_hidden;
