@@ -87,7 +87,7 @@ int main(void) {
     };
 
     vkc_run(&c, &scalar, sb, (n + 15) / 16, (m + 15) / 16, 1, &pc);
-    vkc_run(&c, &coop, cb, n / 16, m / 16, 1, &pc);
+    vkc_run(&c, &coop, cb, n / 32, m / 32, 1, &pc);
 
     float *cs = c32.ptr;
     float *cc = c16.ptr;
@@ -112,7 +112,7 @@ int main(void) {
     double t_scalar = (now_sec() - t0) / iters;
     t0 = now_sec();
     for (int it = 0; it < iters; it = it + 1) {
-        vkc_run(&c, &coop, cb, n / 16, m / 16, 1, &pc);
+        vkc_run(&c, &coop, cb, n / 32, m / 32, 1, &pc);
     }
     double t_coop = (now_sec() - t0) / iters;
 

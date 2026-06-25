@@ -328,23 +328,30 @@ static void refresh_w16(model_t *m) {
     m->dirty16 = 0;
 }
 
-// fp16 matmul: out[rows, n] = a[rows, k] @ p->w16[k, n], using the matrix cores.
-// The activation a (fp32) is cast into the shared a16 scratch first; the weight is
-// already mirrored in p->w16. Requires rows, n, k to be multiples of 16.
-static void mm16(model_t *m, fwd_scratch_t *sc, vkc_buf_t *a, param_t *p,
-    vkc_buf_t *out, uint32_t rows, uint32_t n, uint32_t k) {
-    cast_buf(m, a, &sc->a16, rows * k, 0);
+// fp16 matmul from an already-fp16 activation a16: out[rows, n] = a16[rows, k] @
+// p->w16[k, n] on the matrix cores. Requires rows, n, k multiples of 16.
+static void mm16_pre(model_t *m, vkc_buf_t *a16, param_t *p, vkc_buf_t *out,
+    uint32_t rows, uint32_t n, uint32_t k) {
     mm_pc_t pc = (mm_pc_t) {
         .m = rows,
         .n = n,
         .k = k,
     };
     vkc_buf_t *bufs[3] = {
-        &sc->a16,
+        a16,
         &p->w16,
         out,
     };
+    // each workgroup computes a 32x32 output block (2x2 of 16x16 tiles).
     vkc_run(m->c, &m->k_mm16, bufs, n / 16, rows / 16, 1, &pc);
+}
+
+// fp16 matmul: casts the fp32 activation a into the shared a16 scratch, then runs.
+// Use mm16_pre directly when several matmuls share one activation (cast once).
+static void mm16(model_t *m, fwd_scratch_t *sc, vkc_buf_t *a, param_t *p,
+    vkc_buf_t *out, uint32_t rows, uint32_t n, uint32_t k) {
+    cast_buf(m, a, &sc->a16, rows * k, 0);
+    mm16_pre(m, &sc->a16, p, out, rows, n, k);
 }
 
 // pack [bt, d] (laid out b,t,head,dh) -> [b, head, t, dh]. The innermost dh run
@@ -522,12 +529,14 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
         };
         vkc_run(m->c, &m->k_tshift, tsb, (bt * d + 255) / 256, 1, 1, &tpc);
 
-        // project to k,v,r,w,a from tmp2
-        mm16(m, sc, &sc->tmp2, ly->wk, &sc->pk, bt, d, d);
-        mm16(m, sc, &sc->tmp2, ly->wv, &sc->pv, bt, d, d);
-        mm16(m, sc, &sc->tmp2, ly->wr, &sc->pr, bt, d, d);
-        mm16(m, sc, &sc->tmp2, ly->ww, &sc->pw, bt, d, d);
-        mm16(m, sc, &sc->tmp2, ly->wa, &sc->pa, bt, d, d);
+        // project to k,v,r,w,a from tmp2: all five share the same activation, so
+        // cast it to fp16 once and reuse it across the five matmuls.
+        cast_buf(m, &sc->tmp2, &sc->a16, bt * d, 0);
+        mm16_pre(m, &sc->a16, ly->wk, &sc->pk, bt, d, d);
+        mm16_pre(m, &sc->a16, ly->wv, &sc->pv, bt, d, d);
+        mm16_pre(m, &sc->a16, ly->wr, &sc->pr, bt, d, d);
+        mm16_pre(m, &sc->a16, ly->ww, &sc->pw, bt, d, d);
+        mm16_pre(m, &sc->a16, ly->wa, &sc->pa, bt, d, d);
         // w in (0,1), a in (0,1): sigmoid on the GPU (op 2), not a host loop.
         vec_op(m, &sc->pw, &sc->pw, bt * d, 2);
         vec_op(m, &sc->pa, &sc->pa, bt * d, 2);

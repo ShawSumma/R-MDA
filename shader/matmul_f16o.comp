@@ -1,0 +1,29 @@
+#version 450
+// like matmul_f16 but stores the result as fp16 (half the output bandwidth). For
+// activation matmuls whose output feeds another fp16 matmul -- avoids the fp32 round
+// trip. accumulate stays fp32 internally; only the store is narrowed.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 32) in;
+layout(std430, binding = 0) readonly buffer buf_a { float16_t a[]; };
+layout(std430, binding = 1) readonly buffer buf_b { float16_t b[]; };
+layout(std430, binding = 2) writeonly buffer buf_c { float16_t c[]; };
+layout(push_constant) uniform pc { uint m; uint n; uint k; };
+const uint TILE = 16;
+void main() {
+    uint row0 = gl_WorkGroupID.y * TILE;
+    uint col0 = gl_WorkGroupID.x * TILE;
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+    for (uint kk = 0; kk < k; kk = kk + TILE) {
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> ma;
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> mb;
+        coopMatLoad(ma, a, (row0 * k + kk), k, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(mb, b, (kk * n + col0), n, gl_CooperativeMatrixLayoutRowMajor);
+        acc = coopMatMulAdd(ma, mb, acc);
+    }
+    coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acch =
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(acc);
+    coopMatStore(acch, c, (row0 * n + col0), n, gl_CooperativeMatrixLayoutRowMajor);
+}

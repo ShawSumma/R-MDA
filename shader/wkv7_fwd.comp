@@ -20,6 +20,7 @@ layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir, save; };
 shared float S[64*64];     // [DH x DH] state for this (b,h)
 shared float kk[64], vv[64], rr[64], ww[64], aa[64];
 shared float Sk[64];       // S^T k  (length DH)
+shared float part[256];    // partial sums for the 4-way reductions
 
 void main(){
     uint bh   = gl_WorkGroupID.x;        // flat (b*Hd + h)
@@ -48,10 +49,18 @@ void main(){
         // save the pre-update state S_{t-1} for the backward pass
         if(save==1){ uint sb=(b*Hd+h)*T*DHl*DHl + t*DHl*DHl;
             for(uint i=lid;i<DHl*DHl;i+=gl_WorkGroupSize.x) Sout[sb+i]=S[i]; barrier(); }
-        // Sk[j] = sum_i S[i,j]*k_i   (column-dot with k)  -> length DH
+        // Sk[j] = sum_i S[i,j]*k_i. 256 threads = 4 lanes per column j: lane g sums
+        // its quarter of i, then the 4 partials combine. (DH=64, group=4.)
+        {
+            uint g = lid / DHl;            // lane 0..3
+            uint j = lid % DHl;            // column 0..DH-1
+            float s = 0.0;
+            for(uint i=g; i<DHl; i+=4u) s += S[i*DHl+j]*kk[i];
+            part[lid] = s;
+        }
+        barrier();
         for(uint j=lid;j<DHl;j+=gl_WorkGroupSize.x){
-            float s=0.0; for(uint i=0;i<DHl;i++) s+=S[i*DHl+j]*kk[i];
-            Sk[j]=s;
+            Sk[j] = part[j] + part[DHl+j] + part[2u*DHl+j] + part[3u*DHl+j];
         }
         barrier();
         float a_t = aa[0];   // scalar in-context lr (per-head scalar)
@@ -61,10 +70,17 @@ void main(){
             S[idx] = ww[j]*S[idx] - a_t*kk[i]*Sk[j] + a_t*kk[i]*vv[j];
         }
         barrier();
-        // out_t[j] = sum_i r_i * S[i,j]
+        // out_t[j] = sum_i r_i * S[i,j], same 4-lane-per-column reduction.
+        {
+            uint g = lid / DHl;
+            uint j = lid % DHl;
+            float o = 0.0;
+            for(uint i=g; i<DHl; i+=4u) o += rr[i]*S[i*DHl+j];
+            part[lid] = o;
+        }
+        barrier();
         for(uint j=lid;j<DHl;j+=gl_WorkGroupSize.x){
-            float o=0.0; for(uint i=0;i<DHl;i++) o+=rr[i]*S[i*DHl+j];
-            O[row+j]=o;
+            O[row+j] = part[j] + part[DHl+j] + part[2u*DHl+j] + part[3u*DHl+j];
         }
         barrier();
     }

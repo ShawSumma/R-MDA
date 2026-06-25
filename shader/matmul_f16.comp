@@ -2,8 +2,9 @@
 // c[m, n] = a[m, k] @ b[k, n], using cooperative-matrix (matrix-core) ops.
 // A and B are fp16; the accumulator and C are fp32 (the f16/f16/f32 config the
 // hardware exposes). Each subgroup computes one 16x16 tile of C by stepping over
-// K in 16-wide chunks. Dispatch one subgroup (one local workgroup of 32) per tile:
-//   global = (ceil(n/16), ceil(m/16)).
+// K in 16-wide chunks. Dispatch one subgroup per tile: global = (n/16, m/16).
+// On this UMA part the matmul is memory-bandwidth-bound, so a larger reuse tile did
+// not help; the simple one-tile-per-subgroup kernel is kept for clarity.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -28,10 +29,8 @@ layout(push_constant) uniform pc {
 const uint TILE = 16;
 
 void main() {
-    uint tile_row = gl_WorkGroupID.y;
-    uint tile_col = gl_WorkGroupID.x;
-    uint row0 = tile_row * TILE;
-    uint col0 = tile_col * TILE;
+    uint row0 = gl_WorkGroupID.y * TILE;
+    uint col0 = gl_WorkGroupID.x * TILE;
 
     coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc =
         coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);

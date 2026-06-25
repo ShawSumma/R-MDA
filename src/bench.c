@@ -23,7 +23,7 @@ int main(void) {
         .n_head = 10,
         .seqlen = 64,
         .batch = 8,
-        .ffn_hidden = 1712,
+        .ffn_hidden = 1728,
         .vocab = data_vocab,
         .vocab_in = data_vocab + 1,
     };
