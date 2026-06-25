@@ -326,9 +326,9 @@ static float train_step(trainer_t *tr) {
     // head
     rmsnorm_fwd(m, &sc->x, &m->layers[0].n1->w, &sc->tmp, &sc->rms_stash, bt, d);
     buf_to_host(&sc->tmp, tr->x_final_n, bt * d);
-    mm(m, &sc->tmp, &m->head->w, &sc->logits, bt, M_VOCAB, d);
+    mm(m, &sc->tmp, &m->head->w, &sc->logits, bt, m->cfg.vocab, d);
 
-    ce_pc_t cpc = (ce_pc_t) { .rows = bt, .vocab = M_VOCAB };
+    ce_pc_t cpc = (ce_pc_t) { .rows = bt, .vocab = m->cfg.vocab };
     vkc_buf_t *cb[5] = { &sc->logits, &sc->target, &sc->mask, &sc->weight, &sc->loss };
     vkc_run(m->c, &m->k_ce, cb, bt, 1, 1, &cpc);
 
@@ -355,7 +355,7 @@ static float train_step(trainer_t *tr) {
     {
         float inv = 1.0f / (float)(cnt + 1e-6);
         float *dl = sc->logits.ptr;
-        for (uint32_t i = 0; i < bt * M_VOCAB; i = i + 1) {
+        for (uint32_t i = 0; i < bt * m->cfg.vocab; i = i + 1) {
             dl[i] *= inv;
         }
     }
@@ -363,9 +363,9 @@ static float train_step(trainer_t *tr) {
     // head: logits = head(x_final_n).  d_head += x_final_n^T dlogits ; dx_n = dlogits head^T
     // a = x_final_n
     host_to_buf(tr->x_final_n, &sc->tmp, bt * d);
-    mm_dB(m, &sc->tmp, &sc->logits, &m->head->g, bt, M_VOCAB, d);
+    mm_dB(m, &sc->tmp, &sc->logits, &m->head->g, bt, m->cfg.vocab, d);
     // dx_n in dx_head
-    mm_dA(m, &m->head->w, &sc->logits, &sc->dx_head, bt, M_VOCAB, d);
+    mm_dA(m, &m->head->w, &sc->logits, &sc->dx_head, bt, m->cfg.vocab, d);
     // rmsnorm before head backward: x stream grad. need x (final residual) -> recompute? we
     // have a->x at last layer's x_mid + ffn add == sc->x currently still holds final x.
     // dy = dx_head, x = sc->x (final), gain = layers[0].n1

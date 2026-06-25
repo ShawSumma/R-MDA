@@ -124,17 +124,21 @@ int main(void) {
     srand(1234);
     vkc_t c = vkc_init();
 
+    // load + tokenize first: the corpus sets the vocab size the model is built for.
+    corpus_t cp = corpus_load("data/wiki.txt");
+
     mcfg_t cfg = (mcfg_t) {
-        .d = 512,
+        .d = 640,
         .n_layer = 12,
-        .n_head = 8,
+        .n_head = 10,
         .seqlen = 64,
         .batch = 8,
-        .ffn_hidden = 1365,
+        .ffn_hidden = 1707,
+        .vocab = data_vocab,
+        .vocab_in = data_vocab + 1,
     };
     model_t *m = model_init(&c, cfg);
     trainer_t tr = trainer_make(m);
-    corpus_t cp = corpus_load("data/wiki.txt");
 
     fprintf(stderr, "params %.2f M | d=%u L=%u H=%u seq=%u batch=%u\n", (double)model_param_count(m) / 1e6, cfg.d, cfg.n_layer, cfg.n_head, cfg.seqlen, cfg.batch);
 

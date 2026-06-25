@@ -29,9 +29,9 @@ static void forward_logits(model_t *m, fwd_scratch_t *sc) {
 }
 
 // argmax over a vocab-sized row of logits.
-static uint32_t argmax_row(float *row) {
+static uint32_t argmax_row(float *row, uint32_t vocab) {
     uint32_t best = 0;
-    for (uint32_t v = 1; v < M_VOCAB; v = v + 1) {
+    for (uint32_t v = 1; v < vocab; v = v + 1) {
         if (row[v] > row[best]) {
             best = v;
         }
@@ -42,17 +42,19 @@ static uint32_t argmax_row(float *row) {
 int main(void) {
     srand(7);
     vkc_t c = vkc_init();
+    corpus_t cp = corpus_load("data/wiki.txt");
     mcfg_t cfg = (mcfg_t) {
-        .d = 512,
+        .d = 640,
         .n_layer = 12,
-        .n_head = 8,
+        .n_head = 10,
         .seqlen = 64,
         .batch = 8,
-        .ffn_hidden = 1365,
+        .ffn_hidden = 1707,
+        .vocab = data_vocab,
+        .vocab_in = data_vocab + 1,
     };
     model_t *m = model_init(&c, cfg);
     fwd_scratch_t sc = fwd_alloc(m);
-    corpus_t cp = corpus_load("data/wiki.txt");
     uint32_t step = load_ckpt(m);
     fprintf(stderr, "loaded checkpoint @ step %u\n", step);
 
@@ -85,12 +87,15 @@ int main(void) {
         uint32_t *target = sc.target.ptr;
         float *logits = sc.logits_save.ptr;
         for (uint32_t i = 0; i < cfg.batch * cfg.seqlen; i = i + 1) {
+            // CE is per-token; convert to per-byte by spreading each token's loss
+            // over its byte length, so bits/byte stays comparable across vocabs.
+            uint32_t blen = cp.tok.entries[target[i]].len;
             raw = raw + loss[i] / (weight[i] + 1e-9);
-            cnt = cnt + mask[i];
-            if (ids[i] != DATA_MASK_ID) {
+            cnt = cnt + mask[i] * (double)blen;
+            if (ids[i] != data_mask_id) {
                 continue;
             }
-            uint32_t best = argmax_row(logits + i * M_VOCAB);
+            uint32_t best = argmax_row(logits + i * cfg.vocab, cfg.vocab);
             int hit = (best == target[i]) ? 1 : 0;
             acc_total = acc_total + 1;
             acc_correct = acc_correct + hit;
@@ -128,18 +133,21 @@ int main(void) {
     uint32_t total = 0;
     printf("actual : ");
     for (uint32_t s = 0; s < cfg.seqlen; s = s + 1) {
-        unsigned char ch = (unsigned char)target[s];
-        putchar((ch >= 32 && ch < 127) ? ch : '.');
+        tok_entry_t *e = &cp.tok.entries[target[s]];
+        fwrite(e->bytes, 1, e->len, stdout);
     }
     printf("\nmodel  : ");
     for (uint32_t s = 0; s < cfg.seqlen; s = s + 1) {
-        if (ids[s] != DATA_MASK_ID) {
-            putchar(' ');
+        if (ids[s] != data_mask_id) {
+            tok_entry_t *e = &cp.tok.entries[target[s]];
+            for (uint32_t k = 0; k < e->len; k = k + 1) {
+                putchar(' ');
+            }
             continue;
         }
-        uint32_t best = argmax_row(logits + s * M_VOCAB);
-        unsigned char ch = (unsigned char)best;
-        putchar((ch >= 32 && ch < 127) ? ch : '.');
+        uint32_t best = argmax_row(logits + s * cfg.vocab, cfg.vocab);
+        tok_entry_t *e = &cp.tok.entries[best];
+        fwrite(e->bytes, 1, e->len, stdout);
         total = total + 1;
         if (best == target[s]) {
             correct = correct + 1;

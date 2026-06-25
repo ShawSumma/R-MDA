@@ -8,10 +8,6 @@
 #include "data.h"
 #include <math.h>
 
-#define M_VOCAB 256
-// vocab fed to the model: the 256 byte values plus one MASK id.
-#define M_VOCAB_IN 257
-#define M_DIFF_STEPS 1000
 // registry capacity (max distinct parameter tensors).
 #define M_MAX_PARAMS 256
 
@@ -25,6 +21,9 @@ struct mcfg {
     uint32_t seqlen;
     uint32_t batch;
     uint32_t ffn_hidden;
+    // output vocab (subword count) and input vocab (vocab + 1 for the mask id).
+    uint32_t vocab;
+    uint32_t vocab_in;
 };
 
 // One trainable tensor: the weights plus its grad and AdamW moments, all same size.
@@ -183,10 +182,10 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
     uint32_t hid = cfg.ffn_hidden;
     float s = 0.02f;
 
-    m->tok_emb = param_new(m, M_VOCAB_IN * d, s, 0.0f, "tok_emb");
+    m->tok_emb = param_new(m, cfg.vocab_in * d, s, 0.0f, "tok_emb");
     m->pos_emb = param_new(m, cfg.seqlen * d, s, 0.0f, "pos_emb");
     m->t_proj = param_new(m, d * d, s, 0.0f, "t_proj");
-    m->head = param_new(m, d * M_VOCAB, s, 0.0f, "head");
+    m->head = param_new(m, d * cfg.vocab, s, 0.0f, "head");
 
     m->layers = malloc(cfg.n_layer * sizeof(mlayer_t));
     for (uint32_t l = 0; l < cfg.n_layer; l = l + 1) {

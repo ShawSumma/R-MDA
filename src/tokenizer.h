@@ -27,15 +27,24 @@ struct tok_entry {
     float logp;
 };
 
+// A byte trie over the vocab: walking it from a text position yields every token
+// that matches a prefix there, in O(token length) with no vocab scan. Each node is
+// 256 child slots (index into nodes, 0 = none) plus the token id that ends at this
+// node (-1 if none). Children use index 0 as "empty" so the root is node 1.
+typedef struct trie_node trie_node_t;
+
+struct trie_node {
+    uint32_t child[256];
+    int32_t token;
+};
+
 typedef struct tokenizer tokenizer_t;
 
 struct tokenizer {
     tok_entry_t *entries;
     uint32_t count;
-    // first_of[c] is the index of the first entry whose first byte is c, or count
-    // if none; entries are sorted by first byte then by string, so a token lookup
-    // can scan a narrow range. Built by tokenizer_index.
-    uint32_t first_of[257];
+    trie_node_t *nodes;
+    uint32_t node_count;
 };
 
 static void tok_unescape(const char *src, char *dst, uint32_t *len_out) {
@@ -70,32 +79,39 @@ static void tok_escape(const char *src, uint32_t len, FILE *f) {
     }
 }
 
-static int tok_compare(const void *pa, const void *pb) {
-    const tok_entry_t *a = pa;
-    const tok_entry_t *b = pb;
-    uint32_t n = (a->len < b->len) ? a->len : b->len;
-    int c = memcmp(a->bytes, b->bytes, n);
-    if (c != 0) {
-        return c;
-    }
-    if (a->len < b->len) {
-        return -1;
-    }
-    if (a->len > b->len) {
-        return 1;
-    }
-    return 0;
+static uint32_t trie_new_node(tokenizer_t *t) {
+    uint32_t id = t->node_count;
+    t->node_count = t->node_count + 1;
+    trie_node_t *n = &t->nodes[id];
+    memset(n->child, 0, sizeof(n->child));
+    n->token = -1;
+    return id;
 }
 
-// build first_of[] after entries are sorted by (first byte, string).
+// build the byte trie: insert every token's bytes, marking the terminal node with
+// the token id. Node 0 is reserved as "empty child"; node 1 is the root.
 static void tokenizer_index(tokenizer_t *t) {
-    qsort(t->entries, t->count, sizeof(tok_entry_t), tok_compare);
-    uint32_t e = 0;
-    for (uint32_t c = 0; c < 257; c = c + 1) {
-        while (e < t->count && (unsigned char)t->entries[e].bytes[0] < c) {
-            e = e + 1;
+    // worst case one node per byte of every token, plus root and the empty slot.
+    uint32_t cap = 2;
+    for (uint32_t i = 0; i < t->count; i = i + 1) {
+        cap = cap + t->entries[i].len;
+    }
+    t->nodes = malloc(cap * sizeof(trie_node_t));
+    t->node_count = 0;
+    trie_new_node(t);
+    uint32_t root = trie_new_node(t);
+    for (uint32_t i = 0; i < t->count; i = i + 1) {
+        uint32_t node = root;
+        const char *b = t->entries[i].bytes;
+        for (uint32_t k = 0; k < t->entries[i].len; k = k + 1) {
+            unsigned char c = (unsigned char)b[k];
+            if (t->nodes[node].child[c] == 0) {
+                uint32_t fresh = trie_new_node(t);
+                t->nodes[node].child[c] = fresh;
+            }
+            node = t->nodes[node].child[c];
         }
-        t->first_of[c] = e;
+        t->nodes[node].token = (int32_t)i;
     }
 }
 
@@ -143,22 +159,10 @@ static tokenizer_t tokenizer_load(const char *path) {
     return t;
 }
 
-// look up the entry index for an exact token string, or -1 if absent.
-static int32_t tokenizer_find(const tokenizer_t *t, const char *s, uint32_t len) {
-    unsigned char c = (unsigned char)s[0];
-    uint32_t lo = t->first_of[c];
-    uint32_t hi = t->first_of[c + 1];
-    for (uint32_t i = lo; i < hi; i = i + 1) {
-        if (t->entries[i].len == len && memcmp(t->entries[i].bytes, s, len) == 0) {
-            return (int32_t)i;
-        }
-    }
-    return -1;
-}
-
 // Viterbi maximum-likelihood segmentation of text[0..len) into token ids. Writes
-// up to max_out ids into out and returns the count. Every single byte must exist
-// as a token (the trainer guarantees this) so a segmentation always exists.
+// up to max_out ids into out and returns the count. Every single byte exists as a
+// token (the trainer guarantees this) so a segmentation always exists. For each
+// start position we walk the trie once, relaxing every token that matches there.
 static uint32_t tokenizer_encode(
     const tokenizer_t *t,
     const char *text,
@@ -178,12 +182,19 @@ static uint32_t tokenizer_encode(
         if (best[i] <= -1e29f) {
             continue;
         }
+        uint32_t node = 1;
         uint32_t max_len = TOK_MAX_LEN;
         if (i + max_len > len) {
             max_len = len - i;
         }
         for (uint32_t l = 1; l <= max_len; l = l + 1) {
-            int32_t id = tokenizer_find(t, text + i, l);
+            unsigned char c = (unsigned char)text[i + l - 1];
+            uint32_t next = t->nodes[node].child[c];
+            if (next == 0) {
+                break;
+            }
+            node = next;
+            int32_t id = t->nodes[node].token;
             if (id < 0) {
                 continue;
             }
@@ -219,6 +230,7 @@ static void tokenizer_free(tokenizer_t *t) {
         free(t->entries[i].bytes);
     }
     free(t->entries);
+    free(t->nodes);
 }
 
 #endif

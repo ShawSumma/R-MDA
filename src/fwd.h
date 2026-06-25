@@ -128,8 +128,8 @@ static fwd_scratch_t fwd_alloc(model_t *m) {
             * (d / cfg.n_head) * (d / cfg.n_head) * sizeof(float)),
         .sstate2 = vkc_alloc(c, cfg.batch * cfg.n_head * cfg.seqlen
             * (d / cfg.n_head) * (d / cfg.n_head) * sizeof(float)),
-        .logits = vkc_alloc(c, bt * M_VOCAB * sizeof(float)),
-        .logits_save = vkc_alloc(c, bt * M_VOCAB * sizeof(float)),
+        .logits = vkc_alloc(c, bt * cfg.vocab * sizeof(float)),
+        .logits_save = vkc_alloc(c, bt * cfg.vocab * sizeof(float)),
         .loss = vkc_alloc(c, bt * sizeof(float)),
         .ids = vkc_alloc(c, bt * sizeof(uint32_t)),
         .target = vkc_alloc(c, bt * sizeof(uint32_t)),
@@ -540,15 +540,15 @@ static float model_forward(model_t *m, fwd_scratch_t *sc) {
 
     // 3. head: logits = head(rmsnorm(x))   (reuse n1[0] as a final gain? use ones)
     rmsnorm_fwd(m, &sc->x, &m->layers[0].n1->w, &sc->tmp, &sc->rms_stash, bt, d);
-    mm(m, &sc->tmp, &m->head->w, &sc->logits, bt, M_VOCAB, d);
+    mm(m, &sc->tmp, &m->head->w, &sc->logits, bt, m->cfg.vocab, d);
 
     // snapshot logits before CE overwrites them with dlogits (for inference)
-    memcpy(sc->logits_save.ptr, sc->logits.ptr, bt * M_VOCAB * sizeof(float));
+    memcpy(sc->logits_save.ptr, sc->logits.ptr, bt * m->cfg.vocab * sizeof(float));
 
     // 4. masked CE loss (also writes dlogits into logits)
     ce_pc_t cpc = (ce_pc_t) {
         .rows = bt,
-        .vocab = M_VOCAB,
+        .vocab = m->cfg.vocab,
     };
     vkc_buf_t *cb[5] = {
         &sc->logits,

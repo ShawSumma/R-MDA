@@ -1,21 +1,30 @@
-// data.h -- byte-level corpus loader + masked-diffusion batch builder. No Python.
-// Vocab is the 256 byte values plus one MASK id at index 256.
+// data.h -- corpus loader + masked-diffusion batch builder over Unigram subword
+// tokens (see tokenizer.h). The corpus is tokenized once at load into a flat array
+// of token ids; batches sample token windows and mask token positions. No Python.
+// Vocab is the trained subword set plus one MASK id at index DATA_VOCAB.
 #ifndef DATA_H
 #define DATA_H
 
+#include "tokenizer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 
-#define DATA_VOCAB 256
-#define DATA_MASK_ID 256
+// the vocab size and mask id are set when the corpus is tokenized; the model reads
+// DATA_VOCAB to size its embedding and head. DATA_MASK_ID is the absorbing token.
+extern uint32_t data_vocab;
+extern uint32_t data_mask_id;
 
 typedef struct corpus corpus_t;
 
 struct corpus {
-    unsigned char *bytes;
+    uint32_t *ids;
     size_t len;
+    tokenizer_t tok;
 };
+
+uint32_t data_vocab = 0;
+uint32_t data_mask_id = 0;
 
 static corpus_t corpus_load(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -26,24 +35,56 @@ static corpus_t corpus_load(const char *path) {
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    unsigned char *b = malloc(n);
-    fread(b, 1, n, f);
+    char *bytes = malloc(n);
+    fread(bytes, 1, n, f);
     fclose(f);
-    return (corpus_t) {
-        .bytes = b,
-        .len = (size_t)n,
+
+    tokenizer_t tok = tokenizer_load("models/vocab.txt");
+    data_vocab = tok.count;
+    data_mask_id = tok.count;
+
+    // tokenize the whole corpus once. Encoding 60+ MB through Viterbi is slow if
+    // done in one call (the back-pointer arrays scale with length), so segment it
+    // in fixed windows; windows are large enough that boundary effects are tiny.
+    uint32_t *ids = malloc((size_t)n * sizeof(uint32_t));
+    size_t total = 0;
+    uint32_t window = 8192;
+    uint32_t *tmp = malloc(window * sizeof(uint32_t));
+    size_t pos = 0;
+    while (pos < (size_t)n) {
+        uint32_t chunk = window;
+        if (pos + chunk > (size_t)n) {
+            chunk = (uint32_t)((size_t)n - pos);
+        }
+        uint32_t got = tokenizer_encode(&tok, bytes + pos, chunk, tmp, window);
+        for (uint32_t i = 0; i < got; i = i + 1) {
+            ids[total] = tmp[i];
+            total = total + 1;
+        }
+        pos = pos + chunk;
+    }
+    free(tmp);
+    free(bytes);
+
+    fprintf(stderr, "tokenized corpus: %ld bytes -> %zu tokens (%.2f bytes/token), vocab %u\n", n, total, (double)n / total, tok.count);
+
+    corpus_t cp = {
+        .ids = ids,
+        .len = total,
+        .tok = tok,
     };
+    return cp;
 }
 
 static float frand(void) {
     return (float)((rand() % 1000000) / 1000000.0);
 }
 
-// Build one masked-diffusion batch.
-//   ids_in[b*seqlen]   : corrupted token ids fed to the denoiser (mask id where masked)
-//   target[b*seqlen]   : the true byte at each position
-//   mask[b*seqlen]     : 1.0 where the position was masked (loss is counted there)
-//   weight[b*seqlen]   : 1/t loss weight (per sequence, broadcast over positions)
+// Build one masked-diffusion batch over token positions.
+//   ids_in[b*seqlen] : corrupted token ids fed to the denoiser (mask id where masked)
+//   target[b*seqlen] : the true token id at each position
+//   mask[b*seqlen]   : 1.0 where the position was masked (loss is counted there)
+//   weight[b*seqlen] : 1/t loss weight (per sequence, broadcast over positions)
 // t is sampled per sequence in [t_min, 1]; each token masked independently w.p. t.
 static void make_batch(
     const corpus_t *cp,
@@ -61,14 +102,14 @@ static void make_batch(
         float w = 1.0f / t;
         for (uint32_t s = 0; s < seqlen; s = s + 1) {
             uint32_t pos = b * seqlen + s;
-            unsigned char byte = cp->bytes[start + s];
-            target[pos] = byte;
+            uint32_t token = cp->ids[start + s];
+            target[pos] = token;
             weight[pos] = w;
             if (frand() < t) {
-                ids_in[pos] = DATA_MASK_ID;
+                ids_in[pos] = data_mask_id;
                 mask[pos] = 1.0f;
             } else {
-                ids_in[pos] = byte;
+                ids_in[pos] = token;
                 mask[pos] = 0.0f;
             }
         }
