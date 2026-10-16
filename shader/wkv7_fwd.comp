@@ -1,10 +1,13 @@
 #version 450
 // RWKV-7 WKV forward recurrence, one workgroup per (batch, head), sequential in t.
-//   S_t = diag(w_t) S_{t-1} - a_t (k_t (S_{t-1}^T k_t)^T) + a_t (k_t v_t^T)
-//   out_t = r_t^T S_t          (readout; the +r.x residual is added on the host side)
+//   S_t[i,j] = w_t[j] S_{t-1}[i,j] + a_t[i] k_t[i] (v_t[j] - (S_{t-1}^T k_t)[j])
+//   out_t = r_t^T S_t
+// i.e. a delta rule with a per-key-channel in-context learning rate a (RWKV-7's a*k).
 // State S is [DH x DH] (row i, col j). w,a,k,v,r are [DH] per (t).
 // Layout per (b,h): k,v,r,w,a are [T, DH]; out is [T, DH]; we hold S in shared mem.
 // direction: 0 = forward (t=0..T-1), 1 = backward (t=T-1..0).
+// Requires DH == 64: the state indexing (>>6, &63, row stride 65) and the 4-lane
+// reductions (256 threads = 4 x DH) are fixed to it; model_init checks the config.
 layout(local_size_x = 256) in;  // threads cooperate on the [DH x DH] state per step
 
 layout(std430,binding=0) readonly  buffer BK { float K[]; };
@@ -63,11 +66,10 @@ void main(){
             Sk[j] = part[j] + part[DHl+j] + part[2u*DHl+j] + part[3u*DHl+j];
         }
         barrier();
-        float a_t = aa[0];   // scalar in-context lr (per-head scalar)
-        // update: each thread updates its rows. S[i,j] = w_j*S[i,j] - a*k_i*Sk[j] + a*k_i*v_j
+        // update: each thread updates its rows. S[i,j] = w_j*S[i,j] + a_i*k_i*(v_j - Sk[j])
         for(uint idx=lid; idx<DHl*DHl; idx+=gl_WorkGroupSize.x){
             uint i=idx >> 6, j=idx & 63u;
-            S[(idx>>6)*65u + (idx&63u)] = ww[j]*S[(idx>>6)*65u + (idx&63u)] - a_t*kk[i]*Sk[j] + a_t*kk[i]*vv[j];
+            S[i*65u + j] = ww[j]*S[i*65u + j] + aa[i]*kk[i]*(vv[j] - Sk[j]);
         }
         barrier();
         // out_t[j] = sum_i r_i * S[i,j], same 4-lane-per-column reduction.

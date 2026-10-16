@@ -62,6 +62,8 @@ struct sumsq_pc_t {
     uint32_t n;
     uint32_t op;
     float scale;
+    // first partial slot for this param (op 0)
+    uint32_t off;
 };
 
 // Push constants for the matmul-backward kernel: mode 0 makes dA, mode 1 makes dB.
@@ -116,10 +118,13 @@ struct model_t {
     vkc_kernel_t k_repack;
     vkc_kernel_t k_sumsq;
     vkc_kernel_t k_normheads;
+    vkc_kernel_t k_temb;
 
     param_t *tok_emb;
     param_t *pos_emb;
     param_t *t_proj;
+    // gain of the final rmsnorm before the head
+    param_t *n_out;
     param_t *head;
     mlayer_t *layers;
 
@@ -131,6 +136,9 @@ struct model_t {
     int dirty16;
     // when set, model_forward stops after logits (no CE loss) -- for generation.
     int infer;
+    // when set, the forward's matmuls run in fp32 on the scalar kernel instead of fp16
+    // on the matrix cores: a reference mode for gradient checks (slow).
+    int ref32;
 };
 
 static void randn_fill(float *p, uint32_t n, float std) {
@@ -170,7 +178,34 @@ static param_t *param_new(
     return p;
 }
 
+// The kernels hardcode shapes: wkv7_fwd/bwd assume head_dim 64, and the fp16 matmuls
+// compute 64x64 output blocks (rows and n multiples of 64, k a multiple of 16). Any
+// other config would run and produce wrong results, so refuse it up front.
+static void mcfg_check(mcfg_t cfg) {
+    int bad = 0;
+    if (cfg.n_head == 0 || cfg.d != 64 * cfg.n_head) {
+        fprintf(stderr, "config: d / n_head must be 64 (d=%u n_head=%u)\n", cfg.d, cfg.n_head);
+        bad = 1;
+    }
+    if (cfg.ffn_hidden % 64 != 0) {
+        fprintf(stderr, "config: ffn_hidden must be a multiple of 64 (%u)\n", cfg.ffn_hidden);
+        bad = 1;
+    }
+    if (cfg.vocab % 64 != 0) {
+        fprintf(stderr, "config: vocab must be a multiple of 64 (%u)\n", cfg.vocab);
+        bad = 1;
+    }
+    if ((cfg.batch * cfg.seqlen) % 64 != 0) {
+        fprintf(stderr, "config: batch * seqlen must be a multiple of 64 (%u)\n", cfg.batch * cfg.seqlen);
+        bad = 1;
+    }
+    if (bad) {
+        exit(1);
+    }
+}
+
 static model_t *model_init(vkc_t *c, mcfg_t cfg) {
+    mcfg_check(cfg);
     model_t *m = calloc(1, sizeof(model_t));
     m->c = c;
     m->cfg = cfg;
@@ -178,7 +213,7 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
     m->k_embed = vkc_load(c, "build/embed.spv", 4, 16);
     m->k_tshift = vkc_load(c, "build/tokenshift.spv", 5, 16);
     m->k_wkv_f = vkc_load(c, "build/wkv7_fwd.spv", 7, 24);
-    m->k_wkv_b = vkc_load(c, "build/wkv7_bwd.spv", 12, 16);
+    m->k_wkv_b = vkc_load(c, "build/wkv7_bwd.spv", 12, 20);
     m->k_mm = vkc_load(c, "build/matmul.spv", 3, 12);
     m->k_mm16 = vkc_load(c, "build/matmul_f16.spv", 3, 12);
     m->k_mm16w = vkc_load(c, "build/matmul_f16_wide.spv", 3, 12);
@@ -186,13 +221,14 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
     m->k_mm_bw = vkc_load(c, "build/matmul_bw.spv", 4, 16);
     m->k_elem = vkc_load(c, "build/elem.spv", 2, 8);
     m->k_rms = vkc_load(c, "build/rmsnorm.spv", 5, 12);
-    m->k_adaln = vkc_load(c, "build/adaln.spv", 7, 16);
+    m->k_adaln = vkc_load(c, "build/adaln.spv", 5, 28);
     m->k_ce = vkc_load(c, "build/softmax_ce.spv", 5, 8);
     m->k_adamw = vkc_load(c, "build/adamw.spv", 4, 32);
     m->k_vec = vkc_load(c, "build/vecops.spv", 2, 12);
     m->k_repack = vkc_load(c, "build/repack.spv", 2, 20);
-    m->k_sumsq = vkc_load(c, "build/sumsq.spv", 2, 12);
-    m->k_normheads = vkc_load(c, "build/normheads.spv", 2, 12);
+    m->k_sumsq = vkc_load(c, "build/sumsq.spv", 2, 16);
+    m->k_normheads = vkc_load(c, "build/normheads.spv", 3, 12);
+    m->k_temb = vkc_load(c, "build/temb.spv", 2, 12);
 
     uint32_t d = cfg.d;
     uint32_t hid = cfg.ffn_hidden;
@@ -201,6 +237,7 @@ static model_t *model_init(vkc_t *c, mcfg_t cfg) {
     m->tok_emb = param_new(m, cfg.vocab_in * d, s, 0.0f, "tok_emb");
     m->pos_emb = param_new(m, cfg.seqlen * d, s, 0.0f, "pos_emb");
     m->t_proj = param_new(m, d * d, s, 0.0f, "t_proj");
+    m->n_out = param_new(m, d, 0.0f, 1.0f, "n_out");
     m->head = param_new(m, d * cfg.vocab, s, 0.0f, "head");
 
     m->layers = malloc(cfg.n_layer * sizeof(mlayer_t));

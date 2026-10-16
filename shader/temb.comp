@@ -1,0 +1,32 @@
+#version 450
+// Sinusoidal embedding of the diffusion mask rate t, per sequence. t is recovered from
+// the 1/t loss weight of the sequence's first position (weight is broadcast over t):
+//   emb[b, i] = sin(t * f_i) for even i, cos(t * f_i) for odd i,
+//   f_i = 10000^(-(i/2) / (d/2)).
+// One invocation per (b, i).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer buf_weight {
+    float weight[];
+};
+layout(std430, binding = 1) writeonly buffer buf_emb {
+    float emb[];
+};
+layout(push_constant) uniform pc {
+    uint batch;
+    uint d;
+    uint seqlen;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= batch * d) {
+        return;
+    }
+    uint b = idx / d;
+    uint i = idx % d;
+    float t = 1.0 / (weight[b * seqlen] + 1e-9);
+    float freq = exp(-log(10000.0) * float(i / 2u) / float(d / 2u));
+    float ang = t * freq;
+    emb[idx] = ((i % 2u) == 0u) ? sin(ang) : cos(ang);
+}

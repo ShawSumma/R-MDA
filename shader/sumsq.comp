@@ -1,8 +1,9 @@
 #version 450
 // Partial sum-of-squares reduction for gradient-norm clipping. Each workgroup
-// reduces its slice of `g[n]` into one partial in `out[wg]`. The host sums the
-// (few) partials and computes the global norm -- avoids reading all 63M grads
-// over slow write-combined memory. op 1: scale g[i] *= s (apply clip).
+// reduces its slice of `g[n]` into one partial in `partial[off + wg]`; giving each
+// param its own `off` lets every param's reduction share one batch. The host sums the
+// partials and computes the global norm -- avoids reading all the grads over slow
+// write-combined memory. op 1: scale g[i] *= s (apply clip).
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer buf_g {
@@ -15,6 +16,7 @@ layout(push_constant) uniform pc {
     uint n;
     uint op;
     float scale;
+    uint off;
 };
 
 shared float red[256];
@@ -39,6 +41,6 @@ void main() {
         barrier();
     }
     if (lid == 0) {
-        partial[gl_WorkGroupID.x] = red[0];
+        partial[off + gl_WorkGroupID.x] = red[0];
     }
 }

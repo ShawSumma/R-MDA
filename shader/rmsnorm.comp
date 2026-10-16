@@ -31,6 +31,8 @@ layout(push_constant) uniform pc {
 
 shared float red[256];
 
+// ends with a barrier after every thread has read red[0], so a following reduction's
+// writes into red cannot race those reads.
 float reduce_sum(float v, uint lid) {
     red[lid] = v;
     barrier();
@@ -40,7 +42,9 @@ float reduce_sum(float v, uint lid) {
         }
         barrier();
     }
-    return red[0];
+    float r = red[0];
+    barrier();
+    return r;
 }
 
 void main() {

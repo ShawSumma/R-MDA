@@ -1,8 +1,10 @@
 #version 450
-// Per-head L2 normalization: each of n_vec contiguous vectors of length dh is
-// scaled to unit norm in place. One workgroup per vector; the workgroup reduces
-// the sum of squares in shared memory, then every thread scales its element. op 1
-// also writes 1/||v|| per vector into inv (the backward needs that scale).
+// Per-head L2 normalization of n_vec contiguous vectors of length dh. One workgroup
+// per vector; the workgroup reduces in shared memory, then every thread handles its
+// elements.
+//   op 0 forward:  v = v / ||v|| in place; inv[vec] = 1/||v|| for the backward.
+//   op 1 backward: v holds dk_hat, khat the saved unit vector, inv the saved scale:
+//                  v = (v - khat * (khat . v)) * inv   (the Jacobian of k / ||k||).
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer buf_v {
@@ -10,6 +12,9 @@ layout(std430, binding = 0) buffer buf_v {
 };
 layout(std430, binding = 1) buffer buf_inv {
     float inv[];
+};
+layout(std430, binding = 2) readonly buffer buf_khat {
+    float khat[];
 };
 layout(push_constant) uniform pc {
     uint n_vec;
@@ -19,6 +24,18 @@ layout(push_constant) uniform pc {
 
 shared float partial[256];
 
+float reduce_sum(float x, uint tid) {
+    partial[tid] = x;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride = stride / 2u) {
+        if (tid < stride) {
+            partial[tid] = partial[tid] + partial[tid + stride];
+        }
+        barrier();
+    }
+    return partial[0];
+}
+
 void main() {
     uint vec = gl_WorkGroupID.x;
     if (vec >= n_vec) {
@@ -27,26 +44,28 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint base = vec * dh;
 
-    float local = 0.0;
-    for (uint e = tid; e < dh; e = e + gl_WorkGroupSize.x) {
-        float x = v[base + e];
-        local = local + x * x;
-    }
-    partial[tid] = local;
-    barrier();
-
-    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride = stride / 2u) {
-        if (tid < stride) {
-            partial[tid] = partial[tid] + partial[tid + stride];
+    if (op == 0u) {
+        float local = 0.0;
+        for (uint e = tid; e < dh; e = e + gl_WorkGroupSize.x) {
+            float x = v[base + e];
+            local = local + x * x;
         }
-        barrier();
-    }
-
-    float scale = 1.0 / (sqrt(partial[0]) + 1e-6);
-    if (op == 1u && tid == 0u) {
-        inv[vec] = scale;
-    }
-    for (uint e = tid; e < dh; e = e + gl_WorkGroupSize.x) {
-        v[base + e] = v[base + e] * scale;
+        float scale = 1.0 / (sqrt(reduce_sum(local, tid)) + 1e-6);
+        if (tid == 0u) {
+            inv[vec] = scale;
+        }
+        for (uint e = tid; e < dh; e = e + gl_WorkGroupSize.x) {
+            v[base + e] = v[base + e] * scale;
+        }
+    } else {
+        float local = 0.0;
+        for (uint e = tid; e < dh; e = e + gl_WorkGroupSize.x) {
+            local = local + khat[base + e] * v[base + e];
+        }
+        float dot = reduce_sum(local, tid);
+        float scale = inv[vec];
+        for (uint e = tid; e < dh; e = e + gl_WorkGroupSize.x) {
+            v[base + e] = (v[base + e] - khat[base + e] * dot) * scale;
+        }
     }
 }

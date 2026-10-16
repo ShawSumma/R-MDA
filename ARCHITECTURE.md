@@ -41,10 +41,11 @@ Per layer, **pre-norm**, two sub-blocks:
   state `S` is a `[head_dim x head_dim]` matrix per head, evolved over time:
   ```
   Sk_t[j]  = sum_i S_{t-1}[i,j] * k_t[i]
-  S_t[i,j] = w_t[j]*S_{t-1}[i,j] - a_t*k_t[i]*Sk_t[j] + a_t*k_t[i]*v_t[j]
+  S_t[i,j] = w_t[j]*S_{t-1}[i,j] + a_t[i]*k_t[i]*(v_t[j] - Sk_t[j])
   out_t[j] = sum_i r_t[i] * S_t[i,j]
   ```
-  `w` is a per-column decay, `a` a per-step scalar "in-context learning rate".
+  `w` is a per-column decay, `a` a per-key-channel "in-context learning rate" (RWKV-7's
+  `a*k`), so every channel of the `a` projection is used.
   **Bidirectional**: run L->R and R->L, **average** the outputs (needed for a
   denoiser — every position sees past and future; averaging not summing, or the
   magnitude doubles and drifts).
@@ -60,8 +61,10 @@ Absorbing-state masked diffusion (MDLM): each training sequence samples a mask r
 `t ∈ [0.02, 1]`, masks each token independently with prob t, and the model predicts the
 originals. Loss is **1/t-weighted cross-entropy on masked positions only**. The 1/t
 weighting produces high-variance gradients (handled by gradient clipping). adaLN-Zero
-timestep conditioning is wired (sinusoidal embed of t -> per-block scale/shift) but
-currently a no-op in the inference path (cond=0 -> plain pre-norm RWKV).
+timestep conditioning: sinusoidal embed of t -> t_proj -> per-block scale/shift on both
+norms. Training and inference share one forward (`forward_rec` in src/fwd.h), so eval
+and generation run exactly the trained network; generation conditions each sequence
+on its current masked fraction.
 
 ### 1.4 Generation (src/generate.c)
 Iterative denoising: start fully masked, run **N forward passes**, each predicting all
@@ -78,6 +81,8 @@ unmasking). Cost is **linear in N**. `build/generate <N>`.
 - **Command batching:** `vkc_begin` / record many dispatches (with a compute->compute
   memory barrier between dependent ones) / `vkc_flush` submits once. This replaced a
   per-dispatch `vkQueueSubmit + vkQueueWaitIdle` that dominated with ~250 small kernels.
+  The inference forward, the whole training step (forward + backward), the grad-norm
+  reduction and the clip + AdamW update are each one batch.
 - **wave32 is forced** at pipeline creation (`requiredSubgroupSize=32` +
   `subgroupSizeControl` feature). RDNA3 WMMA runs in wave32 but the device defaults to
   wave64; multi-subgroup matmul kernels that assume 32-lane waves silently break (half
@@ -95,27 +100,36 @@ unmasking). Cost is **linear in N**. `build/generate <N>`.
 | `embed` | token + position embedding lookup |
 | `tokenshift` | RWKV token shift |
 | `wkv7_fwd` / `wkv7_bwd` | the WKV-7 recurrence (forward saves states for backward) |
-| `matmul` / `matmul_bw` | scalar fp32 matmul (backward + the tiny batch=8 cond/ada matmuls) |
-| `matmul_f16` | **fp16 cooperative-matrix matmul, 64x64 block** (per-layer matmuls) |
+| `matmul` / `matmul_bw` | scalar fp32 matmul (backward, the batch-row t_proj matmul, and the fp32 reference mode) |
+| `matmul_f16` | **fp16 cooperative-matrix matmul, 64x64 block** (per-layer matmuls; the ada projections with cond padded to 64 rows) |
 | `matmul_f16_wide` | fp16 coopmat, 256x64 / 4x4 block (the large-n vocab head) |
 | `cast_f16` | fp32 <-> fp16 cast (weight mirrors + activation casts) |
-| `rmsnorm`, `adaln` | normalization (forward + backward) |
+| `temb` | sinusoidal embedding of the mask rate t (from the 1/t weight) |
+| `rmsnorm`, `adaln` | normalization (forward + backward); adaln reads/writes the ada6 slots in place |
 | `softmax_ce` | masked cross-entropy + dlogits |
 | `adamw` | optimizer step |
 | `vecops` | elementwise glue: add, mul, sigmoid, average, copy, sigmoid', scale |
 | `repack` | [bt,d] <-> [b,head,t,dh] layout for wkv |
 | `sumsq` | GPU grad-norm reduction (for clipping) |
-| `normheads` | per-head L2 normalization of k (+ saves 1/‖k‖ for backward) |
+| `normheads` | per-head L2 normalization of k (+ saves 1/‖k‖) and its backward |
 | `argmax` | per-row top-1 token + confidence (generation sampling) |
 
+Shape limits (checked by `mcfg_check` in src/model.h): head_dim d/n_head must be 64
+(wkv7_fwd/bwd), and ffn_hidden, vocab and batch*seqlen must be multiples of 64 (the
+fp16 matmul blocks).
+
 Binaries: `train`, `sample`, `bench`, `generate`, `probe_coopmat`, `test_matmul_f16`,
-`train_tokenizer`.
+`test_grad`, `train_tokenizer`. `test_grad` finite-difference checks every parameter's
+gradient on a tiny model in the fp32 reference mode (`model_t.ref32`) and checks that
+train_step and model_forward compute the same loss.
 
 ---
 
 ## 4. Performance — current state
 
-Measured on the 8060S, batch=8, seqlen=64 (512 tokens/forward):
+Measured on the 8060S, batch=8, seqlen=64 (512 tokens/forward). These numbers (and the
+step-1 loss below) predate the forward gaining adaLN conditioning in inference,
+per-channel `a`, and the batched training step; re-measure before relying on them.
 
 | metric | start | now | factor |
 |---|---|---|---|

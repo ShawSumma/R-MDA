@@ -31,6 +31,8 @@ layout(push_constant) uniform pc {
 
 shared float red[256];
 
+// each reduction ends with a barrier after every thread has read red[0], so the next
+// reduction's writes into red cannot race those reads.
 float reduce_max(float v, uint lid) {
     red[lid] = v;
     barrier();
@@ -40,7 +42,9 @@ float reduce_max(float v, uint lid) {
         }
         barrier();
     }
-    return red[0];
+    float r = red[0];
+    barrier();
+    return r;
 }
 
 float reduce_sum(float v, uint lid) {
@@ -52,7 +56,9 @@ float reduce_sum(float v, uint lid) {
         }
         barrier();
     }
-    return red[0];
+    float r = red[0];
+    barrier();
+    return r;
 }
 
 void main() {
@@ -80,14 +86,16 @@ void main() {
     float wt = weight[row];
     uint tgt = target[row];
 
-    if (lid == 0) {
-        float logp_tgt = logits[base + tgt] - logz;
-        loss[row] = -m * wt * logp_tgt;
-    }
-    // gradient: dlogits_i = m * wt * (softmax_i - [i == tgt])
+    // gradient: dlogits_i = m * wt * (softmax_i - [i == tgt]). The thread that owns
+    // tgt writes the loss, reading the logit before it overwrites it.
     for (uint i = lid; i < vocab; i += 256) {
-        float p = exp(logits[base + i] - logz);
-        float oneh = (i == tgt) ? 1.0 : 0.0;
+        float logit = logits[base + i];
+        float p = exp(logit - logz);
+        float oneh = 0.0;
+        if (i == tgt) {
+            loss[row] = -m * wt * (logit - logz);
+            oneh = 1.0;
+        }
         logits[base + i] = m * wt * (p - oneh);
     }
 }

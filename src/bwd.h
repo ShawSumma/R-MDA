@@ -1,8 +1,4 @@
-// bwd.h -- backward pass. Mirrors fwd.h in reverse, accumulating grads into each
-// param's .g buffer. Where a verified kernel exists we use it; the elementwise
-// glue (residual adds, sigmoid/silu derivative, pack/unpack) is done host-side in
-// fp32 (fine at this size) to avoid unverified kernels. The forward saves the
-// per-layer activations the backward needs into model->acts.
+// bwd.h -- matmul backward helpers for the backward pass in step.h.
 #ifndef BWD_H
 #define BWD_H
 
@@ -66,10 +62,6 @@ static void host_add(vkc_buf_t *dst, vkc_buf_t *src, uint32_t n) {
     for (uint32_t i = 0; i < n; ++i) {
         d[i] = d[i] + s[i];
     }
-}
-
-static void host_zero(vkc_buf_t *b, uint32_t n) {
-    memset(b->ptr, 0, n * sizeof(float));
 }
 
 #endif

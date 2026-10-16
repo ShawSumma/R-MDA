@@ -55,9 +55,9 @@ struct vkc_read_spv_t {
     size_t len;
 };
 
-static inline void vkc_ck(VkResult vkc_r, const char *file, size_t line) {
+static inline void vkc_ck(VkResult vkc_r, const char *file, int line) {
     if (vkc_r) {
-        fprintf(stderr, "vk err %d %s:%d\n", vkc_r, __FILE__, __LINE__);
+        fprintf(stderr, "vk err %d %s:%d\n", vkc_r, file, line);
         exit(1);
     }
 }
@@ -173,14 +173,16 @@ static vkc_t vkc_init(void) {
     };
     VKC_CK(vkCreateCommandPool(c.dev, &cpi, 0, &c.cpool));
 
+    // a batch holds one set per recorded dispatch until vkc_flush resets the pool; a
+    // whole training step (forward + backward, ~1400 dispatches) is one batch.
     VkDescriptorPoolSize ps = {
         .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 8192,
+        .descriptorCount = 32768,
     };
     VkDescriptorPoolCreateInfo dpi = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-        .maxSets = 2048,
+        .maxSets = 8192,
         .poolSizeCount = 1,
         .pPoolSizes = &ps,
     };

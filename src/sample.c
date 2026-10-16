@@ -54,7 +54,7 @@ int main(void) {
         .vocab_in = data_vocab + 1,
     };
     model_t *m = model_init(&c, cfg);
-    fwd_scratch_t sc = fwd_alloc(m);
+    fwd_scratch_t sc = fwd_alloc(m, 1);
     uint32_t step = load_ckpt(m);
     m->dirty16 = 1;
     fprintf(stderr, "loaded checkpoint @ step %u\n", step);

@@ -31,7 +31,7 @@ int main(int argc, char **argv) {
     };
     model_t *m = model_init(&c, cfg);
     m->infer = 1;
-    fwd_scratch_t sc = fwd_alloc(m);
+    fwd_scratch_t sc = fwd_alloc(m, 1);
     // GPU argmax over the logits each step (host loop over 16k vocab was the wall).
     vkc_kernel_t k_argmax = vkc_load(&c, "build/argmax.spv", 3, 8);
     uint32_t bt_all = cfg.batch * cfg.seqlen;
@@ -58,16 +58,32 @@ int main(int argc, char **argv) {
     uint32_t bt = cfg.batch * seqlen;
     uint32_t *ids = sc.ids.ptr;
     float *weight = sc.weight.ptr;
-    // start fully masked; the weight buffer feeds the (unused) t-cond, set to t=1.
+    // start fully masked
     for (uint32_t i = 0; i < bt; ++i) {
         ids[i] = data_mask_id;
-        weight[i] = 1.0f;
     }
 
-    uint32_t cand_tok[64];
-    float cand_conf[64];
+    uint32_t *cand_tok = malloc(seqlen * sizeof(uint32_t));
+    float *cand_conf = malloc(seqlen * sizeof(float));
+    uint32_t *masked = malloc(cfg.batch * sizeof(uint32_t));
     double t0 = now_sec();
     for (uint32_t s = 0; s < steps; ++s) {
+        // condition each sequence on its current mask rate t = masked / seqlen, fed
+        // through the 1/t weight like a training batch.
+        for (uint32_t b = 0; b < cfg.batch; ++b) {
+            masked[b] = 0;
+            for (uint32_t p = 0; p < seqlen; ++p) {
+                if (ids[b * seqlen + p] == data_mask_id) {
+                    masked[b] = masked[b] + 1;
+                }
+            }
+            if (masked[b] == 0) {
+                continue;
+            }
+            for (uint32_t p = 0; p < seqlen; ++p) {
+                weight[b * seqlen + p] = (float)seqlen / (float)masked[b];
+            }
+        }
         model_forward(m, &sc);
         // GPU argmax: per position, top-1 token + confidence (reads 16k logits on GPU).
         argmax_pc_t argmax_push = (argmax_pc_t) {
@@ -86,17 +102,11 @@ int main(int argc, char **argv) {
         // then reveal the highest-confidence ones. (Re-argmaxing per reveal was the
         // bottleneck -- host loops over the 16k-vocab logits dominate the forwards.)
         for (uint32_t b = 0; b < cfg.batch; ++b) {
-            uint32_t masked = 0;
-            for (uint32_t p = 0; p < seqlen; ++p) {
-                if (ids[b * seqlen + p] == data_mask_id) {
-                    masked = masked + 1;
-                }
-            }
-            if (masked == 0) {
+            if (masked[b] == 0) {
                 continue;
             }
             uint32_t remaining_steps = steps - s;
-            uint32_t reveal = (masked + remaining_steps - 1) / remaining_steps;
+            uint32_t reveal = (masked[b] + remaining_steps - 1) / remaining_steps;
             for (uint32_t p = 0; p < seqlen; ++p) {
                 uint32_t idx = b * seqlen + p;
                 if (ids[idx] != data_mask_id) {

@@ -33,13 +33,21 @@ static void adamw_all(model_t *m, float lr, uint32_t step) {
     }
 }
 
-// global-norm gradient clipping (GPU-reduced). The 1/t diffusion weighting makes
-// some batches produce huge gradients that kick the model out of its minimum. Clip
-// the global norm to clip. The sum-of-squares is reduced on the GPU (a host loop
-// over all the mapped grads is far too slow); only the small per-workgroup partials
-// are read back. Returns the pre-clip norm.
-static float clip_grads(model_t *m, vkc_buf_t *partials, float clip) {
-    double ss = 0.0;
+// one sum-of-squares partial per 256-element workgroup of every param.
+static uint32_t grad_norm_slots(const model_t *m) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < m->n_params; ++i) {
+        total = total + (m->params[i].n + 255) / 256;
+    }
+    return total;
+}
+
+// global grad norm, GPU-reduced in one batch: each param's workgroups write their own
+// range of partials (grad_norm_slots of them), and only the partials are read back (a
+// host loop over all the mapped grads is far too slow).
+static float grad_norm(model_t *m, vkc_buf_t *partials) {
+    uint32_t off = 0;
+    vkc_begin(m->c);
     for (uint32_t i = 0; i < m->n_params; ++i) {
         uint32_t n = m->params[i].n;
         uint32_t ng = (n + 255) / 256;
@@ -47,28 +55,33 @@ static float clip_grads(model_t *m, vkc_buf_t *partials, float clip) {
             .n = n,
             .op = 0,
             .scale = 0.0f,
+            .off = off,
         };
         vkc_buf_t *bufs[2] = {
             &m->params[i].g,
             partials,
         };
         vkc_run(m->c, &m->k_sumsq, bufs, ng, 1, 1, &pc);
-        float *p = partials->ptr;
-        for (uint32_t w = 0; w < ng; ++w) {
-            ss = ss + (double)p[w];
-        }
+        off = off + ng;
     }
-    float norm = (float)sqrt(ss);
-    if (norm <= clip) {
-        return norm;
+    vkc_flush(m->c);
+    float *p = partials->ptr;
+    double ss = 0.0;
+    for (uint32_t w = 0; w < off; ++w) {
+        ss = ss + (double)p[w];
     }
-    float scale = clip / (norm + 1e-9f);
+    return (float)sqrt(ss);
+}
+
+// scale every grad by scale (records into the open batch).
+static void scale_grads(model_t *m, vkc_buf_t *partials, float scale) {
     for (uint32_t i = 0; i < m->n_params; ++i) {
         uint32_t n = m->params[i].n;
         sumsq_pc_t pc = (sumsq_pc_t) {
             .n = n,
             .op = 1,
             .scale = scale,
+            .off = 0,
         };
         vkc_buf_t *bufs[2] = {
             &m->params[i].g,
@@ -76,7 +89,6 @@ static float clip_grads(model_t *m, vkc_buf_t *partials, float clip) {
         };
         vkc_run(m->c, &m->k_sumsq, bufs, (n + 255) / 256, 1, 1, &pc);
     }
-    return norm;
 }
 
 // atomic checkpoint: write every param's weights + moments + the step to a temp
@@ -86,6 +98,7 @@ static void checkpoint_save(model_t *m, uint32_t step) {
     const char *dst = "models/ckpt.bin";
     FILE *f = fopen(tmp, "wb");
     if (f == NULL) {
+        perror(tmp);
         return;
     }
     fwrite(&step, sizeof(uint32_t), 1, f);
@@ -144,7 +157,10 @@ int main(void) {
 
     uint32_t start = checkpoint_load(m);
     m->dirty16 = 1;
-    vkc_buf_t clip_partials = vkc_alloc(&c, 8192 * sizeof(float));
+    vkc_buf_t clip_partials = vkc_alloc(&c, grad_norm_slots(m) * sizeof(float));
+    // global-norm gradient clip: the 1/t diffusion weighting makes some batches
+    // produce huge gradients that kick the model out of its minimum.
+    float clip = 2.0f;
 
     float lr_peak = 3e-5f;
     uint32_t warmup = 50;
@@ -170,10 +186,14 @@ int main(void) {
             tr.sc.weight.ptr);
         float loss = train_step(&tr);
         float lr = (s < warmup) ? lr_peak * (float)s / (float)warmup : lr_peak;
-        float gnorm = clip_grads(m, &clip_partials, 2.0f);
+        float gnorm = grad_norm(m, &clip_partials);
+        vkc_begin(&c);
+        if (gnorm > clip) {
+            scale_grads(m, &clip_partials, clip / (gnorm + 1e-9f));
+        }
         adamw_all(m, lr, s);
+        vkc_flush(&c);
         m->dirty16 = 1;
-        (void)gnorm;
 
         float bpb = tr.last_raw_ce / 0.6931472f;
 

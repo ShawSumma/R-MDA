@@ -1,11 +1,18 @@
 #version 450
 // RWKV-7 WKV backward. Reverse-time recurrence carrying dS (grad wrt state).
-// Forward (per step t), with Sk = S_{t-1}^T k:
-//   S_t[i,j] = w[j]*S_{t-1}[i,j] - a*k[i]*Sk[j] + a*k[i]*v[j]
+// Forward (per step t), with P = S_{t-1} and Sk = P^T k:
+//   S_t[i,j] = w[j]*P[i,j] + a[i]*k[i]*(v[j] - Sk[j])
 //   o_t[j]   = sum_i r[i]*S_t[i,j]
-// We need: dK,dV,dR,dW,dA given dO, recomputing S_{t-1} forward states.
-// To keep it correct and simple, the host provides the saved per-step states
-// S_{t-1} in `Sprev` ([T, DH*DH] per (b,h)); we read them rather than recompute.
+// We need: dK,dV,dR,dW,dA given dO. The forward saved every pre-step state P in
+// `Sprev` ([T, DH*DH] per (b,h)); we read them rather than recompute.
+// With ak = a*k and dS the grad wrt S_t (including this step's readout):
+//   dR[i]  = sum_j S_t[i,j]*dO[j]
+//   dW[j]  = sum_i dS[i,j]*P[i,j]
+//   dV[j]  = sum_i dS[i,j]*ak[i]          dSk[j] = -dV[j]
+//   dak[i] = sum_j dS[i,j]*(v[j] - Sk[j])
+//   dA[i]  = dak[i]*k[i]                  dK[i]  = dak[i]*a[i] + sum_j dSk[j]*P[i,j]
+//   dP[i,j] = w[j]*dS[i,j] + dSk[j]*k[i]
+// Requires DH <= 64 (shared arrays); model_init checks the config.
 layout(local_size_x = 64) in;
 
 layout(std430,binding=0) readonly  buffer BK  { float K[]; };
@@ -19,14 +26,13 @@ layout(std430,binding=7) writeonly buffer BdK { float dK[]; };
 layout(std430,binding=8) writeonly buffer BdV { float dV[]; };
 layout(std430,binding=9) writeonly buffer BdR { float dR[]; };
 layout(std430,binding=10) writeonly buffer BdW{ float dW[]; };
-layout(std430,binding=11) buffer BdA{ float dA[]; };
+layout(std430,binding=11) writeonly buffer BdA{ float dA[]; };
 layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir; };
 
 shared float dS[64*64];     // grad wrt current state S_t
 shared float Sp[64*64];     // S_{t-1} for this step
-shared float kk[64],vv[64],rr[64],ww[64],Sk[64];
+shared float kk[64],vv[64],rr[64],ww[64],aa[64],Sk[64];
 shared float dSk[64];       // grad wrt Sk[j]
-shared float red[64];
 
 void main(){
     uint bh=gl_WorkGroupID.x; if(bh>=Bsz*Hd) return;
@@ -44,42 +50,31 @@ void main(){
         uint t = (dir==0) ? (T-1-ti) : ti;
         uint row = base + t*DH;
         for(uint d=lid;d<DH;d+=64){ kk[d]=K[row+d]; vv[d]=V[row+d];
-            rr[d]=R[row+d]; ww[d]=W[row+d]; }
+            rr[d]=R[row+d]; ww[d]=W[row+d]; aa[d]=A[row+d]; }
         for(uint i=lid;i<DH2;i+=64) Sp[i]=Sprev[sbase+t*DH2+i];
         barrier();
-        float a_t=A[row+0];
         // Sk[j] = sum_i Sp[i,j]*k[i]
         for(uint j=lid;j<DH;j+=64){ float s=0; for(uint i=0;i<DH;i++) s+=Sp[i*DH+j]*kk[i]; Sk[j]=s; }
         barrier();
-        // dS += from output: o[j]=sum_i r[i]*S_t[i,j] ; dS[i,j]+= r[i]*dO[j]; dR[i]+=sum_j S_t[i,j]*dO[j]
-        // (S_t = current forward state; reconstruct: S_t[i,j]=w[j]Sp[i,j]-a k[i]Sk[j]+a k[i]v[j])
-        // accumulate dR
-        for(uint i=lid;i<DH;i+=64){ float dr=0;
-            for(uint j=0;j<DH;j++){ float St=ww[j]*Sp[i*DH+j]-a_t*kk[i]*Sk[j]+a_t*kk[i]*vv[j];
+        // readout: dR[i] = sum_j S_t[i,j]*dO[j], with S_t rebuilt from Sp
+        for(uint i=lid;i<DH;i+=64){ float dr=0; float ak=aa[i]*kk[i];
+            for(uint j=0;j<DH;j++){ float St=ww[j]*Sp[i*DH+j]+ak*(vv[j]-Sk[j]);
                 dr+=St*dO[row+j]; }
             dR[row+i]=dr; }
         barrier();
         for(uint idx=lid;idx<DH2;idx+=64){ uint i=idx/DH,j=idx%DH; dS[idx]+= rr[i]*dO[row+j]; }
         barrier();
-        // Now backprop S_t -> {Sp, w, k, v, a, Sk}.  S_t[i,j]=w[j]Sp[i,j]-a k[i]Sk[j]+a k[i]v[j]
-        // dW[j] += sum_i dS[i,j]*Sp[i,j]
-        for(uint j=lid;j<DH;j+=64){ float dw=0; for(uint i=0;i<DH;i++) dw+=dS[i*DH+j]*Sp[i*DH+j]; dW[row+j]=dw; }
-        // dV[j] += sum_i dS[i,j]*a*k[i]
-        for(uint j=lid;j<DH;j+=64){ float dv=0; for(uint i=0;i<DH;i++) dv+=dS[i*DH+j]*a_t*kk[i]; dV[row+j]=dv; }
-        // dSk[j] = sum_i dS[i,j]*(-a*k[i])
-        for(uint j=lid;j<DH;j+=64){ float s=0; for(uint i=0;i<DH;i++) s+=dS[i*DH+j]*(-a_t*kk[i]); dSk[j]=s; }
+        // column sums: dW, dV, dSk
+        for(uint j=lid;j<DH;j+=64){ float dw=0, dv=0;
+            for(uint i=0;i<DH;i++){ float g=dS[i*DH+j]; dw+=g*Sp[i*DH+j]; dv+=g*aa[i]*kk[i]; }
+            dW[row+j]=dw; dV[row+j]=dv; dSk[j]=-dv; }
         barrier();
-        // dk[i] from two paths: term -a*k[i]*Sk[j] and +a*k[i]*v[j]  AND Sk=Sp^T k so dk via dSk too
-        for(uint i=lid;i<DH;i+=64){ float dk=0;
-            for(uint j=0;j<DH;j++){ dk += dS[i*DH+j]*(-a_t*Sk[j]+a_t*vv[j]); dk += dSk[j]*Sp[i*DH+j]; }
-            dK[row+i]=dk; }
-        // dA (scalar): sum over i,j dS[i,j]*( -k[i]Sk[j] + k[i]v[j] )
-        { float da=0.0; for(uint idx=lid;idx<DH2;idx+=64){ uint i=idx/DH,j=idx%DH;
-            da += dS[idx]*(-kk[i]*Sk[j]+kk[i]*vv[j]); } red[lid]=da; barrier();
-          for(uint o=32;o>0;o>>=1){ if(lid<o)red[lid]+=red[lid+o]; barrier(); }
-          if(lid==0) dA[row+0]=red[0]; barrier(); }
-        // propagate to dS_prev: Sp appears in S_t via w[j]Sp[i,j] (diag) and via Sk[j]=sum_i Sp[i,j]k[i].
-        // dSp[i,j] = w[j]*dS[i,j] + dSk[j]*k[i]
+        // row sums: dA, dK
+        for(uint i=lid;i<DH;i+=64){ float dak=0, dskp=0;
+            for(uint j=0;j<DH;j++){ dak+=dS[i*DH+j]*(vv[j]-Sk[j]); dskp+=dSk[j]*Sp[i*DH+j]; }
+            dA[row+i]=dak*kk[i]; dK[row+i]=dak*aa[i]+dskp; }
+        barrier();
+        // propagate to dS_prev: P appears via w[j]*P[i,j] and via Sk[j]=sum_i P[i,j]k[i].
         for(uint idx=lid;idx<DH2;idx+=64){ uint i=idx/DH,j=idx%DH;
             dS[idx] = ww[j]*dS[idx] + dSk[j]*kk[i]; }
         barrier();
