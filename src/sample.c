@@ -1,160 +1,163 @@
-// sample.c -- load the latest checkpoint and show what the denoiser predicts on
-// masked Wikipedia text. Runs independently of training (reads ckpt.bin). This is
-// a qualitative window into what the model has learned.
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "sample.h"
+#include "vkc.h"
+#include "util.h"
+#include "tokenizer.h"
+#include "data.h"
 #include "model.h"
 #include "fwd.h"
-#include "step.h"
+#include "ckpt.h"
 
-static uint32_t load_ckpt(model_t *m) {
-    FILE *f = fopen("models/ckpt.bin", "rb");
-    if (f == NULL) {
-        fprintf(stderr, "no checkpoint\n");
+double mda_sample_pct(uint32_t a, uint32_t b) {
+    if (b == 0) {
+        return 0.0;
+    } else {
+        return 100.0 * a / b;
+    }
+}
+
+uint32_t mda_sample_bucket(float t) {
+    if (t < 0.33f) {
         return 0;
+    } else if (t < 0.66f) {
+        return 1;
+    } else {
+        return 2;
     }
-    uint32_t step = 0;
-    fread(&step, sizeof(uint32_t), 1, f);
-    for (uint32_t i = 0; i < m->n_params; ++i) {
-        param_t *p = &m->params[i];
-        fread(p->w.ptr, sizeof(float), p->n, f);
-        fread(p->m.ptr, sizeof(float), p->n, f);
-        fread(p->v.ptr, sizeof(float), p->n, f);
-    }
-    fclose(f);
-    return step;
 }
 
-// forward up to logits only (no CE overwrite), so we can read predictions.
-static void forward_logits(model_t *m, fwd_scratch_t *sc) {
-    model_forward(m, sc);
-}
-
-// argmax over a vocab-sized row of logits.
-static uint32_t argmax_row(float *row, uint32_t vocab) {
-    uint32_t best = 0;
-    for (uint32_t v = 1; v < vocab; ++v) {
-        if (row[v] > row[best]) {
-            best = v;
-        }
-    }
-    return best;
-}
-
-int main(void) {
-    srand(7);
-    vkc_t c = vkc_init();
-    corpus_t cp = corpus_load("data/wiki.txt");
-    mcfg_t cfg = (mcfg_t) {
-        .d = 640,
-        .n_layer = 12,
-        .n_head = 10,
-        .seqlen = 64,
-        .batch = 8,
-        .ffn_hidden = 1728,
-        .vocab = data_vocab,
-        .vocab_in = data_vocab + 1,
-    };
-    model_t *m = model_init(&c, cfg);
-    fwd_scratch_t sc = fwd_alloc(m, 1);
-    uint32_t step = load_ckpt(m);
-    m->dirty16 = 1;
-    fprintf(stderr, "loaded checkpoint @ step %u\n", step);
-
-    // quantitative: average bits/byte and masked-fill accuracy over many held-out
-    // batches (single-batch numbers are too noisy with so few masked positions).
-    // accuracy is also bucketed by mask rate t (recovered as 1/weight): low t is
-    // easy (few positions masked), high t is hard (mostly masked).
-    double raw = 0.0;
-    double cnt = 0.0;
-    uint32_t acc_correct = 0;
-    uint32_t acc_total = 0;
-    uint32_t bucket_correct[3] = {0, 0, 0};
-    uint32_t bucket_total[3] = {0, 0, 0};
-    int n_batch = 8;
-    for (int it = 0; it < n_batch; ++it) {
-        make_batch(
-            &cp,
-            cfg.batch,
-            cfg.seqlen,
-            sc.ids.ptr,
-            sc.target.ptr,
-            sc.mask.ptr,
-            sc.weight.ptr
-        );
-        forward_logits(m, &sc);
-        float *loss = sc.loss.ptr;
-        float *mask = sc.mask.ptr;
-        float *weight = sc.weight.ptr;
-        uint32_t *ids = sc.ids.ptr;
-        uint32_t *target = sc.target.ptr;
-        float *logits = sc.logits_save.ptr;
-        for (uint32_t i = 0; i < cfg.batch * cfg.seqlen; ++i) {
-            // CE is per-token; convert to per-byte by spreading each token's loss
-            // over its byte length, so bits/byte stays comparable across vocabs.
-            uint32_t blen = cp.tok.entries[target[i]].len;
-            raw = raw + loss[i] / (weight[i] + 1e-9);
-            cnt = cnt + mask[i] * (double)blen;
-            if (ids[i] != data_mask_id) {
-                continue;
+void mda_sample_count(mda_sample_stats_t *st, const mda_data_corpus_t *cp, mda_fwd_scratch_t *sc) {
+    mda_data_batch_t *b = &sc->batch;
+    float *loss = sc->loss.ptr;
+    uint32_t *tok = sc->tok.ptr;
+    st->bytes += mda_data_masked_bytes(cp, b);
+    for (uint32_t i = 0; i < b->batch * b->seqlen; i += 1) {
+        st->ce += loss[i] / b->weight[i];
+        if (b->mask[i] != 0.0f) {
+            uint32_t bucket = mda_sample_bucket(1.0f / b->weight[i]);
+            st->masked += 1.0;
+            st->total += 1;
+            st->bucket_total[bucket] += 1;
+            if (tok[i] == b->target[i]) {
+                st->correct += 1;
+                st->bucket_correct[bucket] += 1;
             }
-            uint32_t best = argmax_row(logits + i * cfg.vocab, cfg.vocab);
-            int hit = (best == target[i]) ? 1 : 0;
-            acc_total = acc_total + 1;
-            acc_correct = acc_correct + hit;
-            float t = 1.0f / (weight[i] + 1e-9);
-            int bucket = (t < 0.33f) ? 0 : (t < 0.66f ? 1 : 2);
-            bucket_total[bucket] = bucket_total[bucket] + 1;
-            bucket_correct[bucket] = bucket_correct[bucket] + hit;
         }
     }
-    double bpb = (raw / (cnt + 1e-6)) / 0.6931472;
-    double acc_low = 100.0 * bucket_correct[0] / (bucket_total[0] + 1);
-    double acc_mid = 100.0 * bucket_correct[1] / (bucket_total[1] + 1);
-    double acc_high = 100.0 * bucket_correct[2] / (bucket_total[2] + 1);
-    double acc_all = 100.0 * acc_correct / (acc_total + 1);
-    printf("checkpoint step %u: held-out bits/byte = %.4f  (random = 8.0)\n", step, bpb);
-    printf("accuracy by mask rate: low(<33%%)=%.1f%%  mid=%.1f%%  high(>66%%)=%.1f%%\n", acc_low, acc_mid, acc_high);
-    printf("masked-fill accuracy over %d batches: %u/%u = %.1f%% (random 0.4%%)\n\n", n_batch, acc_correct, acc_total, acc_all);
+}
 
-    // qualitative: for the first sequence, show actual vs the model's prediction at
-    // masked positions (a blank means the model already saw that position).
-    make_batch(
-        &cp,
-        cfg.batch,
-        cfg.seqlen,
-        sc.ids.ptr,
-        sc.target.ptr,
-        sc.mask.ptr,
-        sc.weight.ptr
-    );
-    forward_logits(m, &sc);
-    uint32_t *ids = sc.ids.ptr;
-    uint32_t *target = sc.target.ptr;
-    float *logits = sc.logits_save.ptr;
+void mda_sample_print_stats(const mda_sample_stats_t *st, uint32_t step, uint32_t vocab) {
+    double bpb = st->ce / st->bytes / 0.6931472;
+    double bpb_random = st->masked * log2((double)vocab) / st->bytes;
+    printf("checkpoint step %u: held-out bits/byte %.4f (uniform guess %.2f)\n", step, bpb, bpb_random);
+    printf("accuracy by mask rate: low (<33%%) %.1f%%, mid %.1f%%, high (>66%%) %.1f%%\n", mda_sample_pct(st->bucket_correct[0], st->bucket_total[0]), mda_sample_pct(st->bucket_correct[1], st->bucket_total[1]), mda_sample_pct(st->bucket_correct[2], st->bucket_total[2]));
+    printf("masked-fill accuracy over %u batches: %u/%u = %.1f%% (uniform guess %.4f%%)\n\n", MDA_SAMPLE_BATCHES, st->correct, st->total, mda_sample_pct(st->correct, st->total), 100.0 / vocab);
+}
+
+void mda_sample_print_sequence(const mda_data_corpus_t *cp, mda_fwd_scratch_t *sc) {
+    mda_data_batch_t *b = &sc->batch;
+    uint32_t *tok = sc->tok.ptr;
     uint32_t correct = 0;
     uint32_t total = 0;
-    printf("actual : ");
-    for (uint32_t s = 0; s < cfg.seqlen; ++s) {
-        tok_entry_t *e = &cp.tok.entries[target[s]];
+    printf("actual:\n");
+    for (uint32_t s = 0; s < b->seqlen; s += 1) {
+        mda_tokenizer_entry_t *e = &cp->tok.entries[b->target[s]];
         fwrite(e->bytes, 1, e->len, stdout);
     }
-    printf("\nmodel  : ");
-    for (uint32_t s = 0; s < cfg.seqlen; ++s) {
-        if (ids[s] != data_mask_id) {
-            tok_entry_t *e = &cp.tok.entries[target[s]];
-            for (uint32_t k = 0; k < e->len; ++k) {
+    printf("\nmodel:\n");
+    for (uint32_t s = 0; s < b->seqlen; s += 1) {
+        if (b->ids[s] != cp->mask_id) {
+            for (uint32_t k = 0; k < cp->tok.entries[b->target[s]].len; k += 1) {
                 putchar(' ');
             }
-            continue;
-        }
-        uint32_t best = argmax_row(logits + s * cfg.vocab, cfg.vocab);
-        tok_entry_t *e = &cp.tok.entries[best];
-        fwrite(e->bytes, 1, e->len, stdout);
-        total = total + 1;
-        if (best == target[s]) {
-            correct = correct + 1;
+        } else {
+            mda_tokenizer_entry_t *e = &cp->tok.entries[tok[s]];
+            fwrite(e->bytes, 1, e->len, stdout);
+            total += 1;
+            if (tok[s] == b->target[s]) {
+                correct += 1;
+            }
         }
     }
-    double sample_acc = total ? 100.0 * correct / total : 0.0;
-    printf("\n\nmasked-position accuracy: %u/%u = %.1f%%\n", correct, total, sample_acc);
-    return 0;
+    printf("\n\nmasked-position accuracy: %u/%u = %.1f%%\n", correct, total, mda_sample_pct(correct, total));
+}
+
+bool mda_sample_eval(mda_model_t *m, const mda_data_corpus_t *cp, mda_fwd_scratch_t *sc, uint32_t step) {
+    mda_sample_stats_t st = {
+        .ce = 0.0,
+    };
+    for (uint32_t it = 0; it < MDA_SAMPLE_BATCHES && m->c->fail == false; it += 1) {
+        mda_data_batch(&sc->batch, cp, MDA_DATA_SPLIT_EVAL, it);
+        mda_fwd_run(m, sc);
+        if (m->c->fail == false) {
+            mda_sample_count(&st, cp, sc);
+        }
+    }
+    if (m->c->fail == false) {
+        mda_sample_print_stats(&st, step, m->cfg.vocab);
+        mda_data_batch(&sc->batch, cp, MDA_DATA_SPLIT_EVAL, MDA_SAMPLE_BATCHES);
+        mda_fwd_run(m, sc);
+    }
+    if (m->c->fail == false) {
+        mda_sample_print_sequence(cp, sc);
+    }
+    return m->c->fail == false;
+}
+
+bool mda_sample_scratch(mda_model_t *m, const mda_data_corpus_t *cp, mda_fwd_scratch_t *sc, const char *path) {
+    mda_ckpt_res_t loaded = mda_ckpt_load(m, mda_tokenizer_hash(&cp->tok), path, false);
+    if (loaded.ok == false) {
+        return false;
+    } else {
+        if (loaded.step == 0) {
+            fprintf(stderr, "no checkpoint: evaluating the random init\n");
+        }
+        return mda_sample_eval(m, cp, sc, loaded.step);
+    }
+}
+
+bool mda_sample_model(mda_vkc_t *c, const mda_data_corpus_t *cp, const char *path) {
+    mda_model_t *m = mda_model_init(c, mda_model_cfg(cp->tok.count));
+    if (m == NULL) {
+        return false;
+    } else {
+        mda_fwd_scratch_t sc = mda_fwd_alloc(m, 1);
+        if (c->fail) {
+            return false;
+        } else {
+            return mda_sample_scratch(m, cp, &sc, path);
+        }
+    }
+}
+
+bool mda_sample_device(mda_vkc_t *c, const char *path) {
+    mda_data_corpus_t cp = mda_data_load(MDA_TOKENIZER_CORPUS_PATH);
+    if (cp.ids == NULL) {
+        return false;
+    } else {
+        return mda_sample_model(c, &cp, path);
+    }
+}
+
+bool mda_sample_main(uint32_t argc, char **argv) {
+    const char *path = mda_util_arg(argc, argv, 1, MDA_CKPT_PATH);
+    mda_vkc_t c = mda_vkc_init();
+    if (c.fail) {
+        return false;
+    } else {
+        return mda_sample_device(&c, path);
+    }
+}
+
+int main(int argc, char **argv) {
+    bool ok = mda_sample_main((uint32_t)argc, argv);
+    if (ok) {
+        return 0;
+    } else {
+        return 1;
+    }
 }

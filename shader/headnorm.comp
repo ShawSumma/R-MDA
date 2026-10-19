@@ -1,0 +1,55 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float x[]; };
+layout(std430, binding = 1) buffer B1 { float y[]; };
+layout(std430, binding = 2) buffer B2 { float rms[]; };
+layout(std430, binding = 3) writeonly buffer B3 { float dx[]; };
+layout(push_constant) uniform pc {
+    uint n_vec;
+    uint op;
+};
+
+shared float red[256];
+
+float group_sum(float v, uint lid) {
+    red[lid] = v;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if ((lid & 63u) < s) {
+            red[lid] += red[lid + s];
+        }
+        barrier();
+    }
+    return red[lid & ~63u];
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint vec = gl_WorkGroupID.x * 4u + (lid >> 6);
+    bool live = vec < n_vec;
+    uint i = vec * 64u + (lid & 63u);
+    float xi = 0.0;
+    if (live) {
+        xi = x[i];
+    }
+    if (op == 0u) {
+        float r = sqrt(group_sum(xi * xi, lid) / 64.0 + 1e-5);
+        if (live) {
+            y[i] = xi / r;
+            if ((lid & 63u) == 0u) {
+                rms[vec] = r;
+            }
+        }
+    } else {
+        float dyi = 0.0;
+        if (live) {
+            dyi = y[i];
+        }
+        float s = group_sum(xi * dyi, lid);
+        if (live) {
+            float r = rms[vec];
+            dx[i] = dyi / r - xi * s / (64.0 * r * r * r);
+        }
+    }
+}

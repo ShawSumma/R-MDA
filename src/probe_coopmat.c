@@ -1,72 +1,91 @@
-// probe_coopmat.c -- enumerate the cooperative-matrix configurations RADV exposes
-// for this GPU, so the fp16 matmul is built to a hardware-native (M, N, K, dtype)
-// tile instead of a shape that silently falls back to scalar code.
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
 #include "vkc.h"
 
-static const char *component_name(VkComponentTypeKHR t) {
-    if (t == VK_COMPONENT_TYPE_FLOAT16_KHR) {
+const char *mda_probe_coopmat_component(VkComponentTypeKHR t) {
+    switch (t) {
+    case VK_COMPONENT_TYPE_FLOAT16_KHR:
         return "f16";
-    }
-    if (t == VK_COMPONENT_TYPE_FLOAT32_KHR) {
+    case VK_COMPONENT_TYPE_FLOAT32_KHR:
         return "f32";
-    }
-    if (t == VK_COMPONENT_TYPE_SINT8_KHR) {
+    case VK_COMPONENT_TYPE_SINT8_KHR:
         return "s8";
-    }
-    if (t == VK_COMPONENT_TYPE_SINT32_KHR) {
+    case VK_COMPONENT_TYPE_SINT32_KHR:
         return "s32";
-    }
-    if (t == VK_COMPONENT_TYPE_UINT8_KHR) {
+    case VK_COMPONENT_TYPE_UINT8_KHR:
         return "u8";
+    default:
+        return "?";
     }
-    return "?";
 }
 
-static const char *scope_name(VkScopeKHR s) {
-    if (s == VK_SCOPE_SUBGROUP_KHR) {
+const char *mda_probe_coopmat_scope(VkScopeKHR s) {
+    switch (s) {
+    case VK_SCOPE_SUBGROUP_KHR:
         return "subgroup";
-    }
-    if (s == VK_SCOPE_WORKGROUP_KHR) {
+    case VK_SCOPE_WORKGROUP_KHR:
         return "workgroup";
+    default:
+        return "?";
     }
-    return "?";
 }
 
-int main(void) {
-    vkc_t c = vkc_init();
-
-    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get_props =
-        (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
-        vkGetInstanceProcAddr(c.inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
-    if (get_props == NULL) {
-        fprintf(stderr, "cooperative matrix not supported by the driver\n");
-        return 1;
-    }
-
+void mda_probe_coopmat_list(mda_vkc_t *c, PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get_props) {
     uint32_t count = 0;
-    get_props(c.pd, &count, NULL);
+    get_props(c->pd, &count, NULL);
     VkCooperativeMatrixPropertiesKHR *props = malloc(count * sizeof(VkCooperativeMatrixPropertiesKHR));
-    for (uint32_t i = 0; i < count; ++i) {
+    for (uint32_t i = 0; i < count; i += 1) {
         props[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
         props[i].pNext = NULL;
     }
-    get_props(c.pd, &count, props);
-
+    get_props(c->pd, &count, props);
     printf("cooperative-matrix configs: %u\n", count);
-    printf("  MxNxK   A    B    C    Result  scope\n");
-    for (uint32_t i = 0; i < count; ++i) {
+    printf("%3s %3s %3s %-4s %-4s %-4s %-6s %s\n", "M", "N", "K", "A", "B", "C", "Result", "scope");
+    for (uint32_t i = 0; i < count; i += 1) {
         VkCooperativeMatrixPropertiesKHR *p = &props[i];
         printf(
-            "  %2ux%2ux%2u  %-4s %-4s %-4s %-4s    %s\n",
+            "%3u %3u %3u %-4s %-4s %-4s %-6s %s\n",
             p->MSize,
             p->NSize,
             p->KSize,
-            component_name(p->AType),
-            component_name(p->BType),
-            component_name(p->CType),
-            component_name(p->ResultType),
-            scope_name(p->scope));
+            mda_probe_coopmat_component(p->AType),
+            mda_probe_coopmat_component(p->BType),
+            mda_probe_coopmat_component(p->CType),
+            mda_probe_coopmat_component(p->ResultType),
+            mda_probe_coopmat_scope(p->scope)
+        );
     }
     free(props);
-    return 0;
+}
+
+bool mda_probe_coopmat_device(mda_vkc_t *c) {
+    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR get_props = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vkGetInstanceProcAddr(c->inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+    if (get_props == NULL) {
+        fprintf(stderr, "cooperative matrix not supported by the driver\n");
+        return false;
+    } else {
+        mda_probe_coopmat_list(c, get_props);
+        return true;
+    }
+}
+
+bool mda_probe_coopmat_main(void) {
+    mda_vkc_t c = mda_vkc_init();
+    if (c.fail) {
+        return false;
+    } else {
+        return mda_probe_coopmat_device(&c);
+    }
+}
+
+int main(void) {
+    bool ok = mda_probe_coopmat_main();
+    if (ok) {
+        return 0;
+    } else {
+        return 1;
+    }
 }

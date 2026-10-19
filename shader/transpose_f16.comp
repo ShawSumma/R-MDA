@@ -1,0 +1,45 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 32, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly buffer buf_src {
+    float src[];
+};
+layout(std430, binding = 1) writeonly buffer buf_dst {
+    float16_t dst[];
+};
+layout(std430, binding = 2) readonly buffer buf_amax {
+    uint amax[];
+};
+layout(push_constant) uniform pc {
+    uint rows;
+    uint cols;
+    uint slot;
+};
+
+shared float tile[32][33];
+
+float slot_scale(uint s) {
+    if (s == ~0u) {
+        return 1.0;
+    } else if (!(uintBitsToFloat(amax[s]) > 0.0) || isinf(uintBitsToFloat(amax[s]))) {
+        return 1.0;
+    } else {
+        return exp2(141.0 - float((amax[s] >> 23) & 0xffu));
+    }
+}
+
+void main() {
+    float sc = slot_scale(slot);
+    uint c0 = gl_WorkGroupID.x * 32u;
+    uint r0 = gl_WorkGroupID.y * 32u;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+    for (uint i = ty; i < 32u; i += 8u) {
+        tile[i][tx] = src[(r0 + i) * cols + c0 + tx];
+    }
+    barrier();
+    for (uint i = ty; i < 32u; i += 8u) {
+        dst[(c0 + i) * rows + r0 + tx] = float16_t(tile[tx][i] * sc);
+    }
+}

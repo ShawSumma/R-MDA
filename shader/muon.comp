@@ -1,0 +1,116 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer buf_a {
+    float a[];
+};
+layout(std430, binding = 1) buffer buf_b {
+    float b[];
+};
+layout(std430, binding = 2) buffer buf_x {
+    float x[];
+};
+layout(std430, binding = 3) writeonly buffer buf_h {
+    float16_t h[];
+};
+layout(std430, binding = 4) buffer buf_red {
+    float red[];
+};
+layout(std430, binding = 5) readonly buffer buf_opt {
+    float lr;
+    float bc1;
+    float bc2;
+    float norm;
+    float scale;
+    float gmul;
+    float good;
+    float skip;
+};
+layout(push_constant) uniform pc {
+    uint n;
+    uint op;
+    uint aux;
+    float p0;
+    float p1;
+};
+
+shared float sh[256];
+
+float reduce_sum(float v, uint lid) {
+    sh[lid] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) {
+            sh[lid] += sh[lid + s];
+        }
+        barrier();
+    }
+    return sh[0];
+}
+
+void momentum(uint i, uint lid) {
+    float xi = 0.0;
+    if (i < n && skip == 0.0) {
+        float g = a[i] * scale;
+        float m = p0 * b[i] + g;
+        b[i] = m;
+        xi = g + p0 * m;
+        x[i] = xi;
+    }
+    float s = reduce_sum(xi * xi, lid);
+    if (lid == 0u) {
+        red[gl_WorkGroupID.x] = s;
+    }
+}
+
+void norm_inv(uint lid) {
+    float acc = 0.0;
+    for (uint j = lid; j < n; j += 256u) {
+        acc += red[j];
+    }
+    float s = reduce_sum(acc, lid);
+    if (lid == 0u) {
+        red[aux] = 1.0 / (sqrt(s) + 1e-7);
+    }
+}
+
+void elementwise(uint i) {
+    switch (op) {
+    case 2u:
+        x[i] = x[i] * red[aux];
+        h[i] = float16_t(x[i]);
+        break;
+    case 3u:
+        h[i] = float16_t(p0 * a[i] + p1 * b[i]);
+        break;
+    case 4u:
+        x[i] = p0 * x[i] + a[i];
+        h[i] = float16_t(x[i]);
+        break;
+    default:
+        if (skip == 0.0) {
+            a[i] = a[i] - lr * p0 * x[i];
+            h[i] = float16_t(a[i]);
+        }
+        break;
+    }
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    switch (op) {
+    case 0u:
+        momentum(i, lid);
+        break;
+    case 1u:
+        norm_inv(lid);
+        break;
+    default:
+        if (i < n) {
+            elementwise(i);
+        }
+        break;
+    }
+}

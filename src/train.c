@@ -1,226 +1,200 @@
-// train.c -- RWKV-7 + masked-diffusion denoiser training on Wikipedia, entirely on
-// the GPU via raw Vulkan compute. Forward + backward + AdamW. Time-based atomic
-// checkpoints; designed to resume from the latest checkpoint after a restart.
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "train.h"
+#include "vkc.h"
+#include "util.h"
+#include "tokenizer.h"
+#include "data.h"
 #include "model.h"
-#include "fwd.h"
 #include "step.h"
-#include <time.h>
+#include "ckpt.h"
 
-static void adamw_all(model_t *m, float lr, uint32_t step) {
-    float b1 = 0.9f;
-    float b2 = 0.999f;
-    float bc1 = 1.0f - powf(b1, (float)step);
-    float bc2 = 1.0f - powf(b2, (float)step);
-    for (uint32_t i = 0; i < m->n_params; ++i) {
-        param_t *p = &m->params[i];
-        adam_pc_t pc = (adam_pc_t) {
-            .n = p->n,
-            .lr = lr,
-            .beta1 = b1,
-            .beta2 = b2,
-            .eps = 1e-8f,
-            .wd = 0.0f,
-            .bc1 = bc1,
-            .bc2 = bc2,
-        };
-        vkc_buf_t *bufs[4] = {
-            &p->w,
-            &p->g,
-            &p->m,
-            &p->v,
-        };
-        vkc_run(m->c, &m->k_adamw, bufs, (p->n + 255) / 256, 1, 1, &pc);
+uint32_t mda_train_max_steps(uint32_t stop) {
+    if (stop != 0) {
+        return stop;
+    } else {
+        return UINT32_MAX;
     }
 }
 
-// one sum-of-squares partial per 256-element workgroup of every param.
-static uint32_t grad_norm_slots(const model_t *m) {
-    uint32_t total = 0;
-    for (uint32_t i = 0; i < m->n_params; ++i) {
-        total = total + (m->params[i].n + 255) / 256;
-    }
-    return total;
+uint32_t mda_train_decay_from(uint32_t stop) {
+    uint32_t max_steps = mda_train_max_steps(stop);
+    return max_steps - max_steps / 5;
 }
 
-// global grad norm, GPU-reduced in one batch: each param's workgroups write their own
-// range of partials (grad_norm_slots of them), and only the partials are read back (a
-// host loop over all the mapped grads is far too slow).
-static float grad_norm(model_t *m, vkc_buf_t *partials) {
-    uint32_t off = 0;
-    vkc_begin(m->c);
-    for (uint32_t i = 0; i < m->n_params; ++i) {
-        uint32_t n = m->params[i].n;
-        uint32_t ng = (n + 255) / 256;
-        sumsq_pc_t pc = (sumsq_pc_t) {
-            .n = n,
-            .op = 0,
-            .scale = 0.0f,
-            .off = off,
-        };
-        vkc_buf_t *bufs[2] = {
-            &m->params[i].g,
-            partials,
-        };
-        vkc_run(m->c, &m->k_sumsq, bufs, ng, 1, 1, &pc);
-        off = off + ng;
-    }
-    vkc_flush(m->c);
-    float *p = partials->ptr;
-    double ss = 0.0;
-    for (uint32_t w = 0; w < off; ++w) {
-        ss = ss + (double)p[w];
-    }
-    return (float)sqrt(ss);
-}
-
-// scale every grad by scale (records into the open batch).
-static void scale_grads(model_t *m, vkc_buf_t *partials, float scale) {
-    for (uint32_t i = 0; i < m->n_params; ++i) {
-        uint32_t n = m->params[i].n;
-        sumsq_pc_t pc = (sumsq_pc_t) {
-            .n = n,
-            .op = 1,
-            .scale = scale,
-            .off = 0,
-        };
-        vkc_buf_t *bufs[2] = {
-            &m->params[i].g,
-            partials,
-        };
-        vkc_run(m->c, &m->k_sumsq, bufs, (n + 255) / 256, 1, 1, &pc);
+float mda_train_lr(mda_train_args_t args, uint32_t s) {
+    uint32_t decay_from = mda_train_decay_from(args.stop);
+    if (s < MDA_TRAIN_WARMUP) {
+        return args.lr_peak * (float)s / (float)MDA_TRAIN_WARMUP;
+    } else if (args.stop != 0 && s > decay_from) {
+        return args.lr_peak * (float)(args.stop - s) / (float)(args.stop - decay_from);
+    } else {
+        return args.lr_peak;
     }
 }
 
-// atomic checkpoint: write every param's weights + moments + the step to a temp
-// file, then rename over the real one (so a crash mid-write can't corrupt it).
-static void checkpoint_save(model_t *m, uint32_t step) {
-    const char *tmp = "models/ckpt.tmp";
-    const char *dst = "models/ckpt.bin";
-    FILE *f = fopen(tmp, "wb");
-    if (f == NULL) {
-        perror(tmp);
-        return;
+void mda_train_record(mda_train_log_t *log, const mda_step_trainer_t *tr, float loss, double bpb) {
+    log->n_logged += 1;
+    if (tr->skipped) {
+        log->skip_run += 1;
+        log->n_skipped += 1;
+    } else if (log->n_ema == 0) {
+        log->skip_run = 0;
+        log->ema = loss;
+        log->ema_bpb = bpb;
+        log->n_ema += 1;
+    } else {
+        log->skip_run = 0;
+        log->ema = 0.95 * log->ema + 0.05 * loss;
+        log->ema_bpb = 0.95 * log->ema_bpb + 0.05 * bpb;
+        log->n_ema += 1;
     }
-    fwrite(&step, sizeof(uint32_t), 1, f);
-    for (uint32_t i = 0; i < m->n_params; ++i) {
-        param_t *p = &m->params[i];
-        fwrite(p->w.ptr, sizeof(float), p->n, f);
-        fwrite(p->m.ptr, sizeof(float), p->n, f);
-        fwrite(p->v.ptr, sizeof(float), p->n, f);
+    if (tr->skipped == false && tr->gnorm > MDA_TRAIN_CLIP) {
+        log->n_clipped += 1;
     }
-    fclose(f);
-    rename(tmp, dst);
 }
 
-static uint32_t checkpoint_load(model_t *m) {
-    FILE *f = fopen("models/ckpt.bin", "rb");
-    if (f == NULL) {
-        return 0;
+void mda_train_report(mda_train_log_t *log, const mda_step_trainer_t *tr, uint32_t s, float lr, float loss, double bpb, double now) {
+    if (s % 5 == 0 || s == log->start + 1) {
+        double per_step = (now - log->t0) / (s - log->start);
+        printf("step %u lr %.2e loss %.4f ema %.4f bits/byte %.4f ema %.4f gnorm %.3f clip %.0f%% skip %u %.3f s/step\n", s, lr, loss, log->ema, bpb, log->ema_bpb, tr->gnorm, 100.0 * log->n_clipped / log->n_logged, log->n_skipped, per_step);
+        fflush(stdout);
+        log->n_clipped = 0;
+        log->n_skipped = 0;
+        log->n_logged = 0;
     }
-    uint32_t step = 0;
-    if (fread(&step, sizeof(uint32_t), 1, f) != 1) {
-        fclose(f);
-        return 0;
-    }
-    for (uint32_t i = 0; i < m->n_params; ++i) {
-        param_t *p = &m->params[i];
-        fread(p->w.ptr, sizeof(float), p->n, f);
-        fread(p->m.ptr, sizeof(float), p->n, f);
-        fread(p->v.ptr, sizeof(float), p->n, f);
-    }
-    fclose(f);
-    fprintf(stderr, "resumed from checkpoint at step %u\n", step);
-    return step;
 }
 
-int main(void) {
-    srand(1234);
-    vkc_t c = vkc_init();
+void mda_train_checkpoint(mda_train_log_t *log, mda_model_t *m, uint64_t vocab_hash, mda_train_args_t args, uint32_t s, double now) {
+    if (now - log->t_ckpt >= MDA_TRAIN_CKPT_INTERVAL || s == args.stop) {
+        bool saved = mda_ckpt_save(m, vocab_hash, s, args.ckpt_path);
+        if (saved) {
+            fprintf(stderr, "checkpoint at step %u, bpb %.3f\n", s, log->ema_bpb);
+        }
+        log->t_ckpt = now;
+    }
+}
 
-    // load + tokenize first: the corpus sets the vocab size the model is built for.
-    corpus_t cp = corpus_load("data/wiki.txt");
+double mda_train_micros(mda_step_trainer_t *tr, const mda_data_corpus_t *cp, uint32_t s) {
+    double bytes = 0.0;
+    for (uint32_t i = 0; i < tr->accum; i += 1) {
+        mda_data_batch(&tr->sc.batch, cp, MDA_DATA_SPLIT_TRAIN, (uint64_t)(s - 1) * tr->accum + i + 1);
+        mda_step_micro(tr, i);
+        bytes += mda_data_masked_bytes(cp, &tr->sc.batch);
+    }
+    return bytes;
+}
 
-    mcfg_t cfg = (mcfg_t) {
-        .d = 640,
-        .n_layer = 12,
-        .n_head = 10,
-        .seqlen = 64,
-        .batch = 8,
-        .ffn_hidden = 1728,
-        .vocab = data_vocab,
-        .vocab_in = data_vocab + 1,
+void mda_train_step(mda_train_log_t *log, mda_step_trainer_t *tr, const mda_data_corpus_t *cp, uint64_t vocab_hash, mda_train_args_t args, uint32_t s) {
+    float lr = mda_train_lr(args, s);
+    mda_step_begin(tr, lr, s);
+    double bytes = mda_train_micros(tr, cp, s);
+    float loss = (float)tr->loss;
+    if (tr->m->c->fail == false) {
+        double bpb = tr->ce_sum / bytes / 0.6931472;
+        mda_train_record(log, tr, loss, bpb);
+        double now = mda_util_now();
+        if (log->skip_run < MDA_TRAIN_MAX_SKIPS) {
+            mda_train_report(log, tr, s, lr, loss, bpb, now);
+            mda_train_checkpoint(log, tr->m, vocab_hash, args, s, now);
+        }
+    }
+}
+
+bool mda_train_steps(mda_step_trainer_t *tr, const mda_data_corpus_t *cp, uint64_t vocab_hash, mda_train_args_t args, uint32_t start) {
+    mda_train_log_t log = {
+        .t0 = mda_util_now(),
+        .t_ckpt = mda_util_now(),
+        .start = start,
     };
-    model_t *m = model_init(&c, cfg);
-    trainer_t tr = trainer_make(m);
-
-    fprintf(stderr, "params %.2f M | d=%u L=%u H=%u seq=%u batch=%u\n", (double)model_param_count(m) / 1e6, cfg.d, cfg.n_layer, cfg.n_head, cfg.seqlen, cfg.batch);
-
-    uint32_t start = checkpoint_load(m);
-    m->dirty16 = 1;
-    vkc_buf_t clip_partials = vkc_alloc(&c, grad_norm_slots(m) * sizeof(float));
-    // global-norm gradient clip: the 1/t diffusion weighting makes some batches
-    // produce huge gradients that kick the model out of its minimum.
-    float clip = 2.0f;
-
-    float lr_peak = 3e-5f;
-    uint32_t warmup = 50;
-    uint32_t max_steps = 1000000;
-    double ckpt_interval = 120.0;
-    struct timespec t0;
-    struct timespec t_ckpt;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    t_ckpt = t0;
-
-    double ema = 0.0;
-    double ema_bpb = 0.0;
-    int ema_init = 0;
-
-    for (uint32_t s = start + 1; s <= max_steps; ++s) {
-        make_batch(
-            &cp,
-            cfg.batch,
-            cfg.seqlen,
-            tr.sc.ids.ptr,
-            tr.sc.target.ptr,
-            tr.sc.mask.ptr,
-            tr.sc.weight.ptr);
-        float loss = train_step(&tr);
-        float lr = (s < warmup) ? lr_peak * (float)s / (float)warmup : lr_peak;
-        float gnorm = grad_norm(m, &clip_partials);
-        vkc_begin(&c);
-        if (gnorm > clip) {
-            scale_grads(m, &clip_partials, clip / (gnorm + 1e-9f));
-        }
-        adamw_all(m, lr, s);
-        vkc_flush(&c);
-        m->dirty16 = 1;
-
-        float bpb = tr.last_raw_ce / 0.6931472f;
-
-        if (ema_init == 0) {
-            ema = loss;
-            ema_bpb = bpb;
-            ema_init = 1;
-        } else {
-            ema = 0.95 * ema + 0.05 * loss;
-            ema_bpb = 0.95 * ema_bpb + 0.05 * bpb;
-        }
-
-        struct timespec t1;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        double since_ckpt = (t1.tv_sec - t_ckpt.tv_sec) + (t1.tv_nsec - t_ckpt.tv_nsec) / 1e9;
-
-        if (s % 5 == 0 || s == start + 1) {
-            double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
-            double per_step = dt / (s - start);
-            printf("step %6u  loss %.4f ema %.4f  bits/byte %.4f ema %.4f  %.2f s/step\n", s, loss, ema, bpb, ema_bpb, per_step);
-            fflush(stdout);
-        }
-        if (since_ckpt >= ckpt_interval) {
-            checkpoint_save(m, s);
-            t_ckpt = t1;
-            fprintf(stderr, "[checkpoint @ step %u  bpb %.3f]\n", s, ema_bpb);
-        }
+    uint32_t max_steps = mda_train_max_steps(args.stop);
+    uint32_t s = start + 1;
+    while (s <= max_steps && tr->m->c->fail == false && log.skip_run < MDA_TRAIN_MAX_SKIPS) {
+        mda_train_step(&log, tr, cp, vocab_hash, args, s);
+        s += 1;
     }
-    return 0;
+    if (log.skip_run == MDA_TRAIN_MAX_SKIPS) {
+        fprintf(stderr, "step %u: %u steps in a row overflowed; stopping, weights in %s\n", s - 1, MDA_TRAIN_MAX_SKIPS, MDA_CKPT_OVERFLOW_PATH);
+        mda_ckpt_save(tr->m, vocab_hash, s - 1, MDA_CKPT_OVERFLOW_PATH);
+        return false;
+    } else {
+        return tr->m->c->fail == false;
+    }
+}
+
+bool mda_train_resume(mda_step_trainer_t *tr, const mda_data_corpus_t *cp, mda_train_args_t args) {
+    uint64_t vocab_hash = mda_tokenizer_hash(&cp->tok);
+    mda_ckpt_res_t loaded = mda_ckpt_load(tr->m, vocab_hash, args.ckpt_path, true);
+    if (loaded.ok == false) {
+        return false;
+    } else {
+        if (loaded.step != 0) {
+            fprintf(stderr, "resumed from checkpoint at step %u\n", loaded.step);
+        }
+        if (args.stop != 0) {
+            fprintf(stderr, "lr %g, decaying to 0 over steps %u..%u\n", args.lr_peak, mda_train_decay_from(args.stop), args.stop);
+        } else {
+            fprintf(stderr, "lr %g\n", args.lr_peak);
+        }
+        return mda_train_steps(tr, cp, vocab_hash, args, loaded.step);
+    }
+}
+
+bool mda_train_trainer(mda_step_trainer_t *tr, const mda_data_corpus_t *cp, mda_train_args_t args) {
+    mda_model_cfg_t cfg = tr->m->cfg;
+    if (tr->m->c->fail) {
+        return false;
+    } else {
+        fprintf(stderr, "params %.2f M, d=%u L=%u H=%u seq=%u batch=%u accum=%u muon=%u\n", (double)mda_model_param_count(tr->m) / 1e6, cfg.d, cfg.n_layer, cfg.n_head, cfg.seqlen, cfg.batch, tr->accum, tr->muon);
+        return mda_train_resume(tr, cp, args);
+    }
+}
+
+bool mda_train_model(mda_vkc_t *c, const mda_data_corpus_t *cp, mda_train_args_t args) {
+    mda_model_cfg_t cfg = mda_model_cfg(cp->tok.count);
+    mda_model_t *m = mda_model_init(c, cfg);
+    if (m == NULL) {
+        return false;
+    } else {
+        mda_step_trainer_t tr = mda_step_init(m, MDA_TRAIN_CLIP, args.accum, args.muon);
+        return mda_train_trainer(&tr, cp, args);
+    }
+}
+
+bool mda_train_device(mda_vkc_t *c, mda_train_args_t args) {
+    mda_data_corpus_t cp = mda_data_load(MDA_TOKENIZER_CORPUS_PATH);
+    if (cp.ids == NULL) {
+        return false;
+    } else {
+        return mda_train_model(c, &cp, args);
+    }
+}
+
+bool mda_train_main(uint32_t argc, char **argv) {
+    mda_train_args_t args = {
+        .ckpt_path = mda_util_arg(argc, argv, 2, MDA_CKPT_PATH),
+        .lr_peak = strtof(mda_util_arg(argc, argv, 1, "1e-4"), NULL),
+        .stop = (uint32_t)strtoul(mda_util_arg(argc, argv, 3, "0"), NULL, 10),
+        .accum = (uint32_t)strtoul(mda_util_arg(argc, argv, 4, "1"), NULL, 10),
+        .muon = strcmp(mda_util_arg(argc, argv, 5, "adamw"), "muon") == 0,
+    };
+    mda_vkc_t c = mda_vkc_init();
+    if (c.fail) {
+        return false;
+    } else {
+        return mda_train_device(&c, args);
+    }
+}
+
+int main(int argc, char **argv) {
+    bool ok = mda_train_main((uint32_t)argc, argv);
+    if (ok) {
+        return 0;
+    } else {
+        return 1;
+    }
 }

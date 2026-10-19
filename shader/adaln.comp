@@ -1,15 +1,5 @@
 #version 450
 #extension GL_EXT_shader_atomic_float : require
-// adaLN-Zero modulation: h[b, t, c] = x[b, t, c] * (1 + scale[b, c]) + shift[b, c].
-// scale/shift are per (batch, channel) -- broadcast across the sequence (t) -- and are
-// read straight out of the block's [batch, stride] modulation projection (ada) at
-// column offsets s_off / sh_off, so no slice copies are needed.
-//   op 0 forward:  out = x * (1 + scale) + shift.
-//   op 1 backward: given dout (in out buffer), write
-//       dx = dout * (1 + scale)                         (into dx buffer)
-//       dada[b, s_off + c]  += sum_t dout * x           (atomic over t)
-//       dada[b, sh_off + c] += sum_t dout               (atomic over t)
-// One invocation per (b*t, c). seqlen lets us map row -> batch.
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer buf_x {
@@ -18,10 +8,10 @@ layout(std430, binding = 0) readonly buffer buf_x {
 layout(std430, binding = 1) readonly buffer buf_ada {
     float ada[];
 };
-layout(std430, binding = 2) buffer buf_out {
-    float outp[];
+layout(std430, binding = 2) buffer buf_y {
+    float y[];
 };
-layout(std430, binding = 3) buffer buf_dx {
+layout(std430, binding = 3) writeonly buffer buf_dx {
     float dx[];
 };
 layout(std430, binding = 4) buffer buf_dada {
@@ -39,21 +29,17 @@ layout(push_constant) uniform pc {
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    if (idx >= bt * d) {
-        return;
-    }
-    uint row = idx / d;
-    uint col = idx % d;
-    uint b = row / seqlen;
-    uint s_idx = b * stride + s_off + col;
-    uint sh_idx = b * stride + sh_off + col;
-
-    if (op == 0) {
-        outp[idx] = x[idx] * (1.0 + ada[s_idx]) + ada[sh_idx];
-    } else {
-        float dout = outp[idx];
-        dx[idx] = dout * (1.0 + ada[s_idx]);
-        atomicAdd(dada[s_idx], dout * x[idx]);
-        atomicAdd(dada[sh_idx], dout);
+    if (idx < bt * d) {
+        uint col = idx % d;
+        uint base = idx / d / seqlen * stride;
+        float sc = ada[base + s_off + col];
+        if (op == 0u) {
+            y[idx] = x[idx] * (1.0 + sc) + ada[base + sh_off + col];
+        } else {
+            float g = y[idx];
+            dx[idx] = g * (1.0 + sc);
+            atomicAdd(dada[base + s_off + col], g * x[idx]);
+            atomicAdd(dada[base + sh_off + col], g);
+        }
     }
 }

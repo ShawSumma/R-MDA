@@ -1,5 +1,4 @@
 #version 450
-// c[m, n] = a[m, k] @ b[k, n]. One invocation per output element.
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(std430, binding = 0) readonly buffer buf_a {
@@ -20,12 +19,11 @@ layout(push_constant) uniform pc {
 void main() {
     uint row = gl_GlobalInvocationID.y;
     uint col = gl_GlobalInvocationID.x;
-    if (row >= m || col >= n) {
-        return;
+    if (row < m && col < n) {
+        float acc = 0.0;
+        for (uint i = 0; i < k; i += 1u) {
+            acc += a[row * k + i] * b[i * n + col];
+        }
+        c[row * n + col] = acc;
     }
-    float acc = 0.0;
-    for (uint i = 0; i < k; i++) {
-        acc += a[row * k + i] * b[i * n + col];
-    }
-    c[row * n + col] = acc;
 }

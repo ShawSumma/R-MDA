@@ -1,9 +1,4 @@
 #version 450
-// Wide-block fp16 coopmat matmul for LARGE-n matmuls (the vocab head): each subgroup
-// computes 4 A-row-tiles x 4 B-col-tiles = 16 accumulators (max reuse). 4 subgroups ->
-// 256-row x 64-col block. Wins on huge matmuls (head 512x16000) where there are plenty
-// of workgroups; the 64x64 block (matmul_f16) wins on the small per-layer matmuls.
-// Requires wave32, m mult of 256, n mult of 64.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -11,16 +6,26 @@
 layout(local_size_x = 128) in;
 layout(std430, binding = 0) readonly buffer BA { float16_t A[]; };
 layout(std430, binding = 1) readonly buffer BB { float16_t B[]; };
-layout(std430, binding = 2) writeonly buffer BC { float C[]; };
-layout(push_constant) uniform pc { uint m, n, k; };
+layout(std430, binding = 2) buffer BC { float C[]; };
+layout(std430, binding = 3) readonly buffer BS { uint amax[]; };
+layout(push_constant) uniform pc { uint m, n, k, sa, sb, acc; };
 const uint T = 16;
+float slot_scale(uint s) {
+    if (s == ~0u) {
+        return 1.0;
+    } else if (!(uintBitsToFloat(amax[s]) > 0.0) || isinf(uintBitsToFloat(amax[s]))) {
+        return 1.0;
+    } else {
+        return exp2(141.0 - float((amax[s] >> 23) & 0xffu));
+    }
+}
 void main() {
     uint sg = gl_SubgroupID;
     uint row0 = gl_WorkGroupID.y * 256u + sg * 64u;
     uint col0 = gl_WorkGroupID.x * 64u;
     coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator> ac[4][4];
-    for (int i = 0; i < 4; i = i + 1) {
-        for (int j = 0; j < 4; j = j + 1) {
+    for (uint i = 0; i < 4u; i = i + 1) {
+        for (uint j = 0; j < 4u; j = j + 1) {
             ac[i][j] = coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator>(0.0);
         }
     }
@@ -37,9 +42,17 @@ void main() {
             }
         }
     }
+    float inv = 1.0 / (slot_scale(sa) * slot_scale(sb));
     for (uint i = 0; i < 4u; i = i + 1) {
         for (uint t = 0; t < 4u; t = t + 1) {
-            coopMatStore(ac[i][t], C, (row0 + i * 16u) * n + col0 + t * 16u, n, gl_CooperativeMatrixLayoutRowMajor);
+            uint at = (row0 + i * 16u) * n + col0 + t * 16u;
+            ac[i][t] = ac[i][t] * inv;
+            if (acc != 0u) {
+                coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator> prev;
+                coopMatLoad(prev, C, at, n, gl_CooperativeMatrixLayoutRowMajor);
+                ac[i][t] = ac[i][t] + prev;
+            }
+            coopMatStore(ac[i][t], C, at, n, gl_CooperativeMatrixLayoutRowMajor);
         }
     }
 }

@@ -1,0 +1,71 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float DK[]; };
+layout(std430, binding = 1) readonly buffer B1 { float DV[]; };
+layout(std430, binding = 2) readonly buffer B2 { float DR[]; };
+layout(std430, binding = 3) readonly buffer B3 { float DW[]; };
+layout(std430, binding = 4) readonly buffer B4 { float DA[]; };
+layout(std430, binding = 5) readonly buffer B5 { float DK2[]; };
+layout(std430, binding = 6) readonly buffer B6 { float DV2[]; };
+layout(std430, binding = 7) readonly buffer B7 { float DR2[]; };
+layout(std430, binding = 8) readonly buffer B8 { float DW2[]; };
+layout(std430, binding = 9) readonly buffer B9 { float DA2[]; };
+layout(std430, binding = 10) readonly buffer B10 { float khat[]; };
+layout(std430, binding = 11) readonly buffer B11 { float kinv[]; };
+layout(std430, binding = 12) readonly buffer B12 { float PW[]; };
+layout(std430, binding = 13) readonly buffer B13 { float PA[]; };
+layout(std430, binding = 14) writeonly buffer B14 { float OK[]; };
+layout(std430, binding = 15) writeonly buffer B15 { float OV[]; };
+layout(std430, binding = 16) writeonly buffer B16 { float OR[]; };
+layout(std430, binding = 17) writeonly buffer B17 { float OW[]; };
+layout(std430, binding = 18) writeonly buffer B18 { float OA[]; };
+layout(push_constant) uniform pc {
+    uint n_vec;
+    uint hd;
+    uint seqlen;
+};
+
+const float C = 0.60653066;
+
+shared float red[256];
+
+float group_sum(float x, uint lid) {
+    red[lid] = x;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if ((lid & 63u) < s) {
+            red[lid] += red[lid + s];
+        }
+        barrier();
+    }
+    return red[lid & ~63u];
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint vec = gl_WorkGroupID.x * 4u + (lid >> 6);
+    uint e = lid & 63u;
+    bool live = vec < n_vec;
+    uint t = vec % seqlen;
+    uint bh = vec / seqlen;
+    uint ui = ((bh / hd) * seqlen + t) * hd * 64u + (bh % hd) * 64u + e;
+    uint pi = vec * 64u + e;
+    float dk = 0.0;
+    float kh = 0.0;
+    if (live) {
+        dk = 0.5 * (DK[pi] + DK2[pi]);
+        kh = khat[pi];
+    }
+    float dot = group_sum(kh * dk, lid);
+    if (live) {
+        OK[ui] = (dk - kh * dot) * kinv[vec];
+        OV[ui] = 0.5 * (DV[pi] + DV2[pi]);
+        OR[ui] = 0.5 * (DR[pi] + DR2[pi]);
+        float w = PW[pi];
+        float s = -log(w) / C;
+        OW[ui] = 0.5 * (DW[pi] + DW2[pi]) * (-C * w * s * (1.0 - s));
+        float a = PA[pi];
+        OA[ui] = 0.5 * (DA[pi] + DA2[pi]) * a * (1.0 - a);
+    }
+}

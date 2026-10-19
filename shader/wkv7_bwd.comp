@@ -1,26 +1,17 @@
 #version 450
-// RWKV-7 WKV backward. Reverse-time recurrence carrying dS (grad wrt state).
-// Forward (per step t), with P = S_{t-1} and Sk = P^T k:
-//   S_t[i,j] = w[j]*P[i,j] + a[i]*k[i]*(v[j] - Sk[j])
-//   o_t[j]   = sum_i r[i]*S_t[i,j]
-// We need: dK,dV,dR,dW,dA given dO. The forward saved every pre-step state P in
-// `Sprev` ([T, DH*DH] per (b,h)); we read them rather than recompute.
-// With ak = a*k and dS the grad wrt S_t (including this step's readout):
-//   dR[i]  = sum_j S_t[i,j]*dO[j]
-//   dW[j]  = sum_i dS[i,j]*P[i,j]
-//   dV[j]  = sum_i dS[i,j]*ak[i]          dSk[j] = -dV[j]
-//   dak[i] = sum_j dS[i,j]*(v[j] - Sk[j])
-//   dA[i]  = dak[i]*k[i]                  dK[i]  = dak[i]*a[i] + sum_j dSk[j]*P[i,j]
-//   dP[i,j] = w[j]*dS[i,j] + dSk[j]*k[i]
-// Requires DH <= 64 (shared arrays); model_init checks the config.
-layout(local_size_x = 64) in;
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 256) in;
+
+const uint CH = 4u;
 
 layout(std430,binding=0) readonly  buffer BK  { float K[]; };
 layout(std430,binding=1) readonly  buffer BV  { float V[]; };
 layout(std430,binding=2) readonly  buffer BR  { float R[]; };
 layout(std430,binding=3) readonly  buffer BW  { float W[]; };
 layout(std430,binding=4) readonly  buffer BA  { float A[]; };
-layout(std430,binding=5) readonly  buffer BSP { float Sprev[]; }; // [T, DH*DH] saved fwd states (state BEFORE step t)
+layout(std430,binding=5) readonly  buffer BSP { float16_t Sprev[]; };
 layout(std430,binding=6) readonly  buffer BdO { float dO[]; };
 layout(std430,binding=7) writeonly buffer BdK { float dK[]; };
 layout(std430,binding=8) writeonly buffer BdV { float dV[]; };
@@ -29,54 +20,121 @@ layout(std430,binding=10) writeonly buffer BdW{ float dW[]; };
 layout(std430,binding=11) writeonly buffer BdA{ float dA[]; };
 layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir; };
 
-shared float dS[64*64];     // grad wrt current state S_t
-shared float Sp[64*64];     // S_{t-1} for this step
-shared float kk[64],vv[64],rr[64],ww[64],aa[64],Sk[64];
-shared float dSk[64];       // grad wrt Sk[j]
+shared float kk[64], vv[64], rr[64], ww[64], aa[64], dOs[64];
+shared float p0[256], p1[256], p2[256];
+shared float h0[128];
+shared vec2 h1[128];
+
+uint step_row(uint base, uint tf) {
+    if (dir == 0u) {
+        return base + tf*64u;
+    } else {
+        return base + (T - 1u - tf)*64u;
+    }
+}
+
+void run(uint bh) {
+    uint lid = gl_LocalInvocationID.x;
+    uint g = lid >> 6;
+    uint e = lid & 63u;
+    uint half_ = e >> 5;
+    bool lead = (e & 31u) == 0u;
+    uint base = bh*T*64u;
+    uint nc = T / CH;
+    uint cbase = bh*nc*4096u + lid;
+
+    float Ps[CH][16];
+    float dS[16];
+    for (uint q = 0; q < 16u; q += 1u) dS[q] = 0.0;
+
+    for (uint ci = 0; ci < nc; ci += 1u) {
+        uint c = nc - 1u - ci;
+
+        float S[16];
+        for (uint q = 0; q < 16u; q += 1u) S[q] = float(Sprev[cbase + c*4096u + q*256u]);
+        [[unroll]] for (uint j = 0; j < CH; j += 1u) {
+            for (uint q = 0; q < 16u; q += 1u) Ps[j][q] = S[q];
+            if (j + 1u < CH) {
+                uint row = step_row(base, c*CH + j);
+                if (lid < 64u) {
+                    kk[lid] = K[row+lid]; vv[lid] = V[row+lid];
+                    ww[lid] = W[row+lid]; aa[lid] = A[row+lid];
+                }
+                barrier();
+                float s = 0.0;
+                for (uint q = 0; q < 16u; q += 1u) s += S[q]*kk[g + 4u*q];
+                p0[lid] = s;
+                barrier();
+                float sk = p0[e] + p0[64u+e] + p0[128u+e] + p0[192u+e];
+                for (uint q = 0; q < 16u; q += 1u) {
+                    uint i = g + 4u*q;
+                    S[q] = ww[e]*S[q] + aa[i]*kk[i]*(vv[e] - sk);
+                }
+                barrier();
+            }
+        }
+
+        [[unroll]] for (uint jj = 0; jj < CH; jj += 1u) {
+            uint j = CH - 1u - jj;
+            uint row = step_row(base, c*CH + j);
+            if (lid < 64u) {
+                kk[lid] = K[row+lid]; vv[lid] = V[row+lid]; rr[lid] = R[row+lid];
+                ww[lid] = W[row+lid]; aa[lid] = A[row+lid]; dOs[lid] = dO[row+lid];
+            }
+            barrier();
+
+            float s = 0.0;
+            for (uint q = 0; q < 16u; q += 1u) s += Ps[j][q]*kk[g + 4u*q];
+            p0[lid] = s;
+            barrier();
+            float sk = p0[e] + p0[64u+e] + p0[128u+e] + p0[192u+e];
+            float we = ww[e];
+            float ve = vv[e];
+            float doe = dOs[e];
+
+            float dw = 0.0;
+            float dv = 0.0;
+            for (uint q = 0; q < 16u; q += 1u) {
+                uint i = g + 4u*q;
+                float ak = aa[i]*kk[i];
+                float x = subgroupAdd((we*Ps[j][q] + ak*(ve - sk))*doe);
+                if (lead) h0[(g*16u + q)*2u + half_] = x;
+                dS[q] += rr[i]*doe;
+                dw += dS[q]*Ps[j][q];
+                dv += dS[q]*ak;
+            }
+            p1[lid] = dw;
+            p2[lid] = dv;
+            barrier();
+            float dve = p2[e] + p2[64u+e] + p2[128u+e] + p2[192u+e];
+            float dsk = -dve;
+            if (lid < 64u) {
+                uint hi = ((lid & 3u)*16u + (lid >> 2))*2u;
+                dR[row + lid] = h0[hi] + h0[hi + 1u];
+                dW[row + lid] = p1[lid] + p1[64u+lid] + p1[128u+lid] + p1[192u+lid];
+                dV[row + lid] = dve;
+            }
+
+            for (uint q = 0; q < 16u; q += 1u) {
+                uint i = g + 4u*q;
+                vec2 y = subgroupAdd(vec2(dS[q]*(ve - sk), dsk*Ps[j][q]));
+                if (lead) h1[(g*16u + q)*2u + half_] = y;
+                dS[q] = we*dS[q] + dsk*kk[i];
+            }
+            barrier();
+            if (lid < 64u) {
+                uint hi = ((lid & 3u)*16u + (lid >> 2))*2u;
+                vec2 y = h1[hi] + h1[hi + 1u];
+                dA[row + lid] = y.x*kk[lid];
+                dK[row + lid] = y.x*aa[lid] + y.y;
+            }
+        }
+    }
+}
 
 void main(){
-    uint bh=gl_WorkGroupID.x; if(bh>=Bsz*Hd) return;
-    uint b=bh/Hd, h=bh%Hd, lid=gl_LocalInvocationID.x;
-    uint DH2=DH*DH;
-    uint base=(b*Hd+h)*T*DH;       // [T,DH] arrays
-    uint sbase=(b*Hd+h)*T*DH2;     // [T,DH*DH] saved states
-
-    for(uint i=lid;i<DH2;i+=64) dS[i]=0.0;
-    barrier();
-
-    for(uint ti=0; ti<T; ti++){
-        // backward walks opposite to the forward: for a dir==0 (L->R) forward we
-        // go reverse-time (T-1..0); for a dir==1 (R->L) forward we go forward-time.
-        uint t = (dir==0) ? (T-1-ti) : ti;
-        uint row = base + t*DH;
-        for(uint d=lid;d<DH;d+=64){ kk[d]=K[row+d]; vv[d]=V[row+d];
-            rr[d]=R[row+d]; ww[d]=W[row+d]; aa[d]=A[row+d]; }
-        for(uint i=lid;i<DH2;i+=64) Sp[i]=Sprev[sbase+t*DH2+i];
-        barrier();
-        // Sk[j] = sum_i Sp[i,j]*k[i]
-        for(uint j=lid;j<DH;j+=64){ float s=0; for(uint i=0;i<DH;i++) s+=Sp[i*DH+j]*kk[i]; Sk[j]=s; }
-        barrier();
-        // readout: dR[i] = sum_j S_t[i,j]*dO[j], with S_t rebuilt from Sp
-        for(uint i=lid;i<DH;i+=64){ float dr=0; float ak=aa[i]*kk[i];
-            for(uint j=0;j<DH;j++){ float St=ww[j]*Sp[i*DH+j]+ak*(vv[j]-Sk[j]);
-                dr+=St*dO[row+j]; }
-            dR[row+i]=dr; }
-        barrier();
-        for(uint idx=lid;idx<DH2;idx+=64){ uint i=idx/DH,j=idx%DH; dS[idx]+= rr[i]*dO[row+j]; }
-        barrier();
-        // column sums: dW, dV, dSk
-        for(uint j=lid;j<DH;j+=64){ float dw=0, dv=0;
-            for(uint i=0;i<DH;i++){ float g=dS[i*DH+j]; dw+=g*Sp[i*DH+j]; dv+=g*aa[i]*kk[i]; }
-            dW[row+j]=dw; dV[row+j]=dv; dSk[j]=-dv; }
-        barrier();
-        // row sums: dA, dK
-        for(uint i=lid;i<DH;i+=64){ float dak=0, dskp=0;
-            for(uint j=0;j<DH;j++){ dak+=dS[i*DH+j]*(vv[j]-Sk[j]); dskp+=dSk[j]*Sp[i*DH+j]; }
-            dA[row+i]=dak*kk[i]; dK[row+i]=dak*aa[i]+dskp; }
-        barrier();
-        // propagate to dS_prev: P appears via w[j]*P[i,j] and via Sk[j]=sum_i P[i,j]k[i].
-        for(uint idx=lid;idx<DH2;idx+=64){ uint i=idx/DH,j=idx%DH;
-            dS[idx] = ww[j]*dS[idx] + dSk[j]*kk[i]; }
-        barrier();
+    uint bh = gl_WorkGroupID.x;
+    if (bh < Bsz*Hd) {
+        run(bh);
     }
 }

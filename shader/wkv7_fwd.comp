@@ -1,89 +1,70 @@
 #version 450
-// RWKV-7 WKV forward recurrence, one workgroup per (batch, head), sequential in t.
-//   S_t[i,j] = w_t[j] S_{t-1}[i,j] + a_t[i] k_t[i] (v_t[j] - (S_{t-1}^T k_t)[j])
-//   out_t = r_t^T S_t
-// i.e. a delta rule with a per-key-channel in-context learning rate a (RWKV-7's a*k).
-// State S is [DH x DH] (row i, col j). w,a,k,v,r are [DH] per (t).
-// Layout per (b,h): k,v,r,w,a are [T, DH]; out is [T, DH]; we hold S in shared mem.
-// direction: 0 = forward (t=0..T-1), 1 = backward (t=T-1..0).
-// Requires DH == 64: the state indexing (>>6, &63, row stride 65) and the 4-lane
-// reductions (256 threads = 4 x DH) are fixed to it; model_init checks the config.
-layout(local_size_x = 256) in;  // threads cooperate on the [DH x DH] state per step
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 256) in;
+
+const uint CH = 4u;
 
 layout(std430,binding=0) readonly  buffer BK { float K[]; };
 layout(std430,binding=1) readonly  buffer BV { float V[]; };
 layout(std430,binding=2) readonly  buffer BR { float R[]; };
-layout(std430,binding=3) readonly  buffer BW { float W[]; };  // decay in (0,1)
-layout(std430,binding=4) readonly  buffer BA { float A[]; };  // in-context lr
+layout(std430,binding=3) readonly  buffer BW { float W[]; };
+layout(std430,binding=4) readonly  buffer BA { float A[]; };
 layout(std430,binding=5) writeonly buffer BO { float O[]; };
-layout(std430,binding=6) writeonly buffer BS { float Sout[]; }; // [T, DH*DH] pre-step states for bwd
+layout(std430,binding=6) writeonly buffer BS { float16_t Sout[]; };
 
 layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir, save; };
 
-shared float S[64*65];     // [DH x DH] state for this (b,h)
 shared float kk[64], vv[64], rr[64], ww[64], aa[64];
-shared float Sk[64];       // S^T k  (length DH)
-shared float part[256];    // partial sums for the 4-way reductions
+shared float p0[256], p1[256];
+
+uint step_t(uint ti) {
+    if (dir == 0u) {
+        return ti;
+    } else {
+        return T - 1u - ti;
+    }
+}
+
+void run(uint bh) {
+    uint lid = gl_LocalInvocationID.x;
+    uint g = lid >> 6;
+    uint e = lid & 63u;
+    uint base = bh*T*64u;
+
+    float S[16];
+    for (uint q = 0; q < 16u; q += 1u) S[q] = 0.0;
+
+    for (uint ti = 0; ti < T; ti += 1u) {
+        uint row = base + step_t(ti)*64u;
+        if (lid < 64u) {
+            kk[lid] = K[row+lid]; vv[lid] = V[row+lid];
+            rr[lid] = R[row+lid]; ww[lid] = W[row+lid]; aa[lid] = A[row+lid];
+        }
+        barrier();
+        if (save == 1u && (ti % CH) == 0u) {
+            uint sb = bh*(T/CH)*4096u + (ti/CH)*4096u + lid;
+            for (uint q = 0; q < 16u; q += 1u) Sout[sb + q*256u] = float16_t(S[q]);
+        }
+        float s = 0.0;
+        for (uint q = 0; q < 16u; q += 1u) s += S[q]*kk[g + 4u*q];
+        p0[lid] = s;
+        barrier();
+        float sk = p0[e] + p0[64u+e] + p0[128u+e] + p0[192u+e];
+        float o = 0.0;
+        for (uint q = 0; q < 16u; q += 1u) {
+            uint i = g + 4u*q;
+            S[q] = ww[e]*S[q] + aa[i]*kk[i]*(vv[e] - sk);
+            o += rr[i]*S[q];
+        }
+        p1[lid] = o;
+        barrier();
+        if (lid < 64u) O[row+lid] = p1[lid] + p1[64u+lid] + p1[128u+lid] + p1[192u+lid];
+    }
+}
 
 void main(){
-    uint bh   = gl_WorkGroupID.x;        // flat (b*Hd + h)
-    uint b    = bh / Hd;
-    uint h    = bh % Hd;
-    uint lid  = gl_LocalInvocationID.x;
-    uint DHl  = DH;
-    if(bh >= Bsz*Hd) return;
-
-    // zero state rows owned by this thread (thread `lid` owns rows lid, lid+64, ...)
-    for(uint i=lid;i<DHl*DHl;i+=gl_WorkGroupSize.x) S[(i>>6)*65u+(i&63u)]=0.0;
-    barrier();
-
-    // base offset into the per-(b,h) [T,DH] arrays
-    uint base = (b*Hd + h) * T * DHl;
-
-    for(uint ti=0; ti<T; ti++){
-        uint t = (dir==0) ? ti : (T-1-ti);
-        uint row = base + t*DHl;
-        // load this step's vectors cooperatively
-        for(uint d=lid; d<DHl; d+=gl_WorkGroupSize.x){
-            kk[d]=K[row+d]; vv[d]=V[row+d];
-            rr[d]=R[row+d]; ww[d]=W[row+d]; aa[d]=A[row+d];
-        }
-        barrier();
-        // save the pre-update state S_{t-1} for the backward pass
-        if(save==1){ uint sb=(b*Hd+h)*T*DHl*DHl + t*DHl*DHl;
-            for(uint i=lid;i<DHl*DHl;i+=gl_WorkGroupSize.x) Sout[sb+i]=S[(i>>6)*65u+(i&63u)]; barrier(); }
-        // Sk[j] = sum_i S[i,j]*k_i. 256 threads = 4 lanes per column j: lane g sums
-        // its quarter of i, then the 4 partials combine. (DH=64, group=4.)
-        {
-            uint g = lid / DHl;            // lane 0..3
-            uint j = lid % DHl;            // column 0..DH-1
-            float s = 0.0;
-            for(uint i=g; i<DHl; i+=4u) s += S[i*65u+j]*kk[i];
-            part[lid] = s;
-        }
-        barrier();
-        for(uint j=lid;j<DHl;j+=gl_WorkGroupSize.x){
-            Sk[j] = part[j] + part[DHl+j] + part[2u*DHl+j] + part[3u*DHl+j];
-        }
-        barrier();
-        // update: each thread updates its rows. S[i,j] = w_j*S[i,j] + a_i*k_i*(v_j - Sk[j])
-        for(uint idx=lid; idx<DHl*DHl; idx+=gl_WorkGroupSize.x){
-            uint i=idx >> 6, j=idx & 63u;
-            S[i*65u + j] = ww[j]*S[i*65u + j] + aa[i]*kk[i]*(vv[j] - Sk[j]);
-        }
-        barrier();
-        // out_t[j] = sum_i r_i * S[i,j], same 4-lane-per-column reduction.
-        {
-            uint g = lid / DHl;
-            uint j = lid % DHl;
-            float o = 0.0;
-            for(uint i=g; i<DHl; i+=4u) o += rr[i]*S[i*65u+j];
-            part[lid] = o;
-        }
-        barrier();
-        for(uint j=lid;j<DHl;j+=gl_WorkGroupSize.x){
-            O[row+j] = part[j] + part[DHl+j] + part[2u*DHl+j] + part[3u*DHl+j];
-        }
-        barrier();
+    uint bh = gl_WorkGroupID.x;
+    if (bh < Bsz*Hd) {
+        run(bh);
     }
 }

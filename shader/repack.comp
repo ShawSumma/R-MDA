@@ -1,9 +1,4 @@
 #version 450
-// GPU head repack between [b,t,head,dh] (model layout) and [b,head,t,dh] (wkv
-// layout). Replaces host pack/unpack loops (which thrash cache on mapped memory).
-//   op 0 (pack):   out[(b*Hd+h)*T*dh + t*dh + e] = in[(b*T+t)*D + h*dh + e]
-//   op 1 (unpack): out[(b*T+t)*D + h*dh + e]     = in[(b*Hd+h)*T*dh + t*dh + e]
-// One invocation per element; D = Hd*dh.
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer buf_in {
@@ -13,32 +8,22 @@ layout(std430, binding = 1) writeonly buffer buf_out {
     float dst[];
 };
 layout(push_constant) uniform pc {
-    uint bt;        // b*T
-    uint hd;        // heads
-    uint dh;        // dim per head
-    uint seqlen;    // T
-    uint op;        // 0 pack, 1 unpack
+    uint bt;
+    uint hd;
+    uint dh;
+    uint seqlen;
+    uint op;
 };
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
     uint D = hd * dh;
-    uint n = bt * D;
-    if (i >= n) {
-        return;
-    }
-    // decode i as (row=b*T+t, c=h*dh+e) in the model layout
     uint row = i / D;
     uint c = i % D;
-    uint b = row / seqlen;
-    uint t = row % seqlen;
-    uint h = c / dh;
-    uint e = c % dh;
-    uint packed = ((b * hd + h) * seqlen + t) * dh + e;
-    uint model = i;
-    if (op == 0) {
-        dst[packed] = src[model];
-    } else {
-        dst[model] = src[packed];
+    uint packed = ((row / seqlen * hd + c / dh) * seqlen + row % seqlen) * dh + c % dh;
+    if (i < bt * D && op == 0) {
+        dst[packed] = src[i];
+    } else if (i < bt * D) {
+        dst[i] = src[packed];
     }
 }

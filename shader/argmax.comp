@@ -1,44 +1,53 @@
 #version 450
-// per-row argmax over a [rows x vocab] logits buffer: outputs the top-1 token id and
-// its logit (confidence) per row. One workgroup per row, reducing in shared memory.
-// Avoids a host loop over the 16k-wide logits (the UMA write-combined-read trap).
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer L { float logits[]; };
 layout(std430, binding = 1) writeonly buffer T { uint tok[]; };
-layout(std430, binding = 2) writeonly buffer C { float conf[]; };
-layout(push_constant) uniform pc { uint rows; uint vocab; };
+layout(push_constant) uniform pc { uint rows; uint vocab; float temp; uint seed; };
 shared float sval[256];
 shared uint sidx[256];
+
+uint hash(uint x) {
+    uint s = x * 747796405u + 2891336453u;
+    uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+float gumbel_key(float logit, uint rs, uint v) {
+    if (temp > 0.0) {
+        float u = (float(hash(rs ^ v) >> 8u) + 0.5) / 16777216.0;
+        return logit / temp - log(-log(u));
+    } else {
+        return logit;
+    }
+}
+
 void main() {
     uint row = gl_WorkGroupID.x;
-    if (row >= rows) {
-        return;
-    }
-    uint tid = gl_LocalInvocationID.x;
-    uint base = row * vocab;
-    float best = -1e30;
-    uint bi = 0;
-    for (uint v = tid; v < vocab; v += gl_WorkGroupSize.x) {
-        float x = logits[base + v];
-        if (x > best) {
-            best = x;
-            bi = v;
+    if (row < rows) {
+        uint tid = gl_LocalInvocationID.x;
+        uint base = row * vocab;
+        uint rs = hash(seed ^ hash(row));
+        float best = -1e30;
+        uint bi = 0;
+        for (uint v = tid; v < vocab; v += 256u) {
+            float key = gumbel_key(logits[base + v], rs, v);
+            if (key > best) {
+                best = key;
+                bi = v;
+            }
         }
-    }
-    sval[tid] = best;
-    sidx[tid] = bi;
-    barrier();
-    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride = stride / 2u) {
-        if (tid < stride) {
-            if (sval[tid + stride] > sval[tid]) {
+        sval[tid] = best;
+        sidx[tid] = bi;
+        barrier();
+        for (uint stride = 128u; stride > 0u; stride = stride / 2u) {
+            if (tid < stride && sval[tid + stride] > sval[tid]) {
                 sval[tid] = sval[tid + stride];
                 sidx[tid] = sidx[tid + stride];
             }
+            barrier();
         }
-        barrier();
-    }
-    if (tid == 0u) {
-        tok[row] = sidx[0];
-        conf[row] = sval[0];
+        if (tid == 0u) {
+            tok[row] = sidx[0];
+        }
     }
 }

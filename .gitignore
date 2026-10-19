@@ -4,3 +4,4 @@ models/
 *.o
 data/
 .claude
+.venv/

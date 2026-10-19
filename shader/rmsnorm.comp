@@ -1,17 +1,11 @@
 #version 450
 #extension GL_EXT_shader_atomic_float : require
-// RMSNorm over the last dim, per row. y = x / rms(x) * g, rms = sqrt(mean(x^2)+eps).
-// One workgroup per row; threads cooperate on the reduction over d.
-//   op 0: forward.   reads x[row, d], g[d]; writes y[row, d]; stashes rms in rms_buf[row].
-//   op 1: backward.  reads x, g, dy (in y buffer), rms_buf; writes dx (in x buffer)
-//         and accumulates dg (atomic add into g_grad).
-// dx_i = (g_i*dy_i)/r - (x_i/(r^3 * D)) * sum_k(x_k * g_k * dy_k)
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer buf_x {
+layout(std430, binding = 0) readonly buffer buf_x {
     float x[];
 };
-layout(std430, binding = 1) buffer buf_g {
+layout(std430, binding = 1) readonly buffer buf_g {
     float g[];
 };
 layout(std430, binding = 2) buffer buf_y {
@@ -23,6 +17,9 @@ layout(std430, binding = 3) buffer buf_rms {
 layout(std430, binding = 4) buffer buf_dg {
     float dg[];
 };
+layout(std430, binding = 5) buffer buf_dacc {
+    float dacc[];
+};
 layout(push_constant) uniform pc {
     uint rows;
     uint d;
@@ -31,8 +28,6 @@ layout(push_constant) uniform pc {
 
 shared float red[256];
 
-// ends with a barrier after every thread has read red[0], so a following reduction's
-// writes into red cannot race those reads.
 float reduce_sum(float v, uint lid) {
     red[lid] = v;
     barrier();
@@ -47,44 +42,41 @@ float reduce_sum(float v, uint lid) {
     return r;
 }
 
-void main() {
-    uint row = gl_WorkGroupID.x;
-    uint lid = gl_LocalInvocationID.x;
-    if (row >= rows) {
-        return;
-    }
-    uint base = row * d;
-
+void forward(uint row, uint lid, uint base) {
     float ss = 0.0;
     for (uint i = lid; i < d; i += 256) {
         ss += x[base + i] * x[base + i];
     }
-    ss = reduce_sum(ss, lid);
-    float r = sqrt(ss / float(d) + 1e-5);
+    float r = sqrt(reduce_sum(ss, lid) / float(d) + 1e-5);
+    if (lid == 0) {
+        rms_buf[row] = r;
+    }
+    for (uint i = lid; i < d; i += 256) {
+        y[base + i] = x[base + i] / r * g[i];
+    }
+}
 
-    if (op == 0) {
-        if (lid == 0) {
-            rms_buf[row] = r;
-        }
-        for (uint i = lid; i < d; i += 256) {
-            y[base + i] = x[base + i] / r * g[i];
-        }
-    } else {
-        r = rms_buf[row];
-        // s = sum_k x_k * g_k * dy_k
-        float s = 0.0;
-        for (uint i = lid; i < d; i += 256) {
-            s += x[base + i] * g[i] * y[base + i];
-        }
-        s = reduce_sum(s, lid);
-        for (uint i = lid; i < d; i += 256) {
-            float dyi = y[base + i];
-            float xi = x[base + i];
-            float dgi = xi / r * dyi;
-            x[base + i] = (g[i] * dyi) / r - xi / (r * r * r * float(d)) * s;
-            // accumulate dg across rows via non-atomic per-row write is unsafe;
-            // host zeroes dg and we add with atomic.
-            atomicAdd(dg[i], dgi);
-        }
+void backward(uint row, uint lid, uint base) {
+    float r = rms_buf[row];
+    float part = 0.0;
+    for (uint i = lid; i < d; i += 256) {
+        part += x[base + i] * g[i] * y[base + i];
+    }
+    float s = reduce_sum(part, lid);
+    for (uint i = lid; i < d; i += 256) {
+        float dyi = y[base + i];
+        float xi = x[base + i];
+        dacc[base + i] += (g[i] * dyi) / r - xi / (r * r * r * float(d)) * s;
+        atomicAdd(dg[i], xi / r * dyi);
+    }
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (row < rows && op == 0) {
+        forward(row, lid, row * d);
+    } else if (row < rows) {
+        backward(row, lid, row * d);
     }
 }

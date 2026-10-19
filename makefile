@@ -1,39 +1,40 @@
-# RWKV-7 + diffusion, raw Vulkan. No Python, no GGML.
-#   shader/*.comp -> build/*.spv   (glslc)
-#   src/*.c        -> build/<name>  (cc, linked against vulkan)
-# Incremental: a target rebuilds only when its sources (or vkc.h) change.
+.POSIX:
+.PHONY: all clean test
 
-CC      := cc
-CFLAGS  := -O2 -Isrc
-LDFLAGS := -lvulkan -lm
-GLSLC   := glslc --target-env=vulkan1.3
+CC = cc
+CFLAGS = -std=gnu17 -O2 -Isrc -MMD -MP
+LDLIBS = -lvulkan -lm
+GLSLC = glslc --target-env=vulkan1.3
 
-SHADERS := $(wildcard shader/*.comp)
-SPV     := $(patsubst shader/%.comp,build/%.spv,$(SHADERS))
+MODS = vkc util hash sort tokenizer vocab data model fwd bwd step ckpt
+TESTS = test_ckpt test_grad test_matmul_f16 test_tokenizer
+PROGS = bench generate probe_acts probe_coopmat probe_memory sample train train_tokenizer ${TESTS}
+KERNELS != cd shader && echo *.comp
 
-# host programs = every src/*.c with a main(). all src/*.h are shared deps.
-SRCS    := $(wildcard src/*.c)
-HDRS    := $(wildcard src/*.h)
-BINS    := $(patsubst src/%.c,build/%,$(SRCS))
+OBJS = ${MODS:%=build/obj/%.o}
+BINS = ${PROGS:%=build/%}
+SPV = ${KERNELS:%.comp=build/%.spv}
 
-.PHONY: all shaders bins clean test
-all: shaders bins
+all: ${SPV} ${BINS}
 
-shaders: $(SPV)
-bins:    $(BINS)
-
-build/%.spv: shader/%.comp | build
-	$(GLSLC) $< -o $@
-
-build/%: src/%.c $(HDRS) | build
-	$(CC) $(CFLAGS) $< $(LDFLAGS) -o $@
-
-build:
+build/%.spv: shader/%.comp
 	@mkdir -p build
+	${GLSLC} $< -o $@
 
-# run all test_* binaries (depends on shaders being built)
+build/obj/%.o: src/%.c
+	@mkdir -p build/obj
+	${CC} ${CFLAGS} -c $< -o $@
+
+build/libmda.a: ${OBJS}
+	ar -rcs $@ $^
+
+build/%: src/%.c build/libmda.a
+	${CC} ${CFLAGS} $< build/libmda.a ${LDLIBS} -o $@
+
+-include ${MODS:%=build/obj/%.d} ${PROGS:%=build/%.d}
+
 test: all
-	@for t in build/test_*; do echo "== $$t =="; $$t || exit 1; done
+	@for t in ${TESTS}; do echo $$t; build/$$t || exit 1; done
 
 clean:
 	rm -rf build

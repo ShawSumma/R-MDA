@@ -1,12 +1,5 @@
 #version 450
 #extension GL_EXT_shader_atomic_float : require
-// RWKV token-shift: mix each token with its previous token, per-channel weight.
-//   out[b, t, c] = mix[c] * x[b, t, c] + (1 - mix[c]) * x[b, t-1, c]   (x[.,-1,.] = 0)
-//   op 0 forward:  reads x, mix; writes out.
-//   op 1 backward: reads x (input, untouched), mix, dout; writes dx (separate buffer,
-//                  host-zeroed), accumulates dmix. dx and dmix use atomic add because
-//                  the previous-token term is written by two source positions.
-// One invocation per (b*t, c).
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer buf_x {
@@ -31,23 +24,26 @@ layout(push_constant) uniform pc {
     uint op;
 };
 
+float previous(uint row, uint col, uint t) {
+    if (t == 0u) {
+        return 0.0;
+    } else {
+        return x[(row - 1u) * d + col];
+    }
+}
+
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    if (idx >= bt * d) {
-        return;
-    }
     uint row = idx / d;
     uint col = idx % d;
     uint t = row % seqlen;
-    float m = mix[col];
-    float cur = x[idx];
-    float prev = (t == 0u) ? 0.0 : x[(row - 1u) * d + col];
-
-    if (op == 0) {
-        outp[idx] = m * cur + (1.0 - m) * prev;
-    } else {
+    if (idx < bt * d && op == 0) {
+        float m = mix[col];
+        outp[idx] = m * x[idx] + (1.0 - m) * previous(row, col, t);
+    } else if (idx < bt * d) {
+        float m = mix[col];
         float dout = outp[idx];
-        atomicAdd(dmix[col], (cur - prev) * dout);
+        atomicAdd(dmix[col], (x[idx] - previous(row, col, t)) * dout);
         atomicAdd(dx[idx], m * dout);
         if (t != 0u) {
             atomicAdd(dx[(row - 1u) * d + col], (1.0 - m) * dout);

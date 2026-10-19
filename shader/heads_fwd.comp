@@ -1,0 +1,61 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float K[]; };
+layout(std430, binding = 1) readonly buffer B1 { float V[]; };
+layout(std430, binding = 2) readonly buffer B2 { float R[]; };
+layout(std430, binding = 3) readonly buffer B3 { float W[]; };
+layout(std430, binding = 4) readonly buffer B4 { float A[]; };
+layout(std430, binding = 5) writeonly buffer B5 { float PK[]; };
+layout(std430, binding = 6) writeonly buffer B6 { float PV[]; };
+layout(std430, binding = 7) writeonly buffer B7 { float PR[]; };
+layout(std430, binding = 8) writeonly buffer B8 { float PW[]; };
+layout(std430, binding = 9) writeonly buffer B9 { float PA[]; };
+layout(std430, binding = 10) writeonly buffer B10 { float kinv[]; };
+layout(push_constant) uniform pc {
+    uint n_vec;
+    uint hd;
+    uint seqlen;
+};
+
+const float C = 0.60653066;
+
+shared float red[256];
+
+float group_sum(float x, uint lid) {
+    red[lid] = x;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if ((lid & 63u) < s) {
+            red[lid] += red[lid + s];
+        }
+        barrier();
+    }
+    return red[lid & ~63u];
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint vec = gl_WorkGroupID.x * 4u + (lid >> 6);
+    uint e = lid & 63u;
+    bool live = vec < n_vec;
+    uint t = vec % seqlen;
+    uint bh = vec / seqlen;
+    uint ui = ((bh / hd) * seqlen + t) * hd * 64u + (bh % hd) * 64u + e;
+    uint pi = vec * 64u + e;
+    float k = 0.0;
+    if (live) {
+        k = K[ui];
+    }
+    float scale = 1.0 / (sqrt(group_sum(k * k, lid)) + 1e-6);
+    if (live) {
+        PK[pi] = k * scale;
+        if (e == 0u) {
+            kinv[vec] = scale;
+        }
+        PV[pi] = V[ui];
+        PR[pi] = R[ui];
+        PW[pi] = exp(-C / (1.0 + exp(-W[ui])));
+        PA[pi] = 1.0 / (1.0 + exp(-A[ui]));
+    }
+}

@@ -1,150 +1,159 @@
-// generate.c -- masked-diffusion text generation by iterative denoising, and a
-// measurement of real generation cost (which is N forward passes, not one). Starts
-// from an all-masked sequence and, over N steps, predicts every masked position and
-// unmasks the highest-confidence ones (the standard confidence schedule). Fewer steps
-// = proportionally faster generation, the main inference lever for diffusion LMs.
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "vkc.h"
+#include "hash.h"
+#include "util.h"
+#include "tokenizer.h"
 #include "model.h"
 #include "fwd.h"
-#include "step.h"
-#include <time.h>
+#include "ckpt.h"
 
-static double now_sec(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec / 1e9;
+double mda_generate_repeat_rate(const uint32_t *s, uint32_t n) {
+    uint32_t rep = 0;
+    for (uint32_t i = 2; i < n; i += 1) {
+        uint32_t j = 2;
+        while (j < i && (s[j] != s[i] || s[j - 1] != s[i - 1] || s[j - 2] != s[i - 2])) {
+            j += 1;
+        }
+        if (j < i) {
+            rep += 1;
+        }
+    }
+    return (double)rep / (n - 2);
+}
+
+void mda_generate_reveal(uint32_t *ids, const uint32_t *tok, uint32_t *open, uint32_t seqlen, uint32_t mask_id, uint32_t s, uint32_t remaining, uint32_t base) {
+    uint32_t n_open = 0;
+    for (uint32_t p = 0; p < seqlen; p += 1) {
+        if (ids[p] == mask_id) {
+            open[n_open] = p;
+            n_open += 1;
+        }
+    }
+    uint32_t reveal = (n_open + remaining - 1) / remaining;
+    for (uint32_t r = 0; r < reveal; r += 1) {
+        uint32_t j = r + (uint32_t)(mda_hash_u64(MDA_HASH_GEN, s, 1 + base + r) % (n_open - r));
+        uint32_t p = open[j];
+        open[j] = open[r];
+        ids[p] = tok[p];
+    }
+}
+
+void mda_generate_weights(const uint32_t *ids, float *weight, uint32_t seqlen, uint32_t mask_id) {
+    uint32_t masked = 0;
+    for (uint32_t p = 0; p < seqlen; p += 1) {
+        masked += ids[p] == mask_id;
+    }
+    for (uint32_t p = 0; p < seqlen; p += 1) {
+        weight[p] = (float)seqlen / (float)mda_util_max_u32(masked, 1);
+    }
+}
+
+void mda_generate_print(const mda_tokenizer_t *tk, const uint32_t *ids, mda_model_cfg_t cfg, uint32_t steps, float temp, double dt) {
+    uint32_t bt = cfg.batch * cfg.seqlen;
+    printf("generated: %u steps, temp %g, %.1f ms, %.0f tok/s\n", steps, temp, dt * 1e3, bt / dt);
+    double rep = 0.0;
+    for (uint32_t b = 0; b < cfg.batch; b += 1) {
+        const uint32_t *row = ids + b * cfg.seqlen;
+        rep += mda_generate_repeat_rate(row, cfg.seqlen);
+        for (uint32_t p = 0; p < cfg.seqlen; p += 1) {
+            mda_tokenizer_entry_t *e = &tk->entries[row[p]];
+            fwrite(e->bytes, 1, e->len, stdout);
+        }
+        printf("\n---\n");
+    }
+    printf("repeated trigrams: %.1f%% of all\n", 100.0 * rep / cfg.batch);
+}
+
+bool mda_generate_run(mda_model_t *m, mda_fwd_scratch_t *sc, const mda_tokenizer_t *tk, uint32_t steps) {
+    mda_model_cfg_t cfg = m->cfg;
+    uint32_t mask_id = tk->count;
+    uint32_t *ids = sc->batch.ids;
+    for (uint32_t i = 0; i < cfg.batch * cfg.seqlen; i += 1) {
+        ids[i] = mask_id;
+    }
+    uint32_t *open = malloc(cfg.seqlen * sizeof(uint32_t));
+    double t0 = mda_util_now();
+    for (uint32_t s = 0; s < steps && m->c->fail == false; s += 1) {
+        for (uint32_t b = 0; b < cfg.batch; b += 1) {
+            mda_generate_weights(ids + b * cfg.seqlen, sc->batch.weight + b * cfg.seqlen, cfg.seqlen, mask_id);
+        }
+        sc->seed = (uint32_t)mda_hash_u64(MDA_HASH_GEN, s, 0);
+        mda_fwd_run(m, sc);
+        uint32_t *tok = sc->tok.ptr;
+        for (uint32_t b = 0; b < cfg.batch && m->c->fail == false; b += 1) {
+            mda_generate_reveal(ids + b * cfg.seqlen, tok + b * cfg.seqlen, open, cfg.seqlen, mask_id, s, steps - s, b * cfg.seqlen);
+        }
+    }
+    double dt = mda_util_now() - t0;
+    free(open);
+    if (m->c->fail) {
+        return false;
+    } else {
+        mda_generate_print(tk, ids, cfg, steps, sc->temp, dt);
+        return true;
+    }
+}
+
+bool mda_generate_scratch(mda_model_t *m, mda_fwd_scratch_t *sc, const mda_tokenizer_t *tk, const char *path, uint32_t steps) {
+    mda_ckpt_res_t loaded = mda_ckpt_load(m, mda_tokenizer_hash(tk), path, false);
+    if (loaded.ok == false) {
+        return false;
+    } else {
+        if (loaded.step == 0) {
+            fprintf(stderr, "no checkpoint: generating from the random init\n");
+        } else {
+            fprintf(stderr, "loaded checkpoint at step %u\n", loaded.step);
+        }
+        return mda_generate_run(m, sc, tk, steps);
+    }
+}
+
+bool mda_generate_model(mda_vkc_t *c, const mda_tokenizer_t *tk, const char *path, uint32_t steps, float temp) {
+    mda_model_t *m = mda_model_init(c, mda_model_cfg(tk->count));
+    if (m == NULL) {
+        return false;
+    } else {
+        m->infer = true;
+        mda_fwd_scratch_t sc = mda_fwd_alloc(m, 1);
+        sc.temp = temp;
+        if (c->fail) {
+            return false;
+        } else {
+            return mda_generate_scratch(m, &sc, tk, path, steps);
+        }
+    }
+}
+
+bool mda_generate_device(mda_vkc_t *c, const char *path, uint32_t steps, float temp) {
+    mda_tokenizer_t tk = mda_tokenizer_load(MDA_TOKENIZER_VOCAB_PATH);
+    if (tk.entries == NULL) {
+        return false;
+    } else {
+        return mda_generate_model(c, &tk, path, steps, temp);
+    }
+}
+
+bool mda_generate_main(uint32_t argc, char **argv) {
+    uint32_t steps = (uint32_t)strtoul(mda_util_arg(argc, argv, 1, "16"), NULL, 10);
+    const char *path = mda_util_arg(argc, argv, 2, MDA_CKPT_PATH);
+    float temp = strtof(mda_util_arg(argc, argv, 3, "0.8"), NULL);
+    mda_vkc_t c = mda_vkc_init();
+    if (c.fail) {
+        return false;
+    } else {
+        return mda_generate_device(&c, path, steps, temp);
+    }
 }
 
 int main(int argc, char **argv) {
-    srand(7);
-    uint32_t steps = (argc > 1) ? (uint32_t)atoi(argv[1]) : 16;
-    vkc_t c = vkc_init();
-    corpus_t cp = corpus_load("data/wiki.txt");
-    mcfg_t cfg = (mcfg_t) {
-        .d = 640,
-        .n_layer = 12,
-        .n_head = 10,
-        .seqlen = 64,
-        .batch = 8,
-        .ffn_hidden = 1728,
-        .vocab = data_vocab,
-        .vocab_in = data_vocab + 1,
-    };
-    model_t *m = model_init(&c, cfg);
-    m->infer = 1;
-    fwd_scratch_t sc = fwd_alloc(m, 1);
-    // GPU argmax over the logits each step (host loop over 16k vocab was the wall).
-    vkc_kernel_t k_argmax = vkc_load(&c, "build/argmax.spv", 3, 8);
-    uint32_t bt_all = cfg.batch * cfg.seqlen;
-    vkc_buf_t amx_tok = vkc_alloc(&c, bt_all * sizeof(uint32_t));
-    vkc_buf_t amx_conf = vkc_alloc(&c, bt_all * sizeof(float));
-    {
-        FILE *f = fopen("models/ckpt.bin", "rb");
-        if (f != NULL) {
-            uint32_t step = 0;
-            fread(&step, sizeof(uint32_t), 1, f);
-            for (uint32_t i = 0; i < m->n_params; ++i) {
-                param_t *p = &m->params[i];
-                fread(p->w.ptr, sizeof(float), p->n, f);
-                fread(p->m.ptr, sizeof(float), p->n, f);
-                fread(p->v.ptr, sizeof(float), p->n, f);
-            }
-            fclose(f);
-            fprintf(stderr, "loaded checkpoint @ step %u\n", step);
-        }
-        m->dirty16 = 1;
+    bool ok = mda_generate_main((uint32_t)argc, argv);
+    if (ok) {
+        return 0;
+    } else {
+        return 1;
     }
-
-    uint32_t seqlen = cfg.seqlen;
-    uint32_t bt = cfg.batch * seqlen;
-    uint32_t *ids = sc.ids.ptr;
-    float *weight = sc.weight.ptr;
-    // start fully masked
-    for (uint32_t i = 0; i < bt; ++i) {
-        ids[i] = data_mask_id;
-    }
-
-    uint32_t *cand_tok = malloc(seqlen * sizeof(uint32_t));
-    float *cand_conf = malloc(seqlen * sizeof(float));
-    uint32_t *masked = malloc(cfg.batch * sizeof(uint32_t));
-    double t0 = now_sec();
-    for (uint32_t s = 0; s < steps; ++s) {
-        // condition each sequence on its current mask rate t = masked / seqlen, fed
-        // through the 1/t weight like a training batch.
-        for (uint32_t b = 0; b < cfg.batch; ++b) {
-            masked[b] = 0;
-            for (uint32_t p = 0; p < seqlen; ++p) {
-                if (ids[b * seqlen + p] == data_mask_id) {
-                    masked[b] = masked[b] + 1;
-                }
-            }
-            if (masked[b] == 0) {
-                continue;
-            }
-            for (uint32_t p = 0; p < seqlen; ++p) {
-                weight[b * seqlen + p] = (float)seqlen / (float)masked[b];
-            }
-        }
-        model_forward(m, &sc);
-        // GPU argmax: per position, top-1 token + confidence (reads 16k logits on GPU).
-        argmax_pc_t argmax_push = (argmax_pc_t) {
-            .rows = bt,
-            .vocab = cfg.vocab,
-        };
-        vkc_buf_t *argmax_bufs[3] = {
-            &sc.logits_save,
-            &amx_tok,
-            &amx_conf,
-        };
-        vkc_run(&c, &k_argmax, argmax_bufs, bt, 1, 1, &argmax_push);
-        uint32_t *amtok = amx_tok.ptr;
-        float *amconf = amx_conf.ptr;
-        // argmax each masked position ONCE this step (top-1 token + its confidence),
-        // then reveal the highest-confidence ones. (Re-argmaxing per reveal was the
-        // bottleneck -- host loops over the 16k-vocab logits dominate the forwards.)
-        for (uint32_t b = 0; b < cfg.batch; ++b) {
-            if (masked[b] == 0) {
-                continue;
-            }
-            uint32_t remaining_steps = steps - s;
-            uint32_t reveal = (masked[b] + remaining_steps - 1) / remaining_steps;
-            for (uint32_t p = 0; p < seqlen; ++p) {
-                uint32_t idx = b * seqlen + p;
-                if (ids[idx] != data_mask_id) {
-                    cand_conf[p] = -1e30f;
-                    continue;
-                }
-                cand_tok[p] = amtok[idx];
-                cand_conf[p] = amconf[idx];
-            }
-            // reveal the top `reveal` positions by confidence (simple selection).
-            for (uint32_t r = 0; r < reveal; ++r) {
-                float best = -1e30f;
-                uint32_t bp = seqlen;
-                for (uint32_t p = 0; p < seqlen; ++p) {
-                    if (cand_conf[p] > best) {
-                        best = cand_conf[p];
-                        bp = p;
-                    }
-                }
-                if (bp < seqlen) {
-                    ids[b * seqlen + bp] = cand_tok[bp];
-                    cand_conf[bp] = -1e30f;
-                }
-            }
-        }
-    }
-    double dt = now_sec() - t0;
-
-    // show the first sequence as decoded text.
-    printf("=== generated (%u steps, %.1f ms, %.0f tok/s) ===\n", steps, dt * 1e3, bt / dt);
-    for (uint32_t p = 0; p < seqlen; ++p) {
-        uint32_t tok = ids[p];
-        if (tok >= cfg.vocab) {
-            continue;
-        }
-        tok_entry_t *e = &cp.tok.entries[tok];
-        fwrite(e->bytes, 1, e->len, stdout);
-    }
-    printf("\n");
-    return 0;
 }
