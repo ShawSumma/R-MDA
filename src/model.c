@@ -1,6 +1,6 @@
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "model.h"
 #include "pc.h"
@@ -11,11 +11,46 @@ mda_model_cfg_t mda_model_cfg(uint32_t vocab) {
         .d = 640,
         .n_layer = 12,
         .n_head = 10,
-        .seqlen = 64,
-        .batch = 8,
+        .seqlen = 256,
+        .batch = 2,
         .ffn_hidden = 1728,
         .vocab = vocab,
+        .block = 0,
     };
+}
+
+mda_model_cfg_t mda_model_cfg_block(mda_model_cfg_t cfg, uint32_t block) {
+    mda_model_cfg_t b = cfg;
+    b.block = block;
+    b.batch = 2 * cfg.batch;
+    return b;
+}
+
+uint32_t mda_model_block_of(const char *mode) {
+    if (strncmp(mode, "block", 5) != 0) {
+        return 0;
+    } else if (mode[5] == '\0') {
+        return MDA_MODEL_BLOCK;
+    } else {
+        return (uint32_t)strtoul(mode + 5, NULL, 10);
+    }
+}
+
+mda_model_cfg_t mda_model_cfg_mode(uint32_t vocab, const char *mode) {
+    uint32_t block = mda_model_block_of(mode);
+    if (block > 0) {
+        return mda_model_cfg_block(mda_model_cfg(vocab), block);
+    } else {
+        return mda_model_cfg(vocab);
+    }
+}
+
+uint32_t mda_model_nclean(mda_model_cfg_t cfg) {
+    if (cfg.block > 0) {
+        return cfg.batch / 2;
+    } else {
+        return 0;
+    }
 }
 
 mda_model_param_t *mda_model_param(mda_model_t *m, uint32_t rows, uint32_t cols, float init_std, float init_const, const char *name) {
@@ -104,6 +139,10 @@ bool mda_model_cfg_check(mda_model_cfg_t cfg) {
         fprintf(stderr, "config: seqlen must be a multiple of %u (%u)\n", MDA_MODEL_WKV_CHUNK, cfg.seqlen);
         bad += 1;
     }
+    if (cfg.block > 0 && (cfg.seqlen % cfg.block != 0 || cfg.block % MDA_MODEL_WKV_CHUNK != 0 || cfg.batch % 2 != 0)) {
+        fprintf(stderr, "config: block %u must divide seqlen %u, be a multiple of %u, and batch %u must be even\n", cfg.block, cfg.seqlen, MDA_MODEL_WKV_CHUNK, cfg.batch);
+        bad += 1;
+    }
     if (cfg.ffn_hidden % 64 != 0) {
         fprintf(stderr, "config: ffn_hidden must be a multiple of 64 (%u)\n", cfg.ffn_hidden);
         bad += 1;
@@ -122,9 +161,9 @@ bool mda_model_cfg_check(mda_model_cfg_t cfg) {
 void mda_model_kernels(mda_model_t *m) {
     mda_vkc_t *c = m->c;
     m->k_embed = mda_vkc_load(c, "build/embed.spv", 4, sizeof(mda_pc_emb_t));
-    m->k_tshift = mda_vkc_load(c, "build/tokenshift.spv", 5, sizeof(mda_pc_ts_t));
-    m->k_wkv_f = mda_vkc_load(c, "build/wkv7_fwd.spv", 7, sizeof(mda_pc_wkv_t));
-    m->k_wkv_b = mda_vkc_load(c, "build/wkv7_bwd.spv", 12, sizeof(mda_pc_wkv_bwd_t));
+    m->k_tshift = mda_vkc_load(c, "build/tokenshift.spv", 7, sizeof(mda_pc_ts_t));
+    m->k_wkv_f = mda_vkc_load(c, "build/wkv7_fwd.spv", 10, sizeof(mda_pc_wkv_t));
+    m->k_wkv_b = mda_vkc_load(c, "build/wkv7_bwd.spv", 13, sizeof(mda_pc_wkv_bwd_t));
     m->k_mm = mda_vkc_load(c, "build/matmul.spv", 3, sizeof(mda_pc_mm_t));
     m->k_mm16 = mda_vkc_load(c, "build/matmul_f16.spv", 4, sizeof(mda_pc_mm16_t));
     m->k_mm16w = mda_vkc_load(c, "build/matmul_f16_wide.spv", 4, sizeof(mda_pc_mm16_t));
@@ -136,6 +175,7 @@ void mda_model_kernels(mda_model_t *m) {
     m->k_rms = mda_vkc_load(c, "build/rmsnorm.spv", 6, sizeof(mda_pc_rms_t));
     m->k_ce = mda_vkc_load(c, "build/softmax_ce.spv", 6, sizeof(mda_pc_ce_t));
     m->k_argmax = mda_vkc_load(c, "build/argmax.spv", 2, sizeof(mda_pc_argmax_t));
+    m->k_softmax = mda_vkc_load(c, "build/softmax.spv", 2, sizeof(mda_pc_softmax_t));
     m->k_adamw = mda_vkc_load(c, "build/adamw.spv", 6, sizeof(mda_pc_adam_t));
     m->k_muon = mda_vkc_load(c, "build/muon.spv", 6, sizeof(mda_pc_muon_t));
     m->k_temb = mda_vkc_load(c, "build/temb.spv", 2, sizeof(mda_pc_temb_t));
@@ -153,7 +193,6 @@ void mda_model_params(mda_model_t *m) {
     uint32_t d = cfg.d;
     uint32_t hid = cfg.ffn_hidden;
     float s = 0.02f;
-    float s_out = s / sqrtf(2.0f * (float)cfg.n_layer);
     m->tok_emb = mda_model_param_mat(m, cfg.vocab, d, s, "tok_emb");
     m->tok_emb->accum = true;
     m->mask_emb = mda_model_param_accum(m, 1, d, s, 0.0f, "mask_emb");
@@ -166,13 +205,13 @@ void mda_model_params(mda_model_t *m) {
         ly->wr = mda_model_param_mat(m, d, d, s, "wr");
         ly->ww = mda_model_param_mat(m, d, d, s, "ww");
         ly->wa = mda_model_param_mat(m, d, d, s, "wa");
-        ly->wo = mda_model_param_mat(m, d, d, s_out, "wo");
+        ly->wo = mda_model_param_mat(m, d, d, s, "wo");
         ly->shift_mix = mda_model_param_accum(m, 1, d, 0.0f, 0.5f, "shift_mix");
         ly->n1 = mda_model_param_accum(m, 1, d, 0.0f, 1.0f, "n1");
         ly->n2 = mda_model_param_accum(m, 1, d, 0.0f, 1.0f, "n2");
         ly->w_gate = mda_model_param_mat(m, d, hid, s, "w_gate");
         ly->w_up = mda_model_param_mat(m, d, hid, s, "w_up");
-        ly->w_down = mda_model_param_mat(m, hid, d, s_out, "w_down");
+        ly->w_down = mda_model_param_mat(m, hid, d, s, "w_down");
         ly->ada = mda_model_param(m, d, 4 * d, 0.0f, 0.0f, "ada");
     }
 }

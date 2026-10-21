@@ -10,6 +10,7 @@
 #define MDA_MODEL_MAX_SLOTS 1024
 #define MDA_MODEL_PARAM_ALIGN 128
 #define MDA_MODEL_WKV_CHUNK 4
+#define MDA_MODEL_BLOCK 16
 
 typedef struct mda_model_cfg_t mda_model_cfg_t;
 typedef struct mda_model_param_t mda_model_param_t;
@@ -24,6 +25,7 @@ struct mda_model_cfg_t {
     uint32_t batch;
     uint32_t ffn_hidden;
     uint32_t vocab;
+    uint32_t block;
 };
 
 struct mda_model_param_t {
@@ -77,6 +79,7 @@ struct mda_model_t {
     mda_vkc_kernel_t k_rms;
     mda_vkc_kernel_t k_ce;
     mda_vkc_kernel_t k_argmax;
+    mda_vkc_kernel_t k_softmax;
     mda_vkc_kernel_t k_adamw;
     mda_vkc_kernel_t k_muon;
     mda_vkc_kernel_t k_temb;
@@ -106,9 +109,14 @@ struct mda_model_t {
     bool infer;
     bool ref32;
     bool grad_acc;
+    bool causal;
 };
 
 mda_model_cfg_t mda_model_cfg(uint32_t vocab);
+mda_model_cfg_t mda_model_cfg_block(mda_model_cfg_t cfg, uint32_t block);
+uint32_t mda_model_block_of(const char *mode);
+mda_model_cfg_t mda_model_cfg_mode(uint32_t vocab, const char *mode);
+uint32_t mda_model_nclean(mda_model_cfg_t cfg);
 mda_model_t *mda_model_init(mda_vkc_t *c, mda_model_cfg_t cfg);
 uint64_t mda_model_param_count(const mda_model_t *m);
 

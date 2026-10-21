@@ -10,6 +10,7 @@
 #include "model.h"
 
 typedef struct mda_fwd_act_t mda_fwd_act_t;
+typedef struct mda_fwd_cache_t mda_fwd_cache_t;
 typedef struct mda_fwd_opt_t mda_fwd_opt_t;
 typedef struct mda_fwd_scratch_t mda_fwd_scratch_t;
 
@@ -40,6 +41,12 @@ struct mda_fwd_act_t {
     mda_vkc_buf_t h;
 };
 
+struct mda_fwd_cache_t {
+    mda_vkc_buf_t state[2];
+    mda_vkc_buf_t carry[2];
+    uint32_t cur;
+};
+
 struct mda_fwd_opt_t {
     float lr;
     float bc1;
@@ -57,9 +64,12 @@ struct mda_fwd_scratch_t {
     mda_vkc_buf_t target;
     mda_vkc_buf_t mask;
     mda_vkc_buf_t weight;
+    mda_vkc_buf_t t;
     mda_vkc_buf_t x;
     mda_vkc_buf_t temb;
     mda_vkc_buf_t dada4;
+    mda_vkc_buf_t bstate;
+    mda_vkc_buf_t dbstate;
     mda_vkc_buf_t tmp;
     mda_vkc_buf_t tmp2;
     mda_vkc_buf_t dup;
@@ -99,6 +109,8 @@ struct mda_fwd_scratch_t {
     mda_data_batch_t batch;
     mda_fwd_act_t *acts;
     mda_vkc_buf_t *ada4;
+    mda_fwd_cache_t *cache;
+    mda_vkc_buf_t *stage;
     float temp;
     uint32_t seed;
     uint32_t a16_slot;
@@ -107,6 +119,9 @@ struct mda_fwd_scratch_t {
 };
 
 mda_fwd_scratch_t mda_fwd_alloc(mda_model_t *m, uint32_t n_acts);
+mda_fwd_cache_t mda_fwd_cache_alloc(mda_model_t *m);
+void mda_fwd_cache_reset(mda_model_t *m, mda_fwd_cache_t *cache);
+void mda_fwd_cache_commit(mda_fwd_cache_t *cache);
 void mda_fwd_vec_op(mda_model_t *m, mda_vkc_buf_t *a, mda_vkc_buf_t *b, uint32_t n, mda_pc_vec_op_t op);
 void mda_fwd_repack(mda_model_t *m, mda_vkc_buf_t *src, mda_vkc_buf_t *dst, uint32_t op);
 void mda_fwd_mm(mda_model_t *m, mda_vkc_buf_t *a, mda_vkc_buf_t *b, mda_vkc_buf_t *out, uint32_t rows, uint32_t n, uint32_t k);

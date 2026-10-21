@@ -53,10 +53,14 @@ bool mda_ckpt_write(mda_model_t *m, uint64_t vocab_hash, uint32_t step, FILE *f)
     }
 }
 
+bool mda_ckpt_same_shape(mda_model_cfg_t a, mda_model_cfg_t b) {
+    return a.d == b.d && a.n_layer == b.n_layer && a.n_head == b.n_head && a.ffn_hidden == b.ffn_hidden && a.vocab == b.vocab;
+}
+
 const char *mda_ckpt_mismatch(mda_ckpt_hdr_t h, mda_ckpt_hdr_t want, size_t got, int64_t size, VkDeviceSize bytes) {
     if (got != 1 || h.magic != want.magic) {
         return "not a checkpoint of this format";
-    } else if (memcmp(&h.cfg, &want.cfg, sizeof(mda_model_cfg_t)) != 0 || h.n_all != want.n_all) {
+    } else if (mda_ckpt_same_shape(h.cfg, want.cfg) == false || h.n_all != want.n_all) {
         return "checkpoint is for a different model config";
     } else if (h.vocab_hash != want.vocab_hash) {
         return "checkpoint was trained with a different vocab";

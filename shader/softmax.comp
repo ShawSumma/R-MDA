@@ -1,0 +1,55 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer L { float logits[]; };
+layout(std430, binding = 1) writeonly buffer P { float probs[]; };
+layout(push_constant) uniform pc { uint rows; uint vocab; float temp; };
+shared float sred[256];
+
+float reduce_max(float x, uint tid) {
+    sred[tid] = x;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride = stride / 2u) {
+        if (tid < stride) {
+            sred[tid] = max(sred[tid], sred[tid + stride]);
+        }
+        barrier();
+    }
+    float r = sred[0];
+    barrier();
+    return r;
+}
+
+float reduce_sum(float x, uint tid) {
+    sred[tid] = x;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride = stride / 2u) {
+        if (tid < stride) {
+            sred[tid] = sred[tid] + sred[tid + stride];
+        }
+        barrier();
+    }
+    float r = sred[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row < rows) {
+        uint tid = gl_LocalInvocationID.x;
+        uint base = row * vocab;
+        float mx = -1e30;
+        for (uint v = tid; v < vocab; v += 256u) {
+            mx = max(mx, logits[base + v] / temp);
+        }
+        mx = reduce_max(mx, tid);
+        float sum = 0.0;
+        for (uint v = tid; v < vocab; v += 256u) {
+            sum += exp(logits[base + v] / temp - mx);
+        }
+        float inv = 1.0 / reduce_sum(sum, tid);
+        for (uint v = tid; v < vocab; v += 256u) {
+            probs[base + v] = exp(logits[base + v] / temp - mx) * inv;
+        }
+    }
+}

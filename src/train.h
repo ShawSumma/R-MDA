@@ -14,9 +14,11 @@ typedef struct mda_train_log_t mda_train_log_t;
 
 struct mda_train_args_t {
     const char *ckpt_path;
+    const char *mode;
     float lr_peak;
     uint32_t stop;
     uint32_t accum;
+    uint32_t sched;
     bool muon;
 };
 

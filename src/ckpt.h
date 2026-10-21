@@ -7,7 +7,7 @@
 
 #include "model.h"
 
-#define MDA_CKPT_MAGIC 0x36504b4341444d52ull
+#define MDA_CKPT_MAGIC 0x37504b4341444d52ull
 #define MDA_CKPT_OVERFLOW_PATH "models/ckpt-overflow.bin"
 #define MDA_CKPT_PATH "models/ckpt.bin"
 

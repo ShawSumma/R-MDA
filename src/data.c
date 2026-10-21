@@ -253,29 +253,99 @@ size_t mda_data_split_hi(const mda_data_corpus_t *cp, mda_data_split_t split) {
     }
 }
 
-void mda_data_batch(mda_data_batch_t *b, const mda_data_corpus_t *cp, mda_data_split_t split, uint64_t key) {
+float mda_data_time(mda_data_sched_t sched, uint64_t key, uint32_t s, uint32_t batch) {
+    float u = (float)fmod(mda_hash_unit(MDA_HASH_BATCH, key, 0) + (double)s / batch, 1.0);
+    switch (sched) {
+    case MDA_DATA_SCHED_ELBO:
+        return fmaxf(u, MDA_DATA_T_EPS);
+    case MDA_DATA_SCHED_AR:
+        return 0.0f;
+    default:
+        return fminf(fmaxf(MDA_DATA_BELL_MEAN + MDA_DATA_BELL_STD * mda_hash_normal(MDA_HASH_TIME, key, s), MDA_DATA_T_EPS), 1.0f);
+    }
+}
+
+float mda_data_weight(mda_data_sched_t sched, float t) {
+    switch (sched) {
+    case MDA_DATA_SCHED_ELBO:
+        return 1.0f / t;
+    default:
+        return 1.0f;
+    }
+}
+
+uint32_t mda_data_span(mda_data_sched_t sched, uint32_t seqlen) {
+    switch (sched) {
+    case MDA_DATA_SCHED_AR:
+        return seqlen + 1;
+    default:
+        return seqlen;
+    }
+}
+
+void mda_data_masked(mda_data_batch_t *b, const mda_data_corpus_t *cp, uint64_t key, uint32_t pos, size_t at, float t) {
+    uint32_t token = cp->ids[at];
+    b->target[pos] = token;
+    if (mda_hash_unit(MDA_HASH_BATCH, key, 1 + b->batch + pos) < t) {
+        b->ids[pos] = cp->mask_id;
+        b->mask[pos] = 1.0f;
+    } else {
+        b->ids[pos] = token;
+        b->mask[pos] = 0.0f;
+    }
+}
+
+void mda_data_next(mda_data_batch_t *b, const mda_data_corpus_t *cp, uint32_t pos, size_t at) {
+    b->ids[pos] = cp->ids[at];
+    b->target[pos] = cp->ids[at + 1];
+    b->mask[pos] = 1.0f;
+}
+
+void mda_data_clean(mda_data_batch_t *b, const mda_data_corpus_t *cp, uint32_t pos, size_t at) {
+    mda_data_next(b, cp, pos, at);
+    b->weight[pos] = 1.0f;
+    b->t[pos] = 0.0f;
+}
+
+uint32_t mda_data_window(const mda_data_batch_t *b, mda_data_sched_t sched) {
+    if (b->nclean > 0) {
+        return b->seqlen + 1;
+    } else {
+        return mda_data_span(sched, b->seqlen);
+    }
+}
+
+void mda_data_batch(mda_data_batch_t *b, const mda_data_corpus_t *cp, mda_data_split_t split, mda_data_sched_t sched, uint64_t key) {
     size_t lo = mda_data_split_lo(cp, split);
     size_t hi = mda_data_split_hi(cp, split);
-    double u0 = mda_hash_unit(MDA_HASH_BATCH, key, 0);
-    for (uint32_t s = 0; s < b->batch; s += 1) {
-        size_t start = lo + (size_t)(mda_hash_u64(MDA_HASH_BATCH, key, 1 + s) % (hi - lo - b->seqlen + 1));
-        double u = fmod(u0 + (double)s / b->batch, 1.0);
-        float t = MDA_DATA_T_MIN + (1.0f - MDA_DATA_T_MIN) * (float)u;
-        float w = 1.0f / t;
+    uint32_t span = mda_data_window(b, sched);
+    uint32_t noisy = b->batch - b->nclean;
+    for (uint32_t s = 0; s < noisy; s += 1) {
+        size_t start = lo + (size_t)(mda_hash_u64(MDA_HASH_BATCH, key, 1 + s) % (hi - lo - span + 1));
+        float t = mda_data_time(sched, key, s, noisy);
+        float w = mda_data_weight(sched, t);
         for (uint32_t p = 0; p < b->seqlen; p += 1) {
-            uint32_t pos = s * b->seqlen + p;
-            uint32_t token = cp->ids[start + p];
-            b->target[pos] = token;
+            uint32_t pos = (b->nclean + s) * b->seqlen + p;
             b->weight[pos] = w;
-            if (mda_hash_unit(MDA_HASH_BATCH, key, 1 + b->batch + pos) < t) {
-                b->ids[pos] = cp->mask_id;
-                b->mask[pos] = 1.0f;
+            b->t[pos] = t;
+            if (sched == MDA_DATA_SCHED_AR) {
+                mda_data_next(b, cp, pos, start + p);
             } else {
-                b->ids[pos] = token;
-                b->mask[pos] = 0.0f;
+                mda_data_masked(b, cp, key, pos, start + p, t);
+            }
+            if (s < b->nclean) {
+                mda_data_clean(b, cp, s * b->seqlen + p, start + p);
             }
         }
     }
+}
+
+double mda_data_bytes(const mda_data_corpus_t *cp, const mda_data_batch_t *b) {
+    double bytes = 0.0;
+    for (uint32_t i = b->nclean * b->seqlen; i < b->batch * b->seqlen; i += 1) {
+        bytes += (double)cp->tok.entries[b->target[i]].len;
+    }
+    return bytes;
 }
 
 double mda_data_masked_bytes(const mda_data_corpus_t *cp, const mda_data_batch_t *b) {

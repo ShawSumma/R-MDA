@@ -11,6 +11,7 @@ enum {
     MDA_HASH_GEN,
     MDA_HASH_CORPUS,
     MDA_HASH_TEST,
+    MDA_HASH_TIME,
 };
 
 uint64_t mda_hash_mix(uint64_t x);

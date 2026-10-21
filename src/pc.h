@@ -24,6 +24,7 @@ typedef struct mda_pc_hn_t mda_pc_hn_t;
 typedef struct mda_pc_elem_t mda_pc_elem_t;
 typedef struct mda_pc_ce_t mda_pc_ce_t;
 typedef struct mda_pc_argmax_t mda_pc_argmax_t;
+typedef struct mda_pc_softmax_t mda_pc_softmax_t;
 typedef struct mda_pc_sumsq_t mda_pc_sumsq_t;
 typedef struct mda_pc_adam_t mda_pc_adam_t;
 typedef struct mda_pc_muon_t mda_pc_muon_t;
@@ -55,6 +56,9 @@ struct mda_pc_ts_t {
     uint32_t d;
     uint32_t seqlen;
     uint32_t op;
+    uint32_t blk;
+    uint32_t nclean;
+    uint32_t cache;
 };
 
 struct mda_pc_absmax_t {
@@ -108,6 +112,10 @@ struct mda_pc_wkv_t {
     uint32_t dh;
     uint32_t dir;
     uint32_t save;
+    uint32_t blk;
+    uint32_t nclean;
+    uint32_t seq0;
+    uint32_t cache;
 };
 
 struct mda_pc_wkv_bwd_t {
@@ -116,6 +124,9 @@ struct mda_pc_wkv_bwd_t {
     uint32_t t;
     uint32_t dh;
     uint32_t dir;
+    uint32_t blk;
+    uint32_t nclean;
+    uint32_t seq0;
 };
 
 struct mda_pc_vec_t {
@@ -151,6 +162,12 @@ struct mda_pc_argmax_t {
     uint32_t vocab;
     float temp;
     uint32_t seed;
+};
+
+struct mda_pc_softmax_t {
+    uint32_t rows;
+    uint32_t vocab;
+    float temp;
 };
 
 struct mda_pc_sumsq_t {

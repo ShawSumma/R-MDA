@@ -1,8 +1,8 @@
 #version 450
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer buf_w {
-    float weight[];
+layout(std430, binding = 0) readonly buffer buf_t {
+    float tt[];
 };
 layout(std430, binding = 1) writeonly buffer buf_e {
     float temb[];
@@ -19,7 +19,7 @@ void main() {
         uint b = idx / d;
         uint i = idx % d;
         uint half_d = d / 2u;
-        float t = 1.0 / weight[b * seqlen];
+        float t = tt[b * seqlen];
         float arg = 1000.0 * t * exp(-log(10000.0) * float(i % half_d) / float(half_d));
         if (i < half_d) {
             temb[idx] = sin(arg);

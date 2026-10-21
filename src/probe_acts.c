@@ -44,7 +44,7 @@ uint32_t mda_probe_acts_bad16(mda_vkc_t *c, mda_vkc_buf_t *b, uint32_t n, mda_vk
 uint32_t mda_probe_acts_first(mda_step_trainer_t *tr, const mda_data_corpus_t *cp, uint32_t batches) {
     uint32_t first = 0;
     for (uint32_t i = 1; i <= batches && first == 0 && tr->m->c->fail == false; i += 1) {
-        mda_data_batch(&tr->sc.batch, cp, MDA_DATA_SPLIT_TRAIN, i);
+        mda_data_batch(&tr->sc.batch, cp, MDA_DATA_SPLIT_TRAIN, MDA_DATA_SCHED_BELL, i);
         float loss = mda_fwd_run(tr->m, &tr->sc);
         if (tr->m->c->fail == false && isfinite(loss) == 0) {
             first = i;

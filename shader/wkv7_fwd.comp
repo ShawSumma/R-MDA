@@ -11,8 +11,11 @@ layout(std430,binding=3) readonly  buffer BW { float W[]; };
 layout(std430,binding=4) readonly  buffer BA { float A[]; };
 layout(std430,binding=5) writeonly buffer BO { float O[]; };
 layout(std430,binding=6) writeonly buffer BS { float16_t Sout[]; };
+layout(std430,binding=7) buffer BB { float Bst[]; };
+layout(std430,binding=8) readonly buffer BCI { float Cin[]; };
+layout(std430,binding=9) writeonly buffer BCO { float Cout[]; };
 
-layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir, save; };
+layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir, save, blk, nclean, seq0, cache; };
 
 shared float kk[64], vv[64], rr[64], ww[64], aa[64];
 shared float p0[256], p1[256];
@@ -25,20 +28,51 @@ uint step_t(uint ti) {
     }
 }
 
+uint block_slot(uint seq, uint h, uint t) {
+    uint c = seq;
+    if (seq >= nclean) {
+        c = seq - nclean;
+    }
+    return ((c*Hd + h)*(T/blk) + t/blk)*4096u;
+}
+
 void run(uint bh) {
     uint lid = gl_LocalInvocationID.x;
     uint g = lid >> 6;
     uint e = lid & 63u;
     uint base = bh*T*64u;
+    uint seq = bh / Hd;
+    uint h = bh % Hd;
+    bool blocked = blk > 0u;
+    bool noisy = blocked && seq >= nclean;
+    bool clean = blocked && seq < nclean;
+
+    bool cached = cache == 1u && clean && dir == 0u;
+    uint cslot = (seq*Hd + h)*4096u + lid;
 
     float S[16];
     for (uint q = 0; q < 16u; q += 1u) S[q] = 0.0;
+    if (cached) {
+        for (uint q = 0; q < 16u; q += 1u) S[q] = Cin[cslot + q*256u];
+    }
 
     for (uint ti = 0; ti < T; ti += 1u) {
-        uint row = base + step_t(ti)*64u;
+        uint t = step_t(ti);
+        uint row = base + t*64u;
         if (lid < 64u) {
             kk[lid] = K[row+lid]; vv[lid] = V[row+lid];
             rr[lid] = R[row+lid]; ww[lid] = W[row+lid]; aa[lid] = A[row+lid];
+        }
+        if (noisy && ti % blk == 0u && dir == 0u) {
+            uint sb = block_slot(seq, h, t) + lid;
+            for (uint q = 0; q < 16u; q += 1u) S[q] = Bst[sb + q*256u];
+        }
+        if (noisy && ti % blk == 0u && dir == 1u) {
+            for (uint q = 0; q < 16u; q += 1u) S[q] = 0.0;
+        }
+        if (clean && ti % blk == 0u) {
+            uint sb = block_slot(seq, h, t) + lid;
+            for (uint q = 0; q < 16u; q += 1u) Bst[sb + q*256u] = S[q];
         }
         barrier();
         if (save == 1u && (ti % CH) == 0u) {
@@ -60,10 +94,13 @@ void run(uint bh) {
         barrier();
         if (lid < 64u) O[row+lid] = p1[lid] + p1[64u+lid] + p1[128u+lid] + p1[192u+lid];
     }
+    if (cached) {
+        for (uint q = 0; q < 16u; q += 1u) Cout[cslot + q*256u] = S[q];
+    }
 }
 
 void main(){
-    uint bh = gl_WorkGroupID.x;
+    uint bh = seq0*Hd + gl_WorkGroupID.x;
     if (bh < Bsz*Hd) {
         run(bh);
     }

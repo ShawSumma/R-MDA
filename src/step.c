@@ -70,60 +70,18 @@ void mda_step_ffn_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *
     mda_step_rmsnorm_bwd(m, &a->x_mid, &ly->n2->w, &sc->dtmp, &a->rms2, &ly->n2->g, &sc->dxh_buf, bt, d);
 }
 
-void mda_step_wkv_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a) {
-    mda_model_cfg_t cfg = m->cfg;
-    mda_pc_wkv_bwd_t pc = {
-        .bsz = cfg.batch,
-        .hd = cfg.n_head,
-        .t = cfg.seqlen,
-        .dh = cfg.d / cfg.n_head,
-        .dir = 0,
-    };
-    mda_vkc_buf_t *bufs[12] = {
-        &a->pk,
-        &a->pv,
-        &a->pr,
-        &a->pw,
-        &a->pa,
-        &a->sstate,
-        &sc->dwkv,
-        &sc->dpk,
-        &sc->dpv,
-        &sc->dpr,
-        &sc->dpw,
-        &sc->dpa,
-    };
-    mda_vkc_set_nobar(m->c, true);
-    mda_vkc_run(m->c, &m->k_wkv_b, bufs, cfg.batch * cfg.n_head, 1, 1, &pc);
-    mda_vkc_set_nobar(m->c, false);
-    mda_pc_wkv_bwd_t pc2 = pc;
-    pc2.dir = 1;
-    mda_vkc_buf_t *bufs2[12] = {
-        &a->pk,
-        &a->pv,
-        &a->pr,
-        &a->pw,
-        &a->pa,
-        &a->sstate2,
-        &sc->dwkv,
-        &sc->dpk2,
-        &sc->dpv2,
-        &sc->dpr2,
-        &sc->dpw2,
-        &sc->dpa2,
-    };
-    mda_vkc_run(m->c, &m->k_wkv_b, bufs2, cfg.batch * cfg.n_head, 1, 1, &pc2);
+void mda_step_heads_run(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a, mda_vkc_buf_t **d2) {
     mda_vkc_buf_t *hb[19] = {
         &sc->dpk,
         &sc->dpv,
         &sc->dpr,
         &sc->dpw,
         &sc->dpa,
-        &sc->dpk2,
-        &sc->dpv2,
-        &sc->dpr2,
-        &sc->dpw2,
-        &sc->dpa2,
+        d2[0],
+        d2[1],
+        d2[2],
+        d2[3],
+        d2[4],
         &a->pk,
         &a->kinv,
         &a->pw,
@@ -135,6 +93,124 @@ void mda_step_wkv_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a) {
         &sc->pa,
     };
     mda_fwd_heads(m, &m->k_heads_b, hb);
+}
+
+void mda_step_heads_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a) {
+    mda_vkc_buf_t *own[5] = {
+        &sc->dpk,
+        &sc->dpv,
+        &sc->dpr,
+        &sc->dpw,
+        &sc->dpa,
+    };
+    mda_vkc_buf_t *other[5] = {
+        &sc->dpk2,
+        &sc->dpv2,
+        &sc->dpr2,
+        &sc->dpw2,
+        &sc->dpa2,
+    };
+    if (m->causal) {
+        mda_step_heads_run(m, sc, a, own);
+    } else {
+        mda_step_heads_run(m, sc, a, other);
+    }
+}
+
+void mda_step_wkv_bwd_run(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a, uint32_t dir, uint32_t seq0, uint32_t count) {
+    mda_model_cfg_t cfg = m->cfg;
+    mda_pc_wkv_bwd_t pc = {
+        .bsz = cfg.batch,
+        .hd = cfg.n_head,
+        .t = cfg.seqlen,
+        .dh = cfg.d / cfg.n_head,
+        .dir = dir,
+        .blk = cfg.block,
+        .nclean = mda_model_nclean(cfg),
+        .seq0 = seq0,
+    };
+    mda_vkc_buf_t *fwd0[6] = {
+        &a->sstate,
+        &sc->dpk,
+        &sc->dpv,
+        &sc->dpr,
+        &sc->dpw,
+        &sc->dpa,
+    };
+    mda_vkc_buf_t *fwd1[6] = {
+        &a->sstate2,
+        &sc->dpk2,
+        &sc->dpv2,
+        &sc->dpr2,
+        &sc->dpw2,
+        &sc->dpa2,
+    };
+    mda_vkc_buf_t **d = fwd0;
+    if (dir == 1) {
+        d = fwd1;
+    }
+    mda_vkc_buf_t *bufs[13] = {
+        &a->pk,
+        &a->pv,
+        &a->pr,
+        &a->pw,
+        &a->pa,
+        d[0],
+        &sc->dwkv,
+        d[1],
+        d[2],
+        d[3],
+        d[4],
+        d[5],
+        &sc->dbstate,
+    };
+    mda_vkc_run(m->c, &m->k_wkv_b, bufs, count * cfg.n_head, 1, 1, &pc);
+}
+
+void mda_step_wkv_bwd_blocks(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a) {
+    mda_model_cfg_t cfg = m->cfg;
+    uint32_t nclean = mda_model_nclean(cfg);
+    uint32_t n = nclean * cfg.seqlen * cfg.d;
+    mda_vkc_set_nobar(m->c, true);
+    mda_step_wkv_bwd_run(m, sc, a, 0, nclean, nclean);
+    mda_vkc_set_nobar(m->c, false);
+    mda_step_wkv_bwd_run(m, sc, a, 1, nclean, nclean);
+    mda_step_wkv_bwd_run(m, sc, a, 0, 0, nclean);
+    mda_vkc_buf_t *from[5] = {
+        &sc->dpk,
+        &sc->dpv,
+        &sc->dpr,
+        &sc->dpw,
+        &sc->dpa,
+    };
+    mda_vkc_buf_t *to[5] = {
+        &sc->dpk2,
+        &sc->dpv2,
+        &sc->dpr2,
+        &sc->dpw2,
+        &sc->dpa2,
+    };
+    for (uint32_t i = 0; i < 5; i += 1) {
+        mda_vkc_buf_t src = mda_vkc_view(from[i], 0, (VkDeviceSize)n * sizeof(float));
+        mda_vkc_buf_t dst = mda_vkc_view(to[i], 0, (VkDeviceSize)n * sizeof(float));
+        mda_vkc_set_nobar(m->c, i + 1 < 5);
+        mda_fwd_vec_op(m, &dst, &src, n, MDA_PC_VEC_COPY);
+    }
+}
+
+void mda_step_wkv_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a) {
+    mda_model_cfg_t cfg = m->cfg;
+    if (m->causal) {
+        mda_step_wkv_bwd_run(m, sc, a, 0, 0, cfg.batch);
+    } else if (cfg.block > 0) {
+        mda_step_wkv_bwd_blocks(m, sc, a);
+    } else {
+        mda_vkc_set_nobar(m->c, true);
+        mda_step_wkv_bwd_run(m, sc, a, 0, 0, cfg.batch);
+        mda_vkc_set_nobar(m->c, false);
+        mda_step_wkv_bwd_run(m, sc, a, 1, 0, cfg.batch);
+    }
+    mda_step_heads_bwd(m, sc, a);
 }
 
 void mda_step_time_mix_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly, mda_fwd_act_t *a, mda_vkc_buf_t *ada4) {
@@ -172,13 +248,17 @@ void mda_step_time_mix_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_laye
         .d = d,
         .seqlen = cfg.seqlen,
         .op = 1,
+        .blk = cfg.block,
+        .nclean = mda_model_nclean(cfg),
     };
-    mda_vkc_buf_t *bufs[5] = {
+    mda_vkc_buf_t *bufs[7] = {
         &a->n1,
         &ly->shift_mix->w,
         &sc->dnorm,
         &sc->dtmp,
         &ly->shift_mix->g,
+        &sc->dg_dummy,
+        &sc->dg_dummy,
     };
     mda_vkc_run(m->c, &m->k_tshift, bufs, (bt * d + 255) / 256, 1, 1, &pc);
     mda_fwd_adaln(m, &a->n1_pre, ada4, &sc->dtmp, &sc->dh, &sc->dada4, 1, 0);

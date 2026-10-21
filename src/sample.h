@@ -3,13 +3,17 @@
 
 #include <stdint.h>
 
-#define MDA_SAMPLE_BATCHES 128
+#define MDA_SAMPLE_BATCHES 512
 
 typedef struct mda_sample_stats_t mda_sample_stats_t;
 
 struct mda_sample_stats_t {
     double ce;
     double bytes;
+    double nelbo;
+    double all_bytes;
+    double ar_nll;
+    double ar_bytes;
     double masked;
     uint32_t bucket_correct[3];
     uint32_t bucket_total[3];
