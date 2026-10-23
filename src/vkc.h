@@ -31,6 +31,7 @@ struct mda_vkc_t {
     const char **qname;
     const char *prof_name[MDA_VKC_MAX_LABELS];
     double prof_ms[MDA_VKC_MAX_LABELS];
+    VkDeviceSize dev_bytes;
     uint32_t prof_count[MDA_VKC_MAX_LABELS];
     uint32_t max_groups[3];
     uint32_t qfi;
@@ -91,6 +92,8 @@ void mda_vkc_submit(mda_vkc_t *c, mda_vkc_cmd_t *cmd);
 void mda_vkc_run(mda_vkc_t *c, mda_vkc_kernel_t *k, mda_vkc_buf_t **bufs, uint32_t gx, uint32_t gy, uint32_t gz, void *push);
 void mda_vkc_copy(mda_vkc_t *c, mda_vkc_buf_t *dst, mda_vkc_buf_t *src, VkDeviceSize sz);
 void mda_vkc_fill(mda_vkc_t *c, mda_vkc_buf_t *b, uint32_t word);
+void *mda_vkc_read(mda_vkc_t *c, mda_vkc_buf_t *b);
+void mda_vkc_write(mda_vkc_t *c, mda_vkc_buf_t *b, const void *src);
 void mda_vkc_set_nobar(mda_vkc_t *c, bool on);
 
 #endif

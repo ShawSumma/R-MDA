@@ -149,7 +149,7 @@ bool mda_train_trainer(mda_step_trainer_t *tr, const mda_data_corpus_t *cp, mda_
     if (tr->m->c->fail) {
         return false;
     } else {
-        fprintf(stderr, "params %.2f M, d=%u L=%u H=%u seq=%u batch=%u accum=%u muon=%u\n", (double)mda_model_param_count(tr->m) / 1e6, cfg.d, cfg.n_layer, cfg.n_head, cfg.seqlen, cfg.batch, tr->accum, tr->muon);
+        fprintf(stderr, "params %.2f M, d=%u L=%u H=%u seq=%u batch=%u accum=%u muon=%u, %.2f GB of GPU memory\n", (double)mda_model_param_count(tr->m) / 1e6, cfg.d, cfg.n_layer, cfg.n_head, cfg.seqlen, cfg.batch, tr->accum, tr->muon, (double)tr->m->c->dev_bytes / 1e9);
         return mda_train_resume(tr, cp, args);
     }
 }

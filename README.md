@@ -16,10 +16,10 @@ The default model has about 80M parameters. It has width 640, 12 layers, 10 head
 
 - Linux or another POSIX system.
 - A C compiler, `make`, the Vulkan headers and loader, and `glslc`.
-- Python 3 with `pyarrow`, to download the corpus. The examples below assume a virtual environment in `.venv`.
+- Python 3 with `pyarrow`, to download the corpus.
 - A GPU with Vulkan 1.3, `VK_KHR_cooperative_matrix` with 16 by 16 by 16 fp16 tiles and fp32 accumulation, `VK_EXT_shader_atomic_float`, fp16 storage and arithmetic, and a subgroup size of 32 in compute shaders.
 
-All buffers are allocated in memory that is both device-local and host-visible. On a discrete GPU this needs Resizable BAR enabled. If a device is unsuitable, the programs print the reason at startup. `build/probe_coopmat` and `build/probe_memory` show what a device supports.
+It has been tested on an AMD Radeon 8060S (Ryzen AI Max) with Mesa's RADV driver. NVIDIA RTX 20-series and newer, and AMD RDNA3 and newer with RADV from Mesa 23.3 on, have the cooperative-matrix support but are untested. AMD RDNA2 and older have none. If a device is unsuitable, the programs print the reason at startup. `build/probe_coopmat` and `build/probe_memory` show what a device supports.
 
 ## Building
 
@@ -33,6 +33,8 @@ make test
 ## Getting started
 
 ```sh
+python3 -m venv .venv
+.venv/bin/pip install pyarrow
 .venv/bin/python3 tools/fetch_corpus.py --shards 1
 mkdir -p models
 build/train_tokenizer
@@ -41,12 +43,13 @@ build/sample models/ckpt.bin diffusion
 build/generate 64 models/ckpt.bin 0.8 diffusion
 ```
 
-1. Download one FineWeb-Edu shard and write its text to `data/corpus.txt`.
-2. Create `models/`, which holds the tokenizer and checkpoints.
-3. Build the tokenizer in `models/vocab.txt`.
-4. Train a diffusion model for 20,000 steps. The first run tokenizes the corpus and caches the token ids in `data/corpus.txt.ids`.
-5. Evaluate on held-out text.
-6. Generate samples with 64 denoising steps at temperature 0.8.
+1. Create a Python environment with `pyarrow` in `.venv`.
+2. Download one FineWeb-Edu shard and write its text to `data/corpus.txt`.
+3. Create `models/`, which holds the tokenizer and checkpoints.
+4. Build the tokenizer in `models/vocab.txt`.
+5. Train a diffusion model for 20,000 steps. The first run tokenizes the corpus and caches the token ids in `data/corpus.txt.ids`.
+6. Evaluate on held-out text.
+7. Generate samples with 64 denoising steps at temperature 0.8.
 
 The other modes:
 
@@ -66,7 +69,7 @@ build/generate 64 models/ckpt.bin 0.8 diffusion models/ar.bin
 
 ## Programs
 
-All arguments are positional. To set one, give all the ones before it.
+All arguments are positional. To set one, give all the ones before it. A checkpoint does not record whether it was trained as `diffusion`, `block` or `ar`, so every program loads it in whatever mode it is given. A mode that differs from the training mode gives poor results but no error.
 
 ### build/train
 
@@ -77,14 +80,16 @@ build/train [lr] [ckpt] [stop] [accum] [opt] [mode] [batch]
 | Argument | Default | Meaning |
 |---|---|---|
 | `lr` | `3e-4` | Peak learning rate. |
-| `ckpt` | `models/ckpt.bin` | Checkpoint file. Training resumes from it if it exists. |
+| `ckpt` | `models/ckpt.bin` | Checkpoint file. If it exists, training resumes from it with the arguments given now, so a new run needs a new path. |
 | `stop` | `0` | Last step. `0` trains until stopped. |
 | `accum` | `2` | Micro-batches per step. |
 | `opt` | `muon` | `muon`, or `adamw` to use Adam for everything. |
 | `mode` | `diffusion` | `diffusion`, `block` (16-token blocks), `blockN`, or `ar`. `N` must divide 256 and be a multiple of 4. |
 | `batch` | `8` | Sequences per micro-batch. Block mode doubles the rows. |
 
-Every 5 steps, `train` prints the loss, bits per byte, gradient norm, clip and skip counts, and seconds per step. It saves a checkpoint every 2 minutes. If 100 steps in a row overflow fp16, it saves the weights to `models/ckpt-overflow.bin` and stops.
+At startup, `train` prints the model size and how much GPU memory it allocated. Every 5 steps, it prints the loss, bits per byte, gradient norm, clip and skip counts, and seconds per step. It saves a checkpoint every 2 minutes and at the last step. A run can be stopped at any time and resumed on any machine, since batches depend only on the step number.
+
+If 100 steps in a row overflow fp16, `train` saves the weights to `models/ckpt-overflow.bin` and stops. `build/probe_acts` shows which layer overflowed. Skipped steps leave the weights unchanged, so the regular checkpoint is still usable. Resuming it with a lower learning rate is the usual next step.
 
 ### build/sample
 
@@ -92,7 +97,7 @@ Every 5 steps, `train` prints the loss, bits per byte, gradient norm, clip and s
 build/sample [ckpt] [mode]
 ```
 
-`sample` evaluates 512 held-out batches. The mode should match the one used for training. It reports:
+`sample` evaluates 512 held-out batches in the given mode, which should be the training mode. It reports:
 
 - The negative ELBO in bits per byte, which is an upper bound on the negative log-likelihood.
 - Masked-token bits per byte, and accuracy at low, medium and high mask rates.
@@ -108,11 +113,11 @@ build/generate [steps] [ckpt] [temp] [mode] [judge] [policy]
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `steps` | `16` | Denoising passes, over the whole sequence in `diffusion` mode or per block in block mode. |
+| `steps` | `16` | Denoising passes, over the whole sequence in `diffusion` mode or per block in block mode. `ar` and `specK` ignore it, but it must still be given to reach the later arguments. |
 | `ckpt` | `models/ckpt.bin` | Checkpoint to sample from. |
 | `temp` | `0.8` | Sampling temperature. `0` is greedy. |
 | `mode` | `diffusion` | `diffusion`, `block`, `blockN`, or `ar`. |
-| `judge` | none | Checkpoint of an `ar` model used to score the samples. |
+| `judge` | none | Checkpoint of an `ar` model, or of a block model (its unmasked side is one), used to score the samples. `""` means none, to reach `policy` without a judge. |
 | `policy` | `random` | `random`, `ltr`, `remdmE`, or `specK`. |
 
 The policies:
@@ -136,7 +141,7 @@ In `ar` mode, `generate` samples one token per forward pass and ignores the poli
 
 ### Other programs
 
-- `build/bench [opt] [batch] [mode]` times each matmul shape, the forward pass, the backward pass and a full step. It also prints GPU time per kernel and compares cached and uncached block decoding. The defaults are `adamw 2 diffusion`. It needs no data.
+- `build/bench [opt] [batch] [mode]` prints how much GPU memory training with those settings allocates. It times each matmul shape, the forward pass, the backward pass and a step of one micro-batch, prints GPU time per kernel, and compares cached and uncached block decoding. The defaults, `muon 8 diffusion`, are `train`'s. It needs no data.
 - `build/probe_acts [ckpt] [batches]` finds the first batch whose fp16 loss is not finite and prints the largest activation in each layer. The defaults are `models/ckpt-overflow.bin 500`.
 - `build/probe_coopmat` lists the cooperative-matrix shapes the driver supports.
 - `build/probe_memory` lists the memory types and measures their bandwidth.
@@ -145,6 +150,8 @@ In `ar` mode, `generate` samples one token per forward pass and ignores the poli
 
 - `tools/fetch_corpus.py [--shards N]` downloads 1 to 14 FineWeb-Edu shards to `data/fineweb-edu/` and writes their text to `data/corpus.txt`. Interrupted downloads resume. Retrain the tokenizer after changing the corpus.
 - `tools/logstat.py LOG... [--last N] [--end STEP]` averages the logged loss and bits per byte over the last `N` steps of each training log, 2000 by default. Runs draw the same batches at the same step, so this compares runs on identical data. To get a log, redirect the output of `build/train` to a file.
+- `tools/sweep.py NAME STOP ACCUM OPT MODE BATCH --lr LR...` trains one run per learning rate with the other settings shared, writing `models/NAME-LR.bin` and its log `models/NAME-LR.log`, then compares the runs with `logstat.py`.
+- `tools/strip_ckpt.py SRC DST` copies a checkpoint without its optimizer state, a third of the size. `sample` and `generate` load the copy; `train` cannot resume from it.
 - `tools/fold_ada.py SRC DST` converts a checkpoint from the older format, in which each layer's scale and shift came from a time-conditioned matrix, to the current one.
 
 ## How it works
@@ -201,7 +208,7 @@ Speculative decoding does two jobs in one forward pass. The unmasked rows hold t
 
 - `test_grad` checks every parameter's gradient against finite differences, fp16 gradients against fp32, and both optimizers against host implementations. It also checks overflow handling, that a block cannot see later blocks, and that cached block decoding gives the same losses as the full sequence.
 - `test_matmul_f16` checks the fp16 matmul kernels against an fp32 kernel.
-- `test_ckpt` checks that a checkpoint saves and loads unchanged.
+- `test_ckpt` checks that a checkpoint saves and loads unchanged, and that a weights-only copy loads but cannot be resumed.
 - `test_tokenizer` checks that the vocabulary file saves and loads unchanged, and that encoded text decodes back exactly.
 
 ## Layout

@@ -232,8 +232,9 @@ bool mda_bench_device(mda_vkc_t *c, bool muon, uint32_t batch, const char *mode)
     if (m == NULL) {
         return false;
     } else {
-        mda_bench_matmuls(m);
         mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, muon);
+        printf("training uses %.2f GB of GPU memory\n", (double)c->dev_bytes / 1e9);
+        mda_bench_matmuls(m);
         if (c->fail) {
             return false;
         } else if (mda_bench_trainer(&tr)) {
@@ -245,8 +246,8 @@ bool mda_bench_device(mda_vkc_t *c, bool muon, uint32_t batch, const char *mode)
 }
 
 bool mda_bench_main(uint32_t argc, char **argv) {
-    bool muon = strcmp(mda_util_arg(argc, argv, 1, "adamw"), "muon") == 0;
-    uint32_t batch = (uint32_t)strtoul(mda_util_arg(argc, argv, 2, "2"), NULL, 10);
+    bool muon = strcmp(mda_util_arg(argc, argv, 1, "muon"), "muon") == 0;
+    uint32_t batch = (uint32_t)strtoul(mda_util_arg(argc, argv, 2, "8"), NULL, 10);
     const char *mode = mda_util_arg(argc, argv, 3, "diffusion");
     mda_vkc_t c = mda_vkc_init();
     if (c.fail) {

@@ -138,8 +138,8 @@ const char *mda_vkc_missing_feature(VkInstance inst, VkPhysicalDevice pd) {
         return "no 16x16x16 f16 cooperative matrix";
     } else if (mda_vkc_compute_family(pd) == MDA_VKC_NO_FAMILY) {
         return "no compute queue";
-    } else if (mda_vkc_memtype(pd, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) < 0 || mda_vkc_memtype(pd, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) < 0) {
-        return "no host-visible device-local or host-cached memory";
+    } else if (mda_vkc_memtype(pd, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) < 0 || mda_vkc_memtype(pd, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) < 0) {
+        return "no device-local or host-cached memory";
     } else {
         return NULL;
     }
@@ -230,7 +230,7 @@ mda_vkc_t mda_vkc_init_device(mda_vkc_t c) {
         c.max_groups[i] = pr.limits.maxComputeWorkGroupCount[i];
     }
     c.ts_period = pr.limits.timestampPeriod;
-    c.mem_dev = (uint32_t)mda_vkc_memtype(c.pd, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    c.mem_dev = (uint32_t)mda_vkc_memtype(c.pd, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     c.mem_cached = (uint32_t)mda_vkc_memtype(c.pd, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
     c.qfi = mda_vkc_compute_family(c.pd);
     float pri = 1.0f;
@@ -362,6 +362,7 @@ mda_vkc_buf_t mda_vkc_alloc_type(mda_vkc_t *c, VkDeviceSize sz, uint32_t type) {
 }
 
 mda_vkc_buf_t mda_vkc_alloc(mda_vkc_t *c, VkDeviceSize sz) {
+    c->dev_bytes += sz;
     return mda_vkc_alloc_type(c, sz, c->mem_dev);
 }
 
@@ -796,6 +797,26 @@ void mda_vkc_fill(mda_vkc_t *c, mda_vkc_buf_t *b, uint32_t word) {
         vkCmdFillBuffer(c->rec, b->buf, b->off, b->sz, word);
         mda_vkc_finish(c, oneshot, "fill");
     }
+}
+
+void *mda_vkc_read(mda_vkc_t *c, mda_vkc_buf_t *b) {
+    mda_vkc_buf_t stage = mda_vkc_alloc_cached(c, b->sz);
+    void *host = malloc(b->sz);
+    mda_vkc_copy(c, &stage, b, b->sz);
+    if (c->fail == false) {
+        memcpy(host, stage.ptr, b->sz);
+    }
+    mda_vkc_free(c, &stage);
+    return host;
+}
+
+void mda_vkc_write(mda_vkc_t *c, mda_vkc_buf_t *b, const void *src) {
+    mda_vkc_buf_t stage = mda_vkc_alloc_cached(c, b->sz);
+    if (c->fail == false) {
+        memcpy(stage.ptr, src, b->sz);
+    }
+    mda_vkc_copy(c, b, &stage, b->sz);
+    mda_vkc_free(c, &stage);
 }
 
 void mda_vkc_set_nobar(mda_vkc_t *c, bool on) {

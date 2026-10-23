@@ -19,28 +19,32 @@ float mda_test_grad_loss(mda_model_t *m, mda_fwd_scratch_t *sc) {
 }
 
 double mda_test_grad_fd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_param_t *p, const float *u, float eps) {
-    float *w = p->w.ptr;
-    float *w0 = malloc(p->n * sizeof(float));
-    memcpy(w0, w, p->n * sizeof(float));
+    float *w0 = mda_vkc_read(m->c, &p->w);
+    float *w = malloc(p->n * sizeof(float));
     for (uint32_t j = 0; j < p->n; j += 1) {
         w[j] = w0[j] + eps * u[j];
     }
+    mda_vkc_write(m->c, &p->w, w);
     float lp = mda_test_grad_loss(m, sc);
     for (uint32_t j = 0; j < p->n; j += 1) {
         w[j] = w0[j] - eps * u[j];
     }
+    mda_vkc_write(m->c, &p->w, w);
     float lm = mda_test_grad_loss(m, sc);
-    memcpy(w, w0, p->n * sizeof(float));
+    mda_vkc_write(m->c, &p->w, w0);
     m->dirty16 = true;
+    free(w);
     free(w0);
     return ((double)lp - (double)lm) / (2.0 * eps);
 }
 
-void mda_test_grad_jitter(mda_model_param_t *p, float amount) {
-    float *w = p->w.ptr;
+void mda_test_grad_jitter(mda_vkc_t *c, mda_model_param_t *p, float amount) {
+    float *w = mda_vkc_read(c, &p->w);
     for (uint32_t j = 0; j < p->n; j += 1) {
         w[j] += amount * ((float)mda_hash_unit(MDA_HASH_TEST, p->off, j) - 0.5f);
     }
+    mda_vkc_write(c, &p->w, w);
+    free(w);
 }
 
 double mda_test_grad_ratio(double num, double den) {
@@ -71,30 +75,31 @@ void mda_test_grad_perturb(mda_model_t *m) {
     for (uint32_t i = 0; i < m->n_params; i += 1) {
         mda_model_param_t *p = &m->params[i];
         if (p->n >= m->cfg.d * m->cfg.d) {
-            float *w = p->w.ptr;
+            float *w = malloc(p->n * sizeof(float));
             for (uint32_t j = 0; j < p->n; j += 1) {
                 w[j] = 0.1f * mda_hash_normal(MDA_HASH_TEST, p->off, j);
             }
+            mda_vkc_write(m->c, &p->w, w);
+            free(w);
         }
     }
     for (uint32_t l = 0; l < m->cfg.n_layer; l += 1) {
         mda_model_layer_t *ly = &m->layers[l];
-        mda_test_grad_jitter(ly->n1, 0.2f);
-        mda_test_grad_jitter(ly->n2, 0.2f);
-        mda_test_grad_jitter(ly->shift_mix, 0.4f);
-        mda_test_grad_jitter(ly->ada, 0.004f);
+        mda_test_grad_jitter(m->c, ly->n1, 0.2f);
+        mda_test_grad_jitter(m->c, ly->n2, 0.2f);
+        mda_test_grad_jitter(m->c, ly->shift_mix, 0.4f);
+        mda_test_grad_jitter(m->c, ly->ada, 0.004f);
     }
-    mda_test_grad_jitter(m->n_out, 0.2f);
+    mda_test_grad_jitter(m->c, m->n_out, 0.2f);
 }
 
 uint32_t mda_test_grad_fp16(mda_step_trainer_t *tr) {
     mda_model_t *m = tr->m;
-    float *g16 = malloc(m->n_all * sizeof(float));
     mda_step_grad(tr);
-    memcpy(g16, m->g_all.ptr, m->n_all * sizeof(float));
+    float *g16 = mda_vkc_read(m->c, &m->g_all);
     m->ref32 = true;
     mda_step_grad(tr);
-    float *g32 = m->g_all.ptr;
+    float *g32 = mda_vkc_read(m->c, &m->g_all);
     uint32_t fails = 0;
     for (uint32_t i = 0; i < m->n_params; i += 1) {
         mda_model_param_t *p = &m->params[i];
@@ -113,6 +118,7 @@ uint32_t mda_test_grad_fp16(mda_step_trainer_t *tr) {
         printf("%u %s fp16 vs fp32 grad: rel err %.4f %s\n", i, p->name, rel, mda_util_verdict(pass));
     }
     free(g16);
+    free(g32);
     return fails;
 }
 
@@ -127,7 +133,7 @@ float mda_test_grad_eps(double change, float loss, double analytic) {
 bool mda_test_grad_fd_param(mda_model_t *m, mda_fwd_scratch_t *sc, uint32_t i, float l_infer) {
     mda_model_param_t *p = &m->params[i];
     float gs = mda_fwd_loss_scale(m->cfg);
-    float *g = p->g.ptr;
+    float *g = mda_vkc_read(m->c, &p->g);
     float *u = malloc(p->n * sizeof(float));
     double analytic = 0.0;
     for (uint32_t j = 0; j < p->n; j += 1) {
@@ -145,6 +151,7 @@ bool mda_test_grad_fd_param(mda_model_t *m, mda_fwd_scratch_t *sc, uint32_t i, f
         double diff = fabs(analytic - numeric[e]);
         best = fmin(best, mda_test_grad_rel(diff, fmax(fabs(analytic), fabs(numeric[e]))));
     }
+    free(g);
     free(u);
     bool pass = best <= 0.005;
     printf("%u %s analytic %+.6e numeric %+.6e %+.6e richardson %+.6e rel %.4f %s\n", i, p->name, analytic, numeric[0], numeric[1], numeric[2], best, mda_util_verdict(pass));
@@ -166,14 +173,12 @@ bool mda_test_grad_opt(mda_step_trainer_t *tr) {
     mda_model_t *m = tr->m;
     uint32_t n = m->n_all;
     float gs = mda_fwd_loss_scale(m->cfg);
-    float *g0 = malloc(n * sizeof(float));
-    float *w0 = malloc(n * sizeof(float));
     m->ref32 = false;
     mda_vkc_fill(m->c, &m->m_all, 0);
     mda_vkc_fill(m->c, &m->v_all, 0);
     mda_step_grad(tr);
-    memcpy(g0, m->g_all.ptr, n * sizeof(float));
-    memcpy(w0, m->w_all.ptr, n * sizeof(float));
+    float *g0 = mda_vkc_read(m->c, &m->g_all);
+    float *w0 = mda_vkc_read(m->c, &m->w_all);
     double ss = 0.0;
     for (uint32_t i = 0; i < n; i += 1) {
         ss += (double)g0[i] * g0[i];
@@ -188,9 +193,9 @@ bool mda_test_grad_opt(mda_step_trainer_t *tr) {
         }
     }
     mda_step_train(tr, lr, 1);
-    float *mg = m->m_all.ptr;
-    float *vg = m->v_all.ptr;
-    float *wg = m->w_all.ptr;
+    float *mg = mda_vkc_read(m->c, &m->m_all);
+    float *vg = mda_vkc_read(m->c, &m->v_all);
+    float *wg = mda_vkc_read(m->c, &m->w_all);
     double em = 0.0;
     double dm = 0.0;
     double ew = 0.0;
@@ -207,6 +212,9 @@ bool mda_test_grad_opt(mda_step_trainer_t *tr) {
     free(g0);
     free(w0);
     free(mul);
+    free(mg);
+    free(vg);
+    free(wg);
     double nrel = fabs(tr->gnorm - norm) / norm;
     double mrel = sqrt(em / dm);
     double wrel = sqrt(ew / dw);
@@ -228,14 +236,13 @@ double mda_test_grad_diff(const float *a, const float *b, uint32_t n) {
 bool mda_test_grad_accum(mda_step_trainer_t *tr, mda_step_trainer_t *tr2, const mda_data_corpus_t *cp) {
     mda_model_t *m = tr->m;
     uint32_t n = m->n_all;
-    float *sum = malloc(n * sizeof(float));
-    float *gb = m->g_all.ptr;
     m->ref32 = false;
     mda_data_batch(&tr->sc.batch, cp, MDA_DATA_SPLIT_TRAIN, MDA_DATA_SCHED_BELL,1);
     mda_step_grad(tr);
-    memcpy(sum, gb, n * sizeof(float));
+    float *sum = mda_vkc_read(m->c, &m->g_all);
     mda_data_batch(&tr->sc.batch, cp, MDA_DATA_SPLIT_TRAIN, MDA_DATA_SCHED_BELL,2);
     mda_step_grad(tr);
+    float *gb = mda_vkc_read(m->c, &m->g_all);
     for (uint32_t i = 0; i < n; i += 1) {
         sum[i] += gb[i];
     }
@@ -244,8 +251,11 @@ bool mda_test_grad_accum(mda_step_trainer_t *tr, mda_step_trainer_t *tr2, const 
         mda_data_batch(&tr2->sc.batch, cp, MDA_DATA_SPLIT_TRAIN, MDA_DATA_SCHED_BELL,i + 1);
         mda_step_micro(tr2, i);
     }
-    double rel = mda_test_grad_diff(gb, sum, n);
+    float *acc = mda_vkc_read(m->c, &m->g_all);
+    double rel = mda_test_grad_diff(acc, sum, n);
     free(sum);
+    free(gb);
+    free(acc);
     bool ok = rel < 1e-3;
     printf("accumulation: 2 micro-batches vs summed grads, rel err %.2e %s\n", rel, mda_util_verdict(ok));
     return ok;
@@ -316,11 +326,11 @@ void mda_test_grad_ns(double *x, uint32_t r, uint32_t c) {
     free(t);
 }
 
-bool mda_test_grad_muon_param(const mda_model_param_t *p, const float *w0, float scale, float lr) {
+bool mda_test_grad_muon_param(mda_vkc_t *c, mda_model_param_t *p, const float *w0, float scale, float lr) {
     uint32_t n = p->n;
     double *x = malloc(n * sizeof(double));
-    const float *g = p->g.ptr;
-    const float *w = p->w.ptr;
+    float *g = mda_vkc_read(c, &p->g);
+    float *w = mda_vkc_read(c, &p->w);
     double ss = 0.0;
     for (uint32_t i = 0; i < n; i += 1) {
         x[i] = (1.0 + MDA_STEP_MUON_MOMENTUM) * g[i] * scale;
@@ -340,6 +350,8 @@ bool mda_test_grad_muon_param(const mda_model_param_t *p, const float *w0, float
         den += want * want;
     }
     free(x);
+    free(g);
+    free(w);
     double rel = sqrt(num / den);
     bool ok = rel < 0.05;
     printf("muon %s [%u x %u]: update vs host Newton-Schulz, rel err %.4f %s\n", p->name, p->rows, p->cols, rel, mda_util_verdict(ok));
@@ -348,17 +360,16 @@ bool mda_test_grad_muon_param(const mda_model_param_t *p, const float *w0, float
 
 bool mda_test_grad_muon(mda_step_trainer_t *tr3, const mda_data_corpus_t *cp) {
     mda_model_t *m = tr3->m;
-    float *w0 = malloc(m->n_all * sizeof(float));
+    float *w0 = mda_vkc_read(m->c, &m->w_all);
     float lr = 1e-3f;
-    memcpy(w0, m->w_all.ptr, m->n_all * sizeof(float));
     mda_vkc_fill(m->c, &m->m_all, 0);
     mda_data_batch(&tr3->sc.batch, cp, MDA_DATA_SPLIT_TRAIN, MDA_DATA_SCHED_BELL,3);
     mda_step_train(tr3, lr, 1);
     mda_fwd_opt_t *o = tr3->sc.opt.ptr;
     mda_model_layer_t *ly = &m->layers[0];
-    bool wk = mda_test_grad_muon_param(ly->wk, w0, o->scale, lr);
-    bool gate = mda_test_grad_muon_param(ly->w_gate, w0, o->scale, lr);
-    bool down = mda_test_grad_muon_param(ly->w_down, w0, o->scale, lr);
+    bool wk = mda_test_grad_muon_param(m->c, ly->wk, w0, o->scale, lr);
+    bool gate = mda_test_grad_muon_param(m->c, ly->w_gate, w0, o->scale, lr);
+    bool down = mda_test_grad_muon_param(m->c, ly->w_down, w0, o->scale, lr);
     free(w0);
     return wk && gate && down;
 }
@@ -366,12 +377,13 @@ bool mda_test_grad_muon(mda_step_trainer_t *tr3, const mda_data_corpus_t *cp) {
 bool mda_test_grad_skip(mda_step_trainer_t *tr) {
     mda_model_t *m = tr->m;
     mda_fwd_opt_t *o = tr->sc.opt.ptr;
-    float *w0 = malloc(m->n_all * sizeof(float));
     o->gmul = 1e38f;
-    memcpy(w0, m->w_all.ptr, m->n_all * sizeof(float));
+    float *w0 = mda_vkc_read(m->c, &m->w_all);
     mda_step_train(tr, 1e-3f, 2);
-    bool unchanged = memcmp(w0, m->w_all.ptr, m->n_all * sizeof(float)) == 0;
+    float *w1 = mda_vkc_read(m->c, &m->w_all);
+    bool unchanged = memcmp(w0, w1, m->n_all * sizeof(float)) == 0;
     free(w0);
+    free(w1);
     bool ok = tr->skipped && unchanged && o->gmul == 5e37f;
     printf("overflow: skipped %d, weights unchanged %d, loss scale %g %s\n", tr->skipped, unchanged, o->gmul, mda_util_verdict(ok));
     return ok;

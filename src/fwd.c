@@ -115,10 +115,10 @@ mda_fwd_scratch_t mda_fwd_alloc(mda_model_t *m, uint32_t n_acts) {
     }
     VkDeviceSize nstate = (VkDeviceSize)mda_util_max_u32(mda_fwd_block_states(cfg), 1) * 4096 * sizeof(float);
     uint32_t widest = mda_util_max_u32(mda_util_max_u32(d, hid), cfg.vocab);
-    mda_vkc_buf_t ids = mda_vkc_alloc(c, bt * sizeof(uint32_t));
-    mda_vkc_buf_t target = mda_vkc_alloc(c, bt * sizeof(uint32_t));
-    mda_vkc_buf_t mask = mda_vkc_alloc(c, bt * sizeof(float));
-    mda_vkc_buf_t weight = mda_vkc_alloc(c, bt * sizeof(float));
+    mda_vkc_buf_t ids = mda_vkc_alloc_cached(c, bt * sizeof(uint32_t));
+    mda_vkc_buf_t target = mda_vkc_alloc_cached(c, bt * sizeof(uint32_t));
+    mda_vkc_buf_t mask = mda_vkc_alloc_cached(c, bt * sizeof(float));
+    mda_vkc_buf_t weight = mda_vkc_alloc_cached(c, bt * sizeof(float));
     mda_fwd_scratch_t sc = {
         .opt = mda_vkc_alloc_cached(c, sizeof(mda_fwd_opt_t)),
         .ids = ids,

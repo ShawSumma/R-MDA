@@ -38,14 +38,47 @@ bool mda_test_matmul_f16_check(const char *name, const float *ref, const float *
     return ok;
 }
 
-void mda_test_matmul_f16_fill(mda_vkc_buf_t *b32, mda_vkc_buf_t *b16, uint32_t n, uint64_t key) {
-    float *p = b32->ptr;
-    uint16_t *h = b16->ptr;
+bool mda_test_matmul_f16_check_buf(mda_vkc_t *c, const char *name, const float *ref, mda_vkc_buf_t *b, uint32_t count) {
+    float *got = mda_vkc_read(c, b);
+    bool ok = mda_test_matmul_f16_check(name, ref, got, count);
+    free(got);
+    return ok;
+}
+
+float *mda_test_matmul_f16_values(uint32_t n, uint64_t key) {
+    float *v = malloc(n * sizeof(float));
     for (uint32_t i = 0; i < n; i += 1) {
-        float v = (float)(mda_hash_u64(MDA_HASH_TEST, key, i) % 1000) / 500.0f - 1.0f;
-        p[i] = v;
-        h[i] = mda_test_matmul_f16_half(v);
+        v[i] = (float)(mda_hash_u64(MDA_HASH_TEST, key, i) % 1000) / 500.0f - 1.0f;
     }
+    return v;
+}
+
+uint16_t *mda_test_matmul_f16_halves(const float *v, uint32_t n) {
+    uint16_t *h = malloc(n * sizeof(uint16_t));
+    for (uint32_t i = 0; i < n; i += 1) {
+        h[i] = mda_test_matmul_f16_half(v[i]);
+    }
+    return h;
+}
+
+void mda_test_matmul_f16_upload(mda_vkc_t *c, mda_vkc_buf_t *b32, mda_vkc_buf_t *b16, const float *v, uint32_t n) {
+    uint16_t *h = mda_test_matmul_f16_halves(v, n);
+    mda_vkc_write(c, b32, v);
+    mda_vkc_write(c, b16, h);
+    free(h);
+}
+
+void mda_test_matmul_f16_upload_t(mda_vkc_t *c, mda_vkc_buf_t *dst, const float *v, uint32_t rows, uint32_t cols) {
+    uint16_t *h = mda_test_matmul_f16_halves(v, rows * cols);
+    uint16_t *t = malloc(rows * cols * sizeof(uint16_t));
+    for (uint32_t r = 0; r < rows; r += 1) {
+        for (uint32_t col = 0; col < cols; col += 1) {
+            t[col * rows + r] = h[r * cols + col];
+        }
+    }
+    mda_vkc_write(c, dst, t);
+    free(h);
+    free(t);
 }
 
 uint32_t mda_test_matmul_f16_poison(void) {
@@ -53,16 +86,6 @@ uint32_t mda_test_matmul_f16_poison(void) {
     uint32_t bits;
     memcpy(&bits, &big, 4);
     return bits;
-}
-
-void mda_test_matmul_f16_transpose(const mda_vkc_buf_t *src, mda_vkc_buf_t *dst, uint32_t rows, uint32_t cols) {
-    const uint16_t *s = src->ptr;
-    uint16_t *d = dst->ptr;
-    for (uint32_t r = 0; r < rows; r += 1) {
-        for (uint32_t col = 0; col < cols; col += 1) {
-            d[col * rows + r] = s[r * cols + col];
-        }
-    }
 }
 
 void mda_test_matmul_f16_dispatch(mda_vkc_t *c, mda_vkc_kernel_t *kern, uint32_t tile, mda_vkc_buf_t **bufs, mda_pc_mm16_t *pc) {
@@ -74,7 +97,7 @@ bool mda_test_matmul_f16_mode(mda_vkc_t *c, mda_vkc_kernel_t *kern, uint32_t til
     mda_test_matmul_f16_dispatch(c, kern, tile, bufs, &pc);
     char label[96];
     snprintf(label, sizeof(label), "coopmat f16 %ux%u tiles, %ux%ux%u %s", tile, tile, pc.m, pc.n, pc.k, name);
-    return mda_test_matmul_f16_check(label, ref, bufs[2]->ptr, pc.m * pc.n);
+    return mda_test_matmul_f16_check_buf(c, label, ref, bufs[2], pc.m * pc.n);
 }
 
 float mda_test_matmul_f16_float(uint16_t h) {
@@ -92,7 +115,7 @@ float mda_test_matmul_f16_float(uint16_t h) {
 
 bool mda_test_matmul_f16_epi(mda_vkc_t *c, mda_vkc_kernel_t *kern, uint32_t tile, mda_vkc_buf_t **bufs, mda_pc_mm16_t pc, const float *ref) {
     uint32_t count = pc.m * pc.n;
-    memcpy(bufs[5]->ptr, ref, count * sizeof(float));
+    mda_vkc_write(c, bufs[5], ref);
     mda_vkc_fill(c, bufs[2], mda_test_matmul_f16_poison());
     mda_pc_mm16_t pe = pc;
     pe.alpha = 0.5f;
@@ -101,18 +124,19 @@ bool mda_test_matmul_f16_epi(mda_vkc_t *c, mda_vkc_kernel_t *kern, uint32_t tile
     mda_test_matmul_f16_dispatch(c, kern, tile, bufs, &pe);
     float *want = malloc(count * sizeof(float));
     float *half = malloc(count * sizeof(float));
-    const uint16_t *h = bufs[4]->ptr;
+    uint16_t *h = mda_vkc_read(c, bufs[4]);
     for (uint32_t i = 0; i < count; i += 1) {
         want[i] = 2.5f * ref[i];
         half[i] = mda_test_matmul_f16_float(h[i]);
     }
     char label[96];
     snprintf(label, sizeof(label), "coopmat f16 %ux%u tiles, 0.5 AB + 2 P, fp32 out", tile, tile);
-    bool ok32 = mda_test_matmul_f16_check(label, want, bufs[2]->ptr, count);
+    bool ok32 = mda_test_matmul_f16_check_buf(c, label, want, bufs[2], count);
     snprintf(label, sizeof(label), "coopmat f16 %ux%u tiles, 0.5 AB + 2 P, fp16 out", tile, tile);
     bool ok16 = mda_test_matmul_f16_check(label, want, half, count);
     free(want);
     free(half);
+    free(h);
     return ok32 && ok16;
 }
 
@@ -131,10 +155,14 @@ bool mda_test_matmul_f16_layouts(mda_vkc_t *c, mda_vkc_kernel_t *scalar, mda_vkc
     if (c->fail) {
         return false;
     } else {
-        mda_test_matmul_f16_fill(&a32, &a16, m * k, 2);
-        mda_test_matmul_f16_fill(&b32, &b16, k * n, 3);
-        mda_test_matmul_f16_transpose(&a16, &at16, m, k);
-        mda_test_matmul_f16_transpose(&b16, &bt16, k, n);
+        float *va = mda_test_matmul_f16_values(m * k, 2);
+        float *vb = mda_test_matmul_f16_values(k * n, 3);
+        mda_test_matmul_f16_upload(c, &a32, &a16, va, m * k);
+        mda_test_matmul_f16_upload(c, &b32, &b16, vb, k * n);
+        mda_test_matmul_f16_upload_t(c, &at16, va, m, k);
+        mda_test_matmul_f16_upload_t(c, &bt16, vb, k, n);
+        free(va);
+        free(vb);
         mda_pc_mm_t spc = {
             .m = m,
             .n = n,
@@ -146,6 +174,7 @@ bool mda_test_matmul_f16_layouts(mda_vkc_t *c, mda_vkc_kernel_t *scalar, mda_vkc
             &c32,
         };
         mda_vkc_run(c, scalar, sb, (n + 15) / 16, (m + 15) / 16, 1, &spc);
+        float *ref = mda_vkc_read(c, &c32);
         mda_pc_mm16_t pc = {
             .m = m,
             .n = n,
@@ -191,10 +220,11 @@ bool mda_test_matmul_f16_layouts(mda_vkc_t *c, mda_vkc_kernel_t *scalar, mda_vkc
         pa.ta = 1;
         mda_pc_mm16_t pb = pc;
         pb.tb = 1;
-        bool ok0 = mda_test_matmul_f16_mode(c, kern, tile, plain, pc, c32.ptr, "A B");
-        bool ok1 = mda_test_matmul_f16_mode(c, kern, tile, ta, pa, c32.ptr, "At B");
-        bool ok2 = mda_test_matmul_f16_mode(c, kern, tile, tb, pb, c32.ptr, "A Bt");
-        bool ok3 = mda_test_matmul_f16_epi(c, kern, tile, epi, pc, c32.ptr);
+        bool ok0 = mda_test_matmul_f16_mode(c, kern, tile, plain, pc, ref, "A B");
+        bool ok1 = mda_test_matmul_f16_mode(c, kern, tile, ta, pa, ref, "At B");
+        bool ok2 = mda_test_matmul_f16_mode(c, kern, tile, tb, pb, ref, "A Bt");
+        bool ok3 = mda_test_matmul_f16_epi(c, kern, tile, epi, pc, ref);
+        free(ref);
         return c->fail == false && ok0 && ok1 && ok2 && ok3;
     }
 }
@@ -218,9 +248,11 @@ bool mda_test_matmul_f16_run(mda_vkc_t *c) {
     if (c->fail) {
         return false;
     } else {
-        *(uint32_t *)amax.ptr = 0;
-        mda_test_matmul_f16_fill(&a32, &a16, m * k, 0);
-        mda_test_matmul_f16_fill(&b32, &b16, k * n, 1);
+        mda_vkc_fill(c, &amax, 0);
+        float *va = mda_test_matmul_f16_values(m * k, 0);
+        float *vb = mda_test_matmul_f16_values(k * n, 1);
+        mda_test_matmul_f16_upload(c, &a32, &a16, va, m * k);
+        mda_test_matmul_f16_upload(c, &b32, &b16, vb, k * n);
         mda_pc_mm_t pc = {
             .m = m,
             .n = n,
@@ -249,18 +281,23 @@ bool mda_test_matmul_f16_run(mda_vkc_t *c) {
             &c16,
         };
         mda_vkc_run(c, &scalar, sb, (n + 15) / 16, (m + 15) / 16, 1, &pc);
+        float *ref = mda_vkc_read(c, &c32);
         mda_vkc_fill(c, &c16, mda_test_matmul_f16_poison());
         mda_vkc_run(c, &coop, cb, n / 64, m / 64, 1, &pc16);
-        bool ok64 = mda_test_matmul_f16_check("coopmat f16 64x64", c32.ptr, c16.ptr, m * n);
+        bool ok64 = mda_test_matmul_f16_check_buf(c, "coopmat f16 64x64", ref, &c16, m * n);
         mda_vkc_fill(c, &c16, mda_test_matmul_f16_poison());
         mda_vkc_run(c, &wide, cb, n / 128, m / 128, 1, &pc16);
-        bool ok128 = mda_test_matmul_f16_check("coopmat f16 128x128", c32.ptr, c16.ptr, m * n);
+        bool ok128 = mda_test_matmul_f16_check_buf(c, "coopmat f16 128x128", ref, &c16, m * n);
+        free(ref);
 
-        float *ap = a32.ptr;
         for (uint32_t i = 0; i < m * k; i += 1) {
-            ap[i] *= 1e5f;
+            va[i] *= 1e5f;
         }
+        mda_vkc_write(c, &a32, va);
+        free(va);
+        free(vb);
         mda_vkc_run(c, &scalar, sb, (n + 15) / 16, (m + 15) / 16, 1, &pc);
+        float *ref_big = mda_vkc_read(c, &c32);
         mda_pc_absmax_t apc = {
             .n = m * k,
             .slot = 0,
@@ -284,7 +321,8 @@ bool mda_test_matmul_f16_run(mda_vkc_t *c) {
         pc16s.sa = 0;
         mda_vkc_fill(c, &c16, mda_test_matmul_f16_poison());
         mda_vkc_run(c, &coop, cb, n / 64, m / 64, 1, &pc16s);
-        bool ok_scaled = mda_test_matmul_f16_check("scaled coopmat f16 (|A| ~ 1e5)", c32.ptr, c16.ptr, m * n);
+        bool ok_scaled = mda_test_matmul_f16_check_buf(c, "scaled coopmat f16 (|A| ~ 1e5)", ref_big, &c16, m * n);
+        free(ref_big);
 
         uint32_t iters = 200;
         double t0 = mda_util_now();

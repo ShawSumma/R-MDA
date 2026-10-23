@@ -98,6 +98,7 @@ float mda_model_init_value(const mda_model_param_t *p, uint32_t i, uint32_t j) {
 }
 
 void mda_model_views(mda_model_t *m) {
+    float *w = calloc(m->n_all, sizeof(float));
     for (uint32_t i = 0; i < m->n_params; i += 1) {
         mda_model_param_t *p = &m->params[i];
         VkDeviceSize off = p->off;
@@ -109,11 +110,12 @@ void mda_model_views(mda_model_t *m) {
         if (p->tmirror) {
             p->wt16 = mda_vkc_alloc(m->c, p->n * sizeof(uint16_t));
         }
-        float *wp = p->w.ptr;
         for (uint32_t j = 0; j < p->n; j += 1) {
-            wp[j] = mda_model_init_value(p, i, j);
+            w[p->off + j] = mda_model_init_value(p, i, j);
         }
     }
+    mda_vkc_write(m->c, &m->w_all, w);
+    free(w);
     m->dirty16 = true;
 }
 
@@ -127,7 +129,6 @@ void mda_model_alloc(mda_model_t *m) {
     m->v_all = mda_vkc_alloc(c, n * sizeof(float));
     m->w16_all = mda_vkc_alloc(c, n * sizeof(uint16_t));
     mda_vkc_begin(c);
-    mda_vkc_fill(c, &m->w_all, 0);
     mda_vkc_fill(c, &m->g_all, 0);
     mda_vkc_fill(c, &m->m_all, 0);
     mda_vkc_fill(c, &m->v_all, 0);

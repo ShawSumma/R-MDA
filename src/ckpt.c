@@ -57,14 +57,16 @@ bool mda_ckpt_same_shape(mda_model_cfg_t a, mda_model_cfg_t b) {
     return a.d == b.d && a.n_layer == b.n_layer && a.n_head == b.n_head && a.ffn_hidden == b.ffn_hidden && a.vocab == b.vocab;
 }
 
-const char *mda_ckpt_mismatch(mda_ckpt_hdr_t h, mda_ckpt_hdr_t want, size_t got, int64_t size, VkDeviceSize bytes) {
+const char *mda_ckpt_mismatch(mda_ckpt_hdr_t h, mda_ckpt_hdr_t want, size_t got, int64_t size, VkDeviceSize bytes, bool moments) {
     if (got != 1 || h.magic != want.magic) {
         return "not a checkpoint of this format";
     } else if (mda_ckpt_same_shape(h.cfg, want.cfg) == false || h.n_all != want.n_all) {
         return "checkpoint is for a different model config";
     } else if (h.vocab_hash != want.vocab_hash) {
         return "checkpoint was trained with a different vocab";
-    } else if ((uint64_t)size != sizeof(h) + 3 * bytes) {
+    } else if (moments && (uint64_t)size == sizeof(h) + bytes) {
+        return "weights only, without the optimizer state training resumes from";
+    } else if ((uint64_t)size != sizeof(h) + 3 * bytes && (uint64_t)size != sizeof(h) + bytes) {
         return "wrong size (truncated?)";
     } else {
         return NULL;
@@ -124,7 +126,7 @@ mda_ckpt_res_t mda_ckpt_read(mda_model_t *m, uint64_t vocab_hash, FILE *f, bool 
     int64_t size = ftell(f);
     fseek(f, 0, SEEK_SET);
     size_t got = fread(&h, sizeof(h), 1, f);
-    const char *why = mda_ckpt_mismatch(h, want, got, size, (VkDeviceSize)m->n_all * sizeof(float));
+    const char *why = mda_ckpt_mismatch(h, want, got, size, (VkDeviceSize)m->n_all * sizeof(float), moments);
     if (why != NULL) {
         fprintf(stderr, "%s: %s\n", path, why);
         return mda_ckpt_bad();

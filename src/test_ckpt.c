@@ -10,16 +10,20 @@
 #include "model.h"
 #include "ckpt.h"
 
-bool mda_test_ckpt_same(const float *a, const mda_vkc_buf_t *b, uint32_t n) {
-    return memcmp(a, b->ptr, n * sizeof(float)) == 0;
+bool mda_test_ckpt_same(mda_vkc_t *c, const float *a, mda_vkc_buf_t *b, uint32_t n) {
+    float *p = mda_vkc_read(c, b);
+    bool same = memcmp(a, p, n * sizeof(float)) == 0;
+    free(p);
+    return same;
 }
 
-bool mda_test_ckpt_zero(const mda_vkc_buf_t *b, uint32_t n) {
-    const float *p = b->ptr;
+bool mda_test_ckpt_zero(mda_vkc_t *c, mda_vkc_buf_t *b, uint32_t n) {
+    float *p = mda_vkc_read(c, b);
     uint32_t i = 0;
     while (i < n && p[i] == 0.0f) {
         i += 1;
     }
+    free(p);
     return i == n;
 }
 
@@ -51,7 +55,7 @@ bool mda_test_ckpt_model(mda_model_t *m) {
         for (uint32_t j = 0; j < n; j += 1) {
             ref[i][j] = (float)mda_hash_unit(MDA_HASH_TEST, i, j) - 0.5f;
         }
-        memcpy(arenas[i]->ptr, ref[i], n * sizeof(float));
+        mda_vkc_write(m->c, arenas[i], ref[i]);
     }
     char *buf = NULL;
     size_t size = 0;
@@ -60,18 +64,25 @@ bool mda_test_ckpt_model(mda_model_t *m) {
     fclose(w);
 
     mda_ckpt_res_t res_full = mda_test_ckpt_reload(m, buf, size, true);
-    bool full = res_full.ok && res_full.step == 123 && mda_test_ckpt_same(ref[0], arenas[0], n) && mda_test_ckpt_same(ref[1], arenas[1], n) && mda_test_ckpt_same(ref[2], arenas[2], n);
+    bool full = res_full.ok && res_full.step == 123 && mda_test_ckpt_same(m->c, ref[0], arenas[0], n) && mda_test_ckpt_same(m->c, ref[1], arenas[1], n) && mda_test_ckpt_same(m->c, ref[2], arenas[2], n);
     printf("round trip with moments: %s\n", mda_util_verdict(full));
 
     mda_ckpt_res_t res_weights = mda_test_ckpt_reload(m, buf, size, false);
-    bool weights = res_weights.ok && res_weights.step == 123 && mda_test_ckpt_same(ref[0], arenas[0], n) && mda_test_ckpt_zero(arenas[1], n) && mda_test_ckpt_zero(arenas[2], n);
+    bool weights = res_weights.ok && res_weights.step == 123 && mda_test_ckpt_same(m->c, ref[0], arenas[0], n) && mda_test_ckpt_zero(m->c, arenas[1], n) && mda_test_ckpt_zero(m->c, arenas[2], n);
     printf("weights only: %s\n", mda_util_verdict(weights));
+
+    size_t stripped_size = sizeof(mda_ckpt_hdr_t) + (size_t)n * sizeof(float);
+    mda_ckpt_res_t res_stripped = mda_test_ckpt_reload(m, buf, stripped_size, false);
+    bool stripped_weights = res_stripped.ok && res_stripped.step == 123 && mda_test_ckpt_same(m->c, ref[0], arenas[0], n);
+    mda_ckpt_res_t res_resume = mda_test_ckpt_reload(m, buf, stripped_size, true);
+    bool stripped = stripped_weights && res_resume.ok == false;
+    printf("weights-only file loads, refuses to resume: %s\n", mda_util_verdict(stripped));
 
     free(buf);
     for (uint32_t i = 0; i < 3; i += 1) {
         free(ref[i]);
     }
-    return m->c->fail == false && wrote && full && weights;
+    return m->c->fail == false && wrote && full && weights && stripped;
 }
 
 bool mda_test_ckpt_device(mda_vkc_t *c) {
