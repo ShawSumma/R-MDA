@@ -5,3 +5,4 @@ models/
 data/
 .claude
 .venv/
+export.txt
