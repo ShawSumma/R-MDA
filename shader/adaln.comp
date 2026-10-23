@@ -20,26 +20,37 @@ layout(std430, binding = 4) buffer buf_dada {
 layout(push_constant) uniform pc {
     uint bt;
     uint d;
-    uint seqlen;
     uint op;
-    uint stride;
     uint s_off;
     uint sh_off;
+    uint rows_per;
+    float scale;
 };
 
 void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    if (idx < bt * d) {
-        uint col = idx % d;
-        uint base = idx / d / seqlen * stride;
-        float sc = ada[base + s_off + col];
-        if (op == 0u) {
-            y[idx] = x[idx] * (1.0 + sc) + ada[base + sh_off + col];
-        } else {
-            float g = y[idx];
-            dx[idx] = g * (1.0 + sc);
-            atomicAdd(dada[base + s_off + col], g * x[idx]);
-            atomicAdd(dada[base + sh_off + col], g);
+    uint gid = gl_GlobalInvocationID.x;
+    if (op == 0u) {
+        if (gid < bt * d) {
+            uint col = gid % d;
+            y[gid] = x[gid] * (1.0 + scale * ada[s_off + col]) + scale * ada[sh_off + col];
+        }
+    } else {
+        uint col = gid % d;
+        uint r0 = gid / d * rows_per;
+        if (r0 < bt) {
+            float sc = 1.0 + scale * ada[s_off + col];
+            float gs = 0.0;
+            float gh = 0.0;
+            uint r1 = min(r0 + rows_per, bt);
+            for (uint r = r0; r < r1; r = r + 1) {
+                uint idx = r * d + col;
+                float g = y[idx];
+                dx[idx] = g * sc;
+                gs += g * x[idx];
+                gh += g;
+            }
+            atomicAdd(dada[s_off + col], scale * gs);
+            atomicAdd(dada[sh_off + col], scale * gh);
         }
     }
 }

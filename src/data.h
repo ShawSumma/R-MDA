@@ -44,7 +44,6 @@ struct mda_data_batch_t {
     uint32_t *target;
     float *mask;
     float *weight;
-    float *t;
     uint32_t batch;
     uint32_t seqlen;
     uint32_t nclean;

@@ -1,5 +1,5 @@
 #version 450
-#extension GL_EXT_shader_atomic_float : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer buf_logits {
@@ -25,9 +25,20 @@ layout(std430, binding = 5) readonly buffer buf_opt {
     float scale;
     float gmul;
 };
+layout(std430, binding = 6) buffer buf_logz {
+    float logz[];
+};
+layout(std430, binding = 7) writeonly buffer buf_h {
+    float16_t h[];
+};
+layout(std430, binding = 8) buffer buf_amax {
+    uint amax[];
+};
 layout(push_constant) uniform pc {
     uint rows;
     uint vocab;
+    uint op;
+    uint slot;
 };
 
 shared float red[256];
@@ -60,37 +71,73 @@ float reduce_sum(float v, uint lid) {
     return r;
 }
 
-void row_ce(uint row, uint lid) {
+float slot_scale(uint s) {
+    if (s == ~0u) {
+        return 1.0;
+    } else if (!(uintBitsToFloat(amax[s]) > 0.0) || isinf(uintBitsToFloat(amax[s]))) {
+        return 1.0;
+    } else {
+        return exp2(141.0 - float((amax[s] >> 23) & 0xffu));
+    }
+}
+
+void row_stats(uint row, uint lid) {
     uint base = row * vocab;
+    uint tgt = target[row];
     float part_mx = -1e30;
+    float part_mo = -1e30;
     for (uint i = lid; i < vocab; i += 256) {
-        part_mx = max(part_mx, logits[base + i]);
+        float l = logits[base + i];
+        part_mx = max(part_mx, l);
+        if (i != tgt) {
+            part_mo = max(part_mo, l);
+        }
     }
     float mx = reduce_max(part_mx, lid);
+    float mo = reduce_max(part_mo, lid);
     float part_se = 0.0;
     for (uint i = lid; i < vocab; i += 256) {
         part_se += exp(logits[base + i] - mx);
     }
-    float logz = mx + log(reduce_sum(part_se, lid));
-    float m = mask[row];
-    float wt = weight[row];
-    float gm = gmul * m * wt;
+    float lz = mx + log(reduce_sum(part_se, lid));
+    if (lid == 0u) {
+        float m = mask[row];
+        float wt = weight[row];
+        float lt = logits[base + tgt];
+        logz[row] = lz;
+        loss[row] = -m * wt * (lt - lz);
+        if (slot != ~0u) {
+            float g = abs(gmul * m * wt) * max(1.0 - exp(lt - lz), exp(mo - lz));
+            atomicMax(amax[slot], floatBitsToUint(g));
+        }
+    }
+}
+
+void row_grad(uint row, uint lid) {
+    uint base = row * vocab;
     uint tgt = target[row];
+    float lz = logz[row];
+    float gm = gmul * mask[row] * weight[row];
+    float s = slot_scale(slot);
     for (uint i = lid; i < vocab; i += 256) {
-        float logit = logits[base + i];
-        float p = exp(logit - logz);
+        float p = exp(logits[base + i] - lz);
+        float g = gm * p;
         if (i == tgt) {
-            loss[row] = -m * wt * (logit - logz);
-            logits[base + i] = gm * (p - 1.0);
+            g = gm * (p - 1.0);
+        }
+        if (op == 1u) {
+            logits[base + i] = g;
         } else {
-            logits[base + i] = gm * p;
+            h[base + i] = float16_t(g * s);
         }
     }
 }
 
 void main() {
     uint row = gl_WorkGroupID.x;
-    if (row < rows) {
-        row_ce(row, gl_LocalInvocationID.x);
+    if (row < rows && op == 0u) {
+        row_stats(row, gl_LocalInvocationID.x);
+    } else if (row < rows) {
+        row_grad(row, gl_LocalInvocationID.x);
     }
 }

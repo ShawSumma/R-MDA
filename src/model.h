@@ -42,6 +42,7 @@ struct mda_model_param_t {
     uint32_t off;
     float init_std;
     float init_const;
+    float lr_mul;
     bool tmirror;
     bool accum;
 };
@@ -82,7 +83,6 @@ struct mda_model_t {
     mda_vkc_kernel_t k_softmax;
     mda_vkc_kernel_t k_adamw;
     mda_vkc_kernel_t k_muon;
-    mda_vkc_kernel_t k_temb;
     mda_vkc_kernel_t k_adaln;
     mda_vkc_kernel_t k_vec;
     mda_vkc_kernel_t k_repack;
@@ -115,8 +115,9 @@ struct mda_model_t {
 mda_model_cfg_t mda_model_cfg(uint32_t vocab);
 mda_model_cfg_t mda_model_cfg_block(mda_model_cfg_t cfg, uint32_t block);
 uint32_t mda_model_block_of(const char *mode);
-mda_model_cfg_t mda_model_cfg_mode(uint32_t vocab, const char *mode);
+mda_model_cfg_t mda_model_cfg_mode(uint32_t vocab, const char *mode, uint32_t batch);
 uint32_t mda_model_nclean(mda_model_cfg_t cfg);
+float mda_model_ada_scale(mda_model_cfg_t cfg);
 mda_model_t *mda_model_init(mda_vkc_t *c, mda_model_cfg_t cfg);
 uint64_t mda_model_param_count(const mda_model_t *m);
 

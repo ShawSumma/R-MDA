@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,12 +37,14 @@ uint32_t mda_model_block_of(const char *mode) {
     }
 }
 
-mda_model_cfg_t mda_model_cfg_mode(uint32_t vocab, const char *mode) {
+mda_model_cfg_t mda_model_cfg_mode(uint32_t vocab, const char *mode, uint32_t batch) {
+    mda_model_cfg_t base = mda_model_cfg(vocab);
+    base.batch = batch;
     uint32_t block = mda_model_block_of(mode);
     if (block > 0) {
-        return mda_model_cfg_block(mda_model_cfg(vocab), block);
+        return mda_model_cfg_block(base, block);
     } else {
-        return mda_model_cfg(vocab);
+        return base;
     }
 }
 
@@ -51,6 +54,10 @@ uint32_t mda_model_nclean(mda_model_cfg_t cfg) {
     } else {
         return 0;
     }
+}
+
+float mda_model_ada_scale(mda_model_cfg_t cfg) {
+    return sqrtf(0.5f * (float)cfg.d);
 }
 
 mda_model_param_t *mda_model_param(mda_model_t *m, uint32_t rows, uint32_t cols, float init_std, float init_const, const char *name) {
@@ -64,6 +71,7 @@ mda_model_param_t *mda_model_param(mda_model_t *m, uint32_t rows, uint32_t cols,
         .off = m->n_all,
         .init_std = init_std,
         .init_const = init_const,
+        .lr_mul = 1.0f,
     };
     m->n_all += (p->n + MDA_MODEL_PARAM_ALIGN - 1) / MDA_MODEL_PARAM_ALIGN * MDA_MODEL_PARAM_ALIGN;
     return p;
@@ -165,26 +173,25 @@ void mda_model_kernels(mda_model_t *m) {
     m->k_wkv_f = mda_vkc_load(c, "build/wkv7_fwd.spv", 10, sizeof(mda_pc_wkv_t));
     m->k_wkv_b = mda_vkc_load(c, "build/wkv7_bwd.spv", 13, sizeof(mda_pc_wkv_bwd_t));
     m->k_mm = mda_vkc_load(c, "build/matmul.spv", 3, sizeof(mda_pc_mm_t));
-    m->k_mm16 = mda_vkc_load(c, "build/matmul_f16.spv", 4, sizeof(mda_pc_mm16_t));
-    m->k_mm16w = mda_vkc_load(c, "build/matmul_f16_wide.spv", 4, sizeof(mda_pc_mm16_t));
+    m->k_mm16 = mda_vkc_load(c, "build/matmul_f16.spv", 6, sizeof(mda_pc_mm16_t));
+    m->k_mm16w = mda_vkc_load(c, "build/matmul_f16_wide.spv", 6, sizeof(mda_pc_mm16_t));
     m->k_cast = mda_vkc_load(c, "build/cast_f16.spv", 3, sizeof(mda_pc_cast_t));
     m->k_tr16 = mda_vkc_load(c, "build/transpose_f16.spv", 3, sizeof(mda_pc_tr16_t));
     m->k_absmax = mda_vkc_load(c, "build/absmax.spv", 2, sizeof(mda_pc_absmax_t));
     m->k_mm_bw = mda_vkc_load(c, "build/matmul_bw.spv", 4, sizeof(mda_pc_mm_bw_t));
     m->k_elem = mda_vkc_load(c, "build/elem.spv", 5, sizeof(mda_pc_elem_t));
     m->k_rms = mda_vkc_load(c, "build/rmsnorm.spv", 6, sizeof(mda_pc_rms_t));
-    m->k_ce = mda_vkc_load(c, "build/softmax_ce.spv", 6, sizeof(mda_pc_ce_t));
+    m->k_ce = mda_vkc_load(c, "build/softmax_ce.spv", 9, sizeof(mda_pc_ce_t));
     m->k_argmax = mda_vkc_load(c, "build/argmax.spv", 2, sizeof(mda_pc_argmax_t));
     m->k_softmax = mda_vkc_load(c, "build/softmax.spv", 2, sizeof(mda_pc_softmax_t));
     m->k_adamw = mda_vkc_load(c, "build/adamw.spv", 6, sizeof(mda_pc_adam_t));
     m->k_muon = mda_vkc_load(c, "build/muon.spv", 6, sizeof(mda_pc_muon_t));
-    m->k_temb = mda_vkc_load(c, "build/temb.spv", 2, sizeof(mda_pc_temb_t));
     m->k_adaln = mda_vkc_load(c, "build/adaln.spv", 5, sizeof(mda_pc_adaln_t));
     m->k_vec = mda_vkc_load(c, "build/vecops.spv", 2, sizeof(mda_pc_vec_t));
     m->k_repack = mda_vkc_load(c, "build/repack.spv", 2, sizeof(mda_pc_repack_t));
     m->k_sumsq = mda_vkc_load(c, "build/sumsq.spv", 3, sizeof(mda_pc_sumsq_t));
     m->k_heads_f = mda_vkc_load(c, "build/heads_fwd.spv", 11, sizeof(mda_pc_heads_t));
-    m->k_heads_b = mda_vkc_load(c, "build/heads_bwd.spv", 19, sizeof(mda_pc_heads_t));
+    m->k_heads_b = mda_vkc_load(c, "build/heads_bwd.spv", 20, sizeof(mda_pc_heads_t));
     m->k_headnorm = mda_vkc_load(c, "build/headnorm.spv", 4, sizeof(mda_pc_hn_t));
 }
 
@@ -193,6 +200,7 @@ void mda_model_params(mda_model_t *m) {
     uint32_t d = cfg.d;
     uint32_t hid = cfg.ffn_hidden;
     float s = 0.02f;
+    float s_out = s / sqrtf(2.0f * cfg.n_layer);
     m->tok_emb = mda_model_param_mat(m, cfg.vocab, d, s, "tok_emb");
     m->tok_emb->accum = true;
     m->mask_emb = mda_model_param_accum(m, 1, d, s, 0.0f, "mask_emb");
@@ -205,14 +213,15 @@ void mda_model_params(mda_model_t *m) {
         ly->wr = mda_model_param_mat(m, d, d, s, "wr");
         ly->ww = mda_model_param_mat(m, d, d, s, "ww");
         ly->wa = mda_model_param_mat(m, d, d, s, "wa");
-        ly->wo = mda_model_param_mat(m, d, d, s, "wo");
+        ly->wo = mda_model_param_mat(m, d, d, s_out, "wo");
         ly->shift_mix = mda_model_param_accum(m, 1, d, 0.0f, 0.5f, "shift_mix");
         ly->n1 = mda_model_param_accum(m, 1, d, 0.0f, 1.0f, "n1");
         ly->n2 = mda_model_param_accum(m, 1, d, 0.0f, 1.0f, "n2");
         ly->w_gate = mda_model_param_mat(m, d, hid, s, "w_gate");
         ly->w_up = mda_model_param_mat(m, d, hid, s, "w_up");
-        ly->w_down = mda_model_param_mat(m, hid, d, s, "w_down");
-        ly->ada = mda_model_param(m, d, 4 * d, 0.0f, 0.0f, "ada");
+        ly->w_down = mda_model_param_mat(m, hid, d, s_out, "w_down");
+        ly->ada = mda_model_param_accum(m, 1, 4 * d, 0.0f, 0.0f, "ada");
+        ly->ada->lr_mul = mda_model_ada_scale(cfg);
     }
 }
 

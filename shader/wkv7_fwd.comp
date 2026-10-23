@@ -17,7 +17,7 @@ layout(std430,binding=9) writeonly buffer BCO { float Cout[]; };
 
 layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir, save, blk, nclean, seq0, cache; };
 
-shared float kk[64], vv[64], rr[64], ww[64], aa[64];
+shared float kc[CH][64], vc[CH][64], rc[CH][64], wc[CH][64], ac[CH][64];
 shared float p0[256], p1[256];
 
 uint step_t(uint ti) {
@@ -59,9 +59,13 @@ void run(uint bh) {
     for (uint ti = 0; ti < T; ti += 1u) {
         uint t = step_t(ti);
         uint row = base + t*64u;
-        if (lid < 64u) {
-            kk[lid] = K[row+lid]; vv[lid] = V[row+lid];
-            rr[lid] = R[row+lid]; ww[lid] = W[row+lid]; aa[lid] = A[row+lid];
+        uint j = ti % CH;
+        if (j == 0u) {
+            uint lrow = base + step_t(ti + g)*64u + e;
+            barrier();
+            kc[g][e] = K[lrow]; vc[g][e] = V[lrow];
+            rc[g][e] = R[lrow]; wc[g][e] = W[lrow]; ac[g][e] = A[lrow];
+            barrier();
         }
         if (noisy && ti % blk == 0u && dir == 0u) {
             uint sb = block_slot(seq, h, t) + lid;
@@ -74,21 +78,20 @@ void run(uint bh) {
             uint sb = block_slot(seq, h, t) + lid;
             for (uint q = 0; q < 16u; q += 1u) Bst[sb + q*256u] = S[q];
         }
-        barrier();
-        if (save == 1u && (ti % CH) == 0u) {
+        if (save == 1u && j == 0u) {
             uint sb = bh*(T/CH)*4096u + (ti/CH)*4096u + lid;
             for (uint q = 0; q < 16u; q += 1u) Sout[sb + q*256u] = float16_t(S[q]);
         }
         float s = 0.0;
-        for (uint q = 0; q < 16u; q += 1u) s += S[q]*kk[g + 4u*q];
+        for (uint q = 0; q < 16u; q += 1u) s += S[q]*kc[j][g + 4u*q];
         p0[lid] = s;
         barrier();
         float sk = p0[e] + p0[64u+e] + p0[128u+e] + p0[192u+e];
         float o = 0.0;
         for (uint q = 0; q < 16u; q += 1u) {
             uint i = g + 4u*q;
-            S[q] = ww[e]*S[q] + aa[i]*kk[i]*(vv[e] - sk);
-            o += rr[i]*S[q];
+            S[q] = wc[j][e]*S[q] + ac[j][i]*kc[j][i]*(vc[j][e] - sk);
+            o += rc[j][i]*S[q];
         }
         p1[lid] = o;
         barrier();

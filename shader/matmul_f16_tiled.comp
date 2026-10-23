@@ -1,0 +1,136 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BA { float16_t A[]; };
+layout(std430, binding = 1) readonly buffer BB { float16_t B[]; };
+layout(std430, binding = 2) buffer BC { float C[]; };
+layout(std430, binding = 3) readonly buffer BS { uint amax[]; };
+layout(push_constant) uniform pc { uint m, n, k, sa, sb, acc, ta, tb; };
+const uint T = 16;
+const uint BM = 128;
+const uint BN = 128;
+const uint BK = 32;
+shared float16_t sA[BM * BK];
+shared float16_t sB[BK * BN];
+
+float slot_scale(uint s) {
+    if (s == ~0u) {
+        return 1.0;
+    } else if (!(uintBitsToFloat(amax[s]) > 0.0) || isinf(uintBitsToFloat(amax[s]))) {
+        return 1.0;
+    } else {
+        return exp2(141.0 - float((amax[s] >> 23) & 0xffu));
+    }
+}
+
+float16_t load_a(uint r, uint c) {
+    if (r < m) {
+        if (ta != 0u) {
+            return A[c * m + r];
+        } else {
+            return A[r * k + c];
+        }
+    } else {
+        return float16_t(0.0);
+    }
+}
+
+float16_t load_b(uint r, uint c) {
+    if (c < n) {
+        if (tb != 0u) {
+            return B[c * k + r];
+        } else {
+            return B[r * n + c];
+        }
+    } else {
+        return float16_t(0.0);
+    }
+}
+
+void stage(uint m0, uint n0, uint k0, uint tid) {
+    for (uint i = 0; i < (BM * BK) / 256u; i = i + 1) {
+        uint e = tid + i * 256u;
+        if (ta != 0u) {
+            uint kr = e / BM;
+            uint mc = e % BM;
+            sA[kr * BM + mc] = load_a(m0 + mc, k0 + kr);
+        } else {
+            uint mr = e / BK;
+            uint kc = e % BK;
+            sA[mr * BK + kc] = load_a(m0 + mr, k0 + kc);
+        }
+    }
+    for (uint i = 0; i < (BK * BN) / 256u; i = i + 1) {
+        uint e = tid + i * 256u;
+        if (tb != 0u) {
+            uint nr = e / BK;
+            uint kc = e % BK;
+            sB[nr * BK + kc] = load_b(k0 + kc, n0 + nr);
+        } else {
+            uint kr = e / BN;
+            uint nc = e % BN;
+            sB[kr * BN + nc] = load_b(k0 + kr, n0 + nc);
+        }
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint m0 = gl_WorkGroupID.y * BM;
+    uint n0 = gl_WorkGroupID.x * BN;
+    uint sr = (sg / 2u) * 32u;
+    uint sc = (sg % 2u) * 64u;
+    coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator> ac[2][4];
+    for (uint i = 0; i < 2u; i = i + 1) {
+        for (uint j = 0; j < 4u; j = j + 1) {
+            ac[i][j] = coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+    for (uint k0 = 0; k0 < k; k0 = k0 + BK) {
+        stage(m0, n0, k0, tid);
+        barrier();
+        for (uint kk = 0; kk < BK; kk = kk + T) {
+            coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseA> ma[2];
+            for (uint i = 0; i < 2u; i = i + 1) {
+                if (ta != 0u) {
+                    coopMatLoad(ma[i], sA, kk * BM + sr + i * T, BM, gl_CooperativeMatrixLayoutColumnMajor);
+                } else {
+                    coopMatLoad(ma[i], sA, (sr + i * T) * BK + kk, BK, gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+            for (uint j = 0; j < 4u; j = j + 1) {
+                coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseB> mb;
+                if (tb != 0u) {
+                    coopMatLoad(mb, sB, (sc + j * T) * BK + kk, BK, gl_CooperativeMatrixLayoutColumnMajor);
+                } else {
+                    coopMatLoad(mb, sB, kk * BN + sc + j * T, BN, gl_CooperativeMatrixLayoutRowMajor);
+                }
+                for (uint i = 0; i < 2u; i = i + 1) {
+                    ac[i][j] = coopMatMulAdd(ma[i], mb, ac[i][j]);
+                }
+            }
+        }
+        barrier();
+    }
+    float inv = 1.0 / (slot_scale(sa) * slot_scale(sb));
+    for (uint i = 0; i < 2u; i = i + 1) {
+        uint row = m0 + sr + i * T;
+        for (uint j = 0; j < 4u; j = j + 1) {
+            uint col = n0 + sc + j * T;
+            if (row < m && col < n) {
+                uint at = row * n + col;
+                ac[i][j] = ac[i][j] * inv;
+                if (acc != 0u) {
+                    coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator> prev;
+                    coopMatLoad(prev, C, at, n, gl_CooperativeMatrixLayoutRowMajor);
+                    ac[i][j] = ac[i][j] + prev;
+                }
+                coopMatStore(ac[i][j], C, at, n, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+    }
+}

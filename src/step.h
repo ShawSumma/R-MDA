@@ -27,25 +27,18 @@ enum {
     MDA_STEP_MUON_PHASE_MOMENTUM,
     MDA_STEP_MUON_PHASE_NORM,
     MDA_STEP_MUON_PHASE_NORMALIZE,
-    MDA_STEP_MUON_PHASE_TRANSPOSE,
     MDA_STEP_MUON_PHASE_GRAM,
-    MDA_STEP_MUON_PHASE_CAST,
-    MDA_STEP_MUON_PHASE_SQUARE,
     MDA_STEP_MUON_PHASE_POLY,
-    MDA_STEP_MUON_PHASE_BX,
     MDA_STEP_MUON_PHASE_ITERATE,
     MDA_STEP_MUON_PHASE_UPDATE,
 };
 
 struct mda_step_muon_t {
     mda_vkc_buf_t x;
-    mda_vkc_buf_t x16;
-    mda_vkc_buf_t xt16;
+    mda_vkc_buf_t x16[2];
     mda_vkc_buf_t a;
     mda_vkc_buf_t a16;
-    mda_vkc_buf_t aa;
     mda_vkc_buf_t b16;
-    mda_vkc_buf_t bx;
     mda_vkc_buf_t red;
     mda_model_param_t *p;
     uint32_t rows;

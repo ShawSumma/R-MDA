@@ -1,4 +1,5 @@
 #version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer B0 { float DK[]; };
@@ -20,10 +21,12 @@ layout(std430, binding = 15) writeonly buffer B15 { float OV[]; };
 layout(std430, binding = 16) writeonly buffer B16 { float OR[]; };
 layout(std430, binding = 17) writeonly buffer B17 { float OW[]; };
 layout(std430, binding = 18) writeonly buffer B18 { float OA[]; };
+layout(std430, binding = 19) buffer B19 { uint amax[]; };
 layout(push_constant) uniform pc {
     uint n_vec;
     uint hd;
     uint seqlen;
+    uint slot;
 };
 
 const float C = 0.60653066;
@@ -42,6 +45,13 @@ float group_sum(float x, uint lid) {
     return red[lid & ~63u];
 }
 
+void note_max(uint s, float v) {
+    float m = subgroupMax(v);
+    if (subgroupElect() && m > uintBitsToFloat(amax[s])) {
+        atomicMax(amax[s], floatBitsToUint(m));
+    }
+}
+
 void main() {
     uint lid = gl_LocalInvocationID.x;
     uint vec = gl_WorkGroupID.x * 4u + (lid >> 6);
@@ -58,14 +68,28 @@ void main() {
         kh = khat[pi];
     }
     float dot = group_sum(kh * dk, lid);
+    vec4 o = vec4(0.0);
+    float oa = 0.0;
     if (live) {
-        OK[ui] = (dk - kh * dot) * kinv[vec];
-        OV[ui] = 0.5 * (DV[pi] + DV2[pi]);
-        OR[ui] = 0.5 * (DR[pi] + DR2[pi]);
         float w = PW[pi];
         float s = -log(w) / C;
-        OW[ui] = 0.5 * (DW[pi] + DW2[pi]) * (-C * w * s * (1.0 - s));
         float a = PA[pi];
-        OA[ui] = 0.5 * (DA[pi] + DA2[pi]) * a * (1.0 - a);
+        o = vec4(
+            (dk - kh * dot) * kinv[vec],
+            0.5 * (DV[pi] + DV2[pi]),
+            0.5 * (DR[pi] + DR2[pi]),
+            0.5 * (DW[pi] + DW2[pi]) * (-C * w * s * (1.0 - s))
+        );
+        oa = 0.5 * (DA[pi] + DA2[pi]) * a * (1.0 - a);
+        OK[ui] = o.x;
+        OV[ui] = o.y;
+        OR[ui] = o.z;
+        OW[ui] = o.w;
+        OA[ui] = oa;
     }
+    note_max(slot, abs(o.x));
+    note_max(slot + 1u, abs(o.y));
+    note_max(slot + 2u, abs(o.z));
+    note_max(slot + 3u, abs(o.w));
+    note_max(slot + 4u, abs(oa));
 }

@@ -46,7 +46,7 @@ void mda_sample_count(mda_sample_stats_t *st, const mda_data_corpus_t *cp, mda_f
         st->nelbo += loss[i];
         st->bytes += b->mask[i] * cp->tok.entries[b->target[i]].len;
         if (b->mask[i] != 0.0f) {
-            uint32_t bucket = mda_sample_bucket(b->t[i]);
+            uint32_t bucket = mda_sample_bucket(1.0f / b->weight[i]);
             st->masked += 1.0;
             st->total += 1;
             st->bucket_total[bucket] += 1;
@@ -143,7 +143,7 @@ bool mda_sample_scratch(mda_model_t *m, const mda_data_corpus_t *cp, mda_fwd_scr
 }
 
 bool mda_sample_model(mda_vkc_t *c, const mda_data_corpus_t *cp, const char *path, const char *mode) {
-    mda_model_t *m = mda_model_init(c, mda_model_cfg_mode(cp->tok.count, mode));
+    mda_model_t *m = mda_model_init(c, mda_model_cfg_mode(cp->tok.count, mode, mda_model_cfg(cp->tok.count).batch));
     if (m == NULL) {
         return false;
     } else {

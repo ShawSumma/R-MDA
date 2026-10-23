@@ -155,7 +155,7 @@ bool mda_train_trainer(mda_step_trainer_t *tr, const mda_data_corpus_t *cp, mda_
 }
 
 bool mda_train_model(mda_vkc_t *c, const mda_data_corpus_t *cp, mda_train_args_t args) {
-    mda_model_cfg_t cfg = mda_model_cfg_mode(cp->tok.count, args.mode);
+    mda_model_cfg_t cfg = mda_model_cfg_mode(cp->tok.count, args.mode, args.batch);
     mda_model_t *m = mda_model_init(c, cfg);
     if (m == NULL) {
         return false;
@@ -188,7 +188,8 @@ bool mda_train_main(uint32_t argc, char **argv) {
         .ckpt_path = mda_util_arg(argc, argv, 2, MDA_CKPT_PATH),
         .lr_peak = strtof(mda_util_arg(argc, argv, 1, "3e-4"), NULL),
         .stop = (uint32_t)strtoul(mda_util_arg(argc, argv, 3, "0"), NULL, 10),
-        .accum = (uint32_t)strtoul(mda_util_arg(argc, argv, 4, "8"), NULL, 10),
+        .accum = (uint32_t)strtoul(mda_util_arg(argc, argv, 4, "2"), NULL, 10),
+        .batch = (uint32_t)strtoul(mda_util_arg(argc, argv, 7, "8"), NULL, 10),
         .muon = strcmp(mda_util_arg(argc, argv, 5, "muon"), "muon") == 0,
         .mode = mda_util_arg(argc, argv, 6, "diffusion"),
         .sched = mda_train_sched(mda_util_arg(argc, argv, 6, "diffusion")),

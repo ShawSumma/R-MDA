@@ -28,7 +28,6 @@ typedef struct mda_pc_softmax_t mda_pc_softmax_t;
 typedef struct mda_pc_sumsq_t mda_pc_sumsq_t;
 typedef struct mda_pc_adam_t mda_pc_adam_t;
 typedef struct mda_pc_muon_t mda_pc_muon_t;
-typedef struct mda_pc_temb_t mda_pc_temb_t;
 typedef struct mda_pc_adaln_t mda_pc_adaln_t;
 
 enum {
@@ -89,7 +88,11 @@ struct mda_pc_mm16_t {
     uint32_t k;
     uint32_t sa;
     uint32_t sb;
-    uint32_t acc;
+    uint32_t ta;
+    uint32_t tb;
+    uint32_t store;
+    float alpha;
+    float beta;
 };
 
 struct mda_pc_mm_bw_t {
@@ -97,12 +100,14 @@ struct mda_pc_mm_bw_t {
     uint32_t n;
     uint32_t k;
     uint32_t mode;
+    uint32_t acc;
 };
 
 struct mda_pc_heads_t {
     uint32_t n_vec;
     uint32_t hd;
     uint32_t seqlen;
+    uint32_t slot;
 };
 
 struct mda_pc_wkv_t {
@@ -127,6 +132,7 @@ struct mda_pc_wkv_bwd_t {
     uint32_t blk;
     uint32_t nclean;
     uint32_t seq0;
+    uint32_t split;
 };
 
 struct mda_pc_vec_t {
@@ -150,11 +156,15 @@ struct mda_pc_hn_t {
 struct mda_pc_elem_t {
     uint32_t n;
     uint32_t op;
+    uint32_t slot;
+    uint32_t slot2;
 };
 
 struct mda_pc_ce_t {
     uint32_t rows;
     uint32_t vocab;
+    uint32_t op;
+    uint32_t slot;
 };
 
 struct mda_pc_argmax_t {
@@ -184,6 +194,7 @@ struct mda_pc_adam_t {
     float beta2;
     float eps;
     float wd;
+    float lr_mul;
 };
 
 struct mda_pc_muon_t {
@@ -194,20 +205,14 @@ struct mda_pc_muon_t {
     float p1;
 };
 
-struct mda_pc_temb_t {
-    uint32_t batch;
-    uint32_t d;
-    uint32_t seqlen;
-};
-
 struct mda_pc_adaln_t {
     uint32_t bt;
     uint32_t d;
-    uint32_t seqlen;
     uint32_t op;
-    uint32_t stride;
     uint32_t s_off;
     uint32_t sh_off;
+    uint32_t rows_per;
+    float scale;
 };
 
 #endif

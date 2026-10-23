@@ -62,14 +62,6 @@ void mda_generate_remask(uint32_t *ids, uint32_t n, uint32_t first, uint32_t mas
     }
 }
 
-float mda_generate_masked_frac(const uint32_t *ids, uint32_t n, uint32_t mask_id) {
-    uint32_t masked = 0;
-    for (uint32_t p = 0; p < n; p += 1) {
-        masked += ids[p] == mask_id;
-    }
-    return (float)masked / (float)n;
-}
-
 uint32_t mda_generate_draw(const float *probs, uint32_t vocab, double u) {
     double acc = 0.0;
     uint32_t v = 0;
@@ -102,18 +94,12 @@ void mda_generate_rows(mda_generate_ctx_t *g, float *dst, uint32_t row, uint32_t
     memcpy(dst, src + ((size_t)row * cfg.seqlen + pos) * cfg.vocab, (size_t)count * cfg.vocab * sizeof(float));
 }
 
-void mda_generate_put(mda_data_batch_t *b, uint32_t i, uint32_t id, float t) {
-    b->ids[i] = id;
-    b->t[i] = t;
-}
-
 void mda_generate_fill_spec(mda_generate_ctx_t *g, uint32_t lo) {
     uint32_t blk = g->m->cfg.seqlen;
-    mda_data_batch_t *b = &g->sc->batch;
+    uint32_t *ids = g->sc->batch.ids;
     for (uint32_t s = 0; s < g->nseq; s += 1) {
         const mda_generate_spec_t *sp = &g->specs[s];
         const uint32_t *row = g->done + s * g->len;
-        float t = (float)(lo + blk - mda_util_min_u32(sp->n, lo + blk)) / (float)blk;
         for (uint32_t p = 0; p < blk; p += 1) {
             uint32_t at = lo + p;
             uint32_t clean = g->mask_id;
@@ -124,21 +110,20 @@ void mda_generate_fill_spec(mda_generate_ctx_t *g, uint32_t lo) {
             } else if (at < sp->n + sp->k) {
                 clean = sp->drafts[at - sp->n];
             }
-            mda_generate_put(b, s * blk + p, clean, 0.0f);
-            mda_generate_put(b, (g->nseq + s) * blk + p, noisy, t);
+            ids[s * blk + p] = clean;
+            ids[(g->nseq + s) * blk + p] = noisy;
         }
     }
 }
 
 void mda_generate_fill_rows(mda_generate_ctx_t *g, uint32_t lo) {
     uint32_t blk = g->m->cfg.seqlen;
-    mda_data_batch_t *b = &g->sc->batch;
+    uint32_t *ids = g->sc->batch.ids;
     for (uint32_t s = 0; s < g->nseq; s += 1) {
         const uint32_t *row = g->done + s * g->len + lo;
-        float t = mda_generate_masked_frac(row, blk, g->mask_id);
         for (uint32_t p = 0; p < blk; p += 1) {
-            mda_generate_put(b, s * blk + p, row[p], 0.0f);
-            mda_generate_put(b, (g->nseq + s) * blk + p, row[p], t);
+            ids[s * blk + p] = row[p];
+            ids[(g->nseq + s) * blk + p] = row[p];
         }
     }
 }
@@ -296,16 +281,10 @@ uint32_t mda_generate_round_cached(mda_generate_ctx_t *g, uint32_t round) {
 }
 
 uint32_t mda_generate_round_plain(mda_generate_ctx_t *g, uint32_t round) {
-    mda_data_batch_t *b = &g->sc->batch;
     mda_generate_start(g);
     for (uint32_t step = 0; step < g->steps && g->m->c->fail == false; step += 1) {
         uint64_t key = mda_generate_key(round, 0, step);
-        for (uint32_t s = 0; s < g->nseq; s += 1) {
-            float t = mda_generate_masked_frac(g->done + s * g->len, g->len, g->mask_id);
-            for (uint32_t p = 0; p < g->len; p += 1) {
-                mda_generate_put(b, s * g->len + p, g->done[s * g->len + p], t);
-            }
-        }
+        memcpy(g->sc->batch.ids, g->done, g->nseq * g->len * sizeof(uint32_t));
         g->sc->seed = (uint32_t)mda_hash_u64(MDA_HASH_GEN, key, 0);
         mda_fwd_run(g->m, g->sc);
         uint32_t *tok = g->sc->tok.ptr;
@@ -327,7 +306,6 @@ void mda_generate_judge(mda_model_t *j, mda_fwd_scratch_t *js, const mda_tokeniz
         uint32_t p = i % cfg.seqlen;
         b->ids[i] = gen[i];
         b->weight[i] = 1.0f;
-        b->t[i] = 0.0f;
         if (p + 1 < cfg.seqlen) {
             b->target[i] = gen[i + 1];
             b->mask[i] = 1.0f;

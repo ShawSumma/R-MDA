@@ -31,14 +31,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("logs", nargs="+", type=Path)
     ap.add_argument("--last", type=int, default=2000, help="steps to average over")
+    ap.add_argument("--end", type=int, default=None, help="last step of the window (default: each log's last)")
     args = ap.parse_args()
     for path in args.logs:
         rs = rows(path)
         if not rs:
             print(f"{path}: no step lines")
         else:
-            end = rs[-1].step
-            tail = [r for r in rs if r.step > end - args.last]
+            end = rs[-1].step if args.end is None else args.end
+            tail = [r for r in rs if end - args.last < r.step <= end]
             loss = sum(r.loss for r in tail) / len(tail)
             bpb = sum(r.bpb for r in tail) / len(tail)
             print(f"{path}: step {end}, last {args.last} steps: loss {loss:.4f}, bits/byte {bpb:.4f}, {rs[-1].sec:.3f} s/step")

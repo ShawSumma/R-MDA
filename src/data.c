@@ -304,7 +304,6 @@ void mda_data_next(mda_data_batch_t *b, const mda_data_corpus_t *cp, uint32_t po
 void mda_data_clean(mda_data_batch_t *b, const mda_data_corpus_t *cp, uint32_t pos, size_t at) {
     mda_data_next(b, cp, pos, at);
     b->weight[pos] = 1.0f;
-    b->t[pos] = 0.0f;
 }
 
 uint32_t mda_data_window(const mda_data_batch_t *b, mda_data_sched_t sched) {
@@ -327,7 +326,6 @@ void mda_data_batch(mda_data_batch_t *b, const mda_data_corpus_t *cp, mda_data_s
         for (uint32_t p = 0; p < b->seqlen; p += 1) {
             uint32_t pos = (b->nclean + s) * b->seqlen + p;
             b->weight[pos] = w;
-            b->t[pos] = t;
             if (sched == MDA_DATA_SCHED_AR) {
                 mda_data_next(b, cp, pos, start + p);
             } else {

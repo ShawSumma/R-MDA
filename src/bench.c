@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -89,6 +90,78 @@ bool mda_bench_trainer(mda_step_trainer_t *tr) {
     return tr->m->c->fail == false;
 }
 
+double mda_bench_mm_time(mda_vkc_t *c, mda_vkc_kernel_t *k, mda_vkc_buf_t **bufs, uint32_t gx, uint32_t gy, mda_pc_mm16_t *pc) {
+    double best = 1e30;
+    for (uint32_t r = 0; r < MDA_BENCH_ROUNDS; r += 1) {
+        double t0 = mda_util_now();
+        mda_vkc_begin(c);
+        for (uint32_t i = 0; i < MDA_BENCH_MM_REPS; i += 1) {
+            mda_vkc_run(c, k, bufs, gx, gy, 1, pc);
+        }
+        mda_vkc_flush(c);
+        best = fmin(best, (mda_util_now() - t0) / MDA_BENCH_MM_REPS);
+    }
+    return best;
+}
+
+void mda_bench_mm_shape(mda_model_t *m, uint32_t rows, uint32_t n, uint32_t k, uint32_t ta, uint32_t tb) {
+    mda_vkc_t *c = m->c;
+    mda_vkc_buf_t a = mda_vkc_alloc(c, (VkDeviceSize)rows * k * sizeof(uint16_t));
+    mda_vkc_buf_t b = mda_vkc_alloc(c, (VkDeviceSize)k * n * sizeof(uint16_t));
+    mda_vkc_buf_t out = mda_vkc_alloc(c, (VkDeviceSize)rows * n * sizeof(float));
+    mda_vkc_fill(c, &a, 0);
+    mda_vkc_fill(c, &b, 0);
+    mda_vkc_buf_t *bufs[6] = {
+        &a,
+        &b,
+        &out,
+        &m->amax,
+        &out,
+        &out,
+    };
+    mda_pc_mm16_t pc = {
+        .m = rows,
+        .n = n,
+        .k = k,
+        .sa = MDA_PC_NO_SLOT,
+        .sb = MDA_PC_NO_SLOT,
+        .ta = ta,
+        .tb = tb,
+        .store = MDA_FWD_STORE32,
+        .alpha = 1.0f,
+    };
+    double t64 = mda_bench_mm_time(c, &m->k_mm16, bufs, n / 64, rows / 64, &pc);
+    double t256 = mda_bench_mm_time(c, &m->k_mm16w, bufs, (n + 127) / 128, (rows + 127) / 128, &pc);
+    double flops = 2.0 * rows * n * k;
+    printf("%6u %6u %6u %2u %2u %9.3f %7.2f %9.3f %7.2f\n", rows, n, k, ta, tb, t64 * 1e3, flops / t64 / 1e12, t256 * 1e3, flops / t256 / 1e12);
+    mda_vkc_free(c, &a);
+    mda_vkc_free(c, &b);
+    mda_vkc_free(c, &out);
+}
+
+void mda_bench_matmuls(mda_model_t *m) {
+    mda_model_cfg_t cfg = m->cfg;
+    uint32_t bt = cfg.batch * cfg.seqlen;
+    uint32_t d = cfg.d;
+    uint32_t hid = cfg.ffn_hidden;
+    printf("%6s %6s %6s %2s %2s %9s %7s %9s %7s\n", "m", "n", "k", "ta", "tb", "64 ms", "TFLOPS", "128 ms", "TFLOPS");
+    mda_bench_mm_shape(m, bt, d, d, 0, 0);
+    mda_bench_mm_shape(m, bt, hid, d, 0, 0);
+    mda_bench_mm_shape(m, bt, d, hid, 0, 0);
+    mda_bench_mm_shape(m, bt, cfg.vocab, d, 0, 0);
+    mda_bench_mm_shape(m, bt, d, cfg.vocab, 0, 0);
+    mda_bench_mm_shape(m, d, d, bt, 1, 0);
+    mda_bench_mm_shape(m, d, hid, bt, 1, 0);
+    mda_bench_mm_shape(m, hid, d, bt, 1, 0);
+    mda_bench_mm_shape(m, cfg.vocab, d, bt, 1, 0);
+    mda_bench_mm_shape(m, d, cfg.vocab, bt, 1, 0);
+    mda_bench_mm_shape(m, d, d, d, 0, 0);
+    mda_bench_mm_shape(m, d, d, hid, 0, 1);
+    mda_bench_mm_shape(m, d, d, hid, 1, 0);
+    mda_bench_mm_shape(m, d, hid, d, 0, 0);
+    mda_bench_mm_shape(m, hid, d, d, 0, 0);
+}
+
 void mda_bench_decode_time(mda_model_t *m, mda_fwd_scratch_t *sc, const char *name) {
     mda_sort_item_t ms[MDA_BENCH_ROUNDS];
     for (uint32_t i = 0; i < 2; i += 1) {
@@ -135,7 +208,6 @@ bool mda_bench_decode(mda_vkc_t *c, mda_model_cfg_t cfg, const char *name, bool 
         }
         for (uint32_t i = 0; i < cfg.batch * cfg.seqlen && c->fail == false; i += 1) {
             sc.batch.ids[i] = (uint32_t)(mda_hash_u64(MDA_HASH_CORPUS, 1, i) % MDA_BENCH_VOCAB);
-            sc.batch.t[i] = 0.5f;
         }
         mda_bench_decode_time(m, &sc, name);
         mda_bench_decode_profile(m, &sc, name);
@@ -155,11 +227,12 @@ bool mda_bench_decoders(mda_vkc_t *c) {
     }
 }
 
-bool mda_bench_device(mda_vkc_t *c, bool muon) {
-    mda_model_t *m = mda_model_init(c, mda_model_cfg(MDA_BENCH_VOCAB));
+bool mda_bench_device(mda_vkc_t *c, bool muon, uint32_t batch, const char *mode) {
+    mda_model_t *m = mda_model_init(c, mda_model_cfg_mode(MDA_BENCH_VOCAB, mode, batch));
     if (m == NULL) {
         return false;
     } else {
+        mda_bench_matmuls(m);
         mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, muon);
         if (c->fail) {
             return false;
@@ -173,11 +246,13 @@ bool mda_bench_device(mda_vkc_t *c, bool muon) {
 
 bool mda_bench_main(uint32_t argc, char **argv) {
     bool muon = strcmp(mda_util_arg(argc, argv, 1, "adamw"), "muon") == 0;
+    uint32_t batch = (uint32_t)strtoul(mda_util_arg(argc, argv, 2, "2"), NULL, 10);
+    const char *mode = mda_util_arg(argc, argv, 3, "diffusion");
     mda_vkc_t c = mda_vkc_init();
     if (c.fail) {
         return false;
     } else {
-        return mda_bench_device(&c, muon);
+        return mda_bench_device(&c, muon, batch, mode);
     }
 }
 

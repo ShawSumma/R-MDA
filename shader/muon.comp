@@ -81,13 +81,6 @@ void elementwise(uint i) {
         x[i] = x[i] * red[aux];
         h[i] = float16_t(x[i]);
         break;
-    case 3u:
-        h[i] = float16_t(p0 * a[i] + p1 * b[i]);
-        break;
-    case 4u:
-        x[i] = p0 * x[i] + a[i];
-        h[i] = float16_t(x[i]);
-        break;
     default:
         if (skip == 0.0) {
             a[i] = a[i] - lr * p0 * x[i];

@@ -10,7 +10,7 @@ layout(std430, binding = 1) readonly buffer buf_b {
 layout(std430, binding = 2) readonly buffer buf_dc {
     float dc[];
 };
-layout(std430, binding = 3) writeonly buffer buf_dout {
+layout(std430, binding = 3) buffer buf_dout {
     float dout[];
 };
 layout(push_constant) uniform pc {
@@ -18,6 +18,7 @@ layout(push_constant) uniform pc {
     uint n;
     uint k;
     uint mode;
+    uint accum;
 };
 
 void main() {
@@ -27,6 +28,9 @@ void main() {
         float acc = 0.0;
         for (uint j = 0; j < n; j += 1u) {
             acc += dc[row * n + j] * b[col * n + j];
+        }
+        if (accum != 0u) {
+            acc += dout[row * k + col];
         }
         dout[row * k + col] = acc;
     } else if (mode != 0 && row < k && col < n) {

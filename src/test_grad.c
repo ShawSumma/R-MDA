@@ -82,6 +82,7 @@ void mda_test_grad_perturb(mda_model_t *m) {
         mda_test_grad_jitter(ly->n1, 0.2f);
         mda_test_grad_jitter(ly->n2, 0.2f);
         mda_test_grad_jitter(ly->shift_mix, 0.4f);
+        mda_test_grad_jitter(ly->ada, 0.004f);
     }
     mda_test_grad_jitter(m->n_out, 0.2f);
 }
@@ -133,20 +134,20 @@ bool mda_test_grad_fd_param(mda_model_t *m, mda_fwd_scratch_t *sc, uint32_t i, f
         u[j] = mda_test_grad_sign(g[j] >= 0.0f);
         analytic += (double)g[j] * gs * u[j];
     }
-    float eps[2] = {
-        mda_test_grad_eps(1e-3, l_infer, analytic),
-        mda_test_grad_eps(1e-4, l_infer, analytic),
-    };
-    double numeric[2];
+    float small = mda_test_grad_eps(1e-4, l_infer, analytic);
+    double half = mda_test_grad_fd(m, sc, p, u, 0.5f * small);
+    double numeric[3];
+    numeric[0] = mda_test_grad_fd(m, sc, p, u, mda_test_grad_eps(1e-3, l_infer, analytic));
+    numeric[1] = mda_test_grad_fd(m, sc, p, u, small);
+    numeric[2] = (4.0 * half - numeric[1]) / 3.0;
     double best = INFINITY;
-    for (uint32_t e = 0; e < 2; e += 1) {
-        numeric[e] = mda_test_grad_fd(m, sc, p, u, eps[e]);
+    for (uint32_t e = 0; e < 3; e += 1) {
         double diff = fabs(analytic - numeric[e]);
         best = fmin(best, mda_test_grad_rel(diff, fmax(fabs(analytic), fabs(numeric[e]))));
     }
     free(u);
     bool pass = best <= 0.005;
-    printf("%u %s analytic %+.6e numeric %+.6e %+.6e rel %.4f %s\n", i, p->name, analytic, numeric[0], numeric[1], best, mda_util_verdict(pass));
+    printf("%u %s analytic %+.6e numeric %+.6e %+.6e richardson %+.6e rel %.4f %s\n", i, p->name, analytic, numeric[0], numeric[1], numeric[2], best, mda_util_verdict(pass));
     return pass;
 }
 
@@ -180,6 +181,12 @@ bool mda_test_grad_opt(mda_step_trainer_t *tr) {
     double norm = gs * sqrt(ss);
     double scale = gs * fmin(1.0, 1.0 / norm);
     float lr = 1e-3f;
+    float *mul = calloc(n, sizeof(float));
+    for (uint32_t i = 0; i < m->n_params; i += 1) {
+        for (uint32_t j = 0; j < m->params[i].n; j += 1) {
+            mul[m->params[i].off + j] = m->params[i].lr_mul;
+        }
+    }
     mda_step_train(tr, lr, 1);
     float *mg = m->m_all.ptr;
     float *vg = m->v_all.ptr;
@@ -192,13 +199,14 @@ bool mda_test_grad_opt(mda_step_trainer_t *tr) {
         double mi = (1.0 - MDA_STEP_ADAM_B1) * g0[i] * scale;
         em += (mg[i] - mi) * (mg[i] - mi);
         dm += mi * mi;
-        double upd = lr * (mg[i] / (1.0 - MDA_STEP_ADAM_B1)) / (sqrt(vg[i] / (1.0 - MDA_STEP_ADAM_B2)) + 1e-8);
+        double upd = lr * mul[i] * (mg[i] / (1.0 - MDA_STEP_ADAM_B1)) / (sqrt(vg[i] / (1.0 - MDA_STEP_ADAM_B2)) + 1e-8);
         double wi = w0[i] - upd;
         ew += (wg[i] - wi) * (wg[i] - wi);
         dw += upd * upd;
     }
     free(g0);
     free(w0);
+    free(mul);
     double nrel = fabs(tr->gnorm - norm) / norm;
     double mrel = sqrt(em / dm);
     double wrel = sqrt(ew / dw);
@@ -412,13 +420,11 @@ void mda_test_grad_copy_rows(mda_data_batch_t *dst, const mda_data_batch_t *src)
     memcpy(dst->target + o, src->target, n * sizeof(uint32_t));
     memcpy(dst->mask + o, src->mask, n * sizeof(float));
     memcpy(dst->weight + o, src->weight, n * sizeof(float));
-    memcpy(dst->t + o, src->t, n * sizeof(float));
     for (uint32_t i = 0; i < dst->nclean * dst->seqlen; i += 1) {
         dst->ids[i] = src->target[i];
         dst->target[i] = src->target[i];
         dst->mask[i] = 0.0f;
         dst->weight[i] = 1.0f;
-        dst->t[i] = 0.0f;
     }
 }
 
@@ -502,7 +508,6 @@ void mda_test_grad_slice(mda_data_batch_t *dst, const mda_data_batch_t *src, uin
             dst->target[i] = src->target[j];
             dst->mask[i] = src->mask[j];
             dst->weight[i] = src->weight[j];
-            dst->t[i] = src->t[j];
         }
     }
 }

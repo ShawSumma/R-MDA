@@ -58,7 +58,10 @@ RWKV-7 blocks trained as a masked-diffusion text denoiser, in raw Vulkan compute
   the sticky `mda_vkc_t.fail` (every vkc call is then a no-op).
 - `tools/fetch_corpus.py` -- downloads FineWeb-Edu shards into `data/fineweb-edu/` and
   writes their text as `data/corpus.txt`; run it with `.venv/bin/python3` (pyarrow).
-- `tools/logstat.py` -- mean loss and bits/byte over the tail of `build/train` logs.
+- `tools/logstat.py` -- mean loss and bits/byte over a window of steps of
+  `build/train` logs (`--last`, `--end`).
+- `tools/fold_ada.py` -- converts a checkpoint with the [d, 4d] `ada` matrix (magic 8)
+  to the folded vector (magic 9), weights and Adam moments.
 - `src/vkc` -- Vulkan harness: device selection + feature checks, device-local
   (`mda_vkc_alloc`) vs host-cached (`mda_vkc_alloc_cached`) buffers, views, copy/fill,
   kernel loading, dispatch. `mda_vkc_begin`/`mda_vkc_flush` record a transient batch
@@ -74,8 +77,8 @@ RWKV-7 blocks trained as a masked-diffusion text denoiser, in raw Vulkan compute
 - `src/vocab` -- Unigram vocab training (seeding, EM, pruning).
 - `src/data` -- loads the vocab and tokenizes the corpus on every core into
   `data/corpus.txt.ids` (reused while vocab and corpus are unchanged; last 1% held out
-  as the eval split); `mda_data_batch` fills a batch (ids, target, mask, loss weight,
-  mask rate t) as a function of its key (the training step), so a run is reproducible
+  as the eval split); `mda_data_batch` fills a batch (ids, target, mask, loss weight)
+  as a function of its key (the training step), so a run is reproducible
   and a resume never replays batches. Schedules: `BELL` (diffusion training: t from a
   truncated N(0.5, 0.1), unweighted loss), `ELBO` (evaluation: t uniform on (0, 1], 1/t
   weight, so the loss is the NELBO), `AR` (next-token targets, nothing masked).
@@ -84,9 +87,20 @@ RWKV-7 blocks trained as a masked-diffusion text denoiser, in raw Vulkan compute
   per-role arenas, plus the transposed fp16 mirror), kernel handles.
 - `src/fwd` -- the GPU optimizer state block (`mda_fwd_opt_t`), scratch buffers (with the
   host batch view of the inputs), per-layer saved activations (`mda_fwd_act_t`), dispatch
-  helpers, mirror refresh, and the one forward (`mda_fwd_rec`: embed, mask-rate adaLN
-  conditioning, blocks, head tied to the token embedding) shared by training and
-  inference; `mda_fwd_run` wraps it for eval/generation. With `mda_model_t.causal` set
+  helpers, mirror refresh, and the one forward (`mda_fwd_rec`: embed, adaLN with a
+  per-layer scale/shift vector `ada` (the network gets no mask rate, as in RADD; read
+  times `mda_model_ada_scale` = sqrt(d/2) and updated with that AdamW lr multiplier,
+  which is exactly the former [d, 4d] matrix applied to a fixed input), blocks, head
+  tied to the token embedding) shared by training and
+  inference; `mda_fwd_run` wraps it for eval/generation. The residual stream lives in
+  the layers' `x_in` / `x_mid`: each sublayer's last matmul writes prev + its product
+  straight into the next one (the last layer into `x`). Each layer keeps the fp16 copies
+  (and scale slots) of the activations its matmuls read, so the backward reuses them;
+  the FFN's `elem` computes silu(gate) * up with its absmax in one pass, and the
+  backward recomputes silu from `gate_pre`. The loss pass (`softmax_ce` op 0) leaves
+  the logits alone and keeps each row's logsumexp and its gradient's absmax; the
+  backward writes the logit gradient from them straight to fp16 (op 2, op 1 in fp32
+  for ref32). With `mda_model_t.causal` set
   at record time only the left-to-right wkv pass runs, making the same network an AR
   model. A config with `block` (`mda_model_cfg_block`, mode names `block` / `block<n>`)
   is block diffusion jointly with AR: the batch's first half holds the second half's
@@ -101,21 +115,37 @@ RWKV-7 blocks trained as a masked-diffusion text denoiser, in raw Vulkan compute
   then continues a sequence one block at a time, exactly as the full-length model
   would. With `stage` set, `mda_fwd_run` also writes the temperature softmax of every
   row there in the same submit.
-- `src/bwd` -- matmul backward helpers (coopmat with transposed operands; scalar in
-  ref32).
+- `src/bwd` -- matmul backward helpers (scalar in ref32): weight grads read the saved
+  fp16 activation and the output grad transposed in place (`MDA_FWD_AT`), input grads
+  multiply by the transposed fp16 weight mirror and can accumulate. `mda_bwd_mm` takes
+  the output grad's fp16 scale slot from the caller: `elem` and `heads_bwd` fold the
+  absmax of what they write into their own pass. The fp16 matmul
+  (`mda_fwd_mm16_epi`) takes the operand layout (`MDA_FWD_AB`/`AT`/`BT`, loops
+  specialized per layout outside the k loop) and an output stage `alpha * AB + beta *
+  prev` (`prev` may be the output itself) stored as fp32, fp16 or both, optionally
+  symmetric (`MDA_FWD_STORE_SYM`: only tiles on or above the diagonal run and mirror
+  themselves; the 64x64 kernel only). It runs the 128x128 kernel (2x2 subgroups of
+  64x64 each, subgroups past m or n idle) when that gives at least
+  `MDA_FWD_WIDE_GROUPS` workgroups, else the 64x64 one.
 - `src/step` -- `mda_step_trainer_t`: three persistent commands, forward + backward
   writing the grads (first micro-batch) or adding to them (the rest), and the optimizer
   (grad norm, clip, dynamic loss scale with overflow skip, Muon's Newton-Schulz update on
-  the hidden matrices with AdamW for the rest or AdamW alone, mirrors);
+  the hidden matrices, each iteration three matmuls whose output stages do the
+  polynomial and the update (the Gram matrix and the polynomial are symmetric), with
+  AdamW per parameter (its `lr_mul`) for the rest or AdamW alone, mirrors). In block
+  mode the noisy rows' wkv backward runs one workgroup per block, since each block's
+  recurrence is independent;
   `mda_step_begin` + `mda_step_micro` run one update of `accum` micro-batches,
   `mda_step_train` a one-micro-batch update, `mda_step_grad` forward + backward alone.
 - `src/ckpt` -- checkpoint format (header with config + vocab hash, then the arenas),
   atomic save, validated load.
 - `src/train.c` (+ `train.h`) -- training loop: warmup-stable-decay lr, logging,
   periodic checkpoints, resume;
-  `build/train [lr [checkpoint [stop [accum [adamw|muon [diffusion|block<n>|ar]]]]]]`
-  (defaults 3e-4, `models/ckpt.bin`, no stop, 8 micro-batches per update, muon,
-  diffusion; a stop update adds the decay over the last fifth).
+  `build/train [lr [checkpoint [stop [accum [adamw|muon [diffusion|block<n>|ar [batch]]]]]]]`
+  (defaults 3e-4, `models/ckpt.bin`, no stop, 2 micro-batches of 8 sequences per
+  update, muon, diffusion; a stop update adds the decay over the last fifth). Few large
+  micro-batches beat many small ones: the wkv kernels run one workgroup per sequence,
+  head and direction, and the matmuls get more rows.
 - `src/sample.c` (+ `sample.h`) -- held-out NELBO bits/byte (the comparable number),
   masked-token bits/byte, masked-fill accuracy and, in block mode, the clean rows' AR
   NLL, on fixed eval batches; `build/sample [checkpoint [diffusion|block<n>|ar]]`.
@@ -131,10 +161,12 @@ RWKV-7 blocks trained as a masked-diffusion text denoiser, in raw Vulkan compute
   `spec<k>` (block mode:
   self-speculative decoding, the noisy rows draft up to k tokens and the clean rows' AR
   distribution accepts or resamples them exactly).
-- `src/bench.c` (+ `bench.h`) -- forward / forward+backward / training-step timing on
-  synthetic tokens, plus the per-kernel GPU profile of a step, then decode-forward
-  timing and profile of the full-length block model vs the block-length cached one;
-  `build/bench [adamw|muon]`.
+- `src/bench.c` (+ `bench.h`) -- a table of both fp16 matmul kernels (64x64 and
+  128x128 tiles) on every shape training and Muon run, then forward / forward+backward /
+  training-step timing on synthetic tokens plus the per-kernel GPU profile of a step,
+  then decode-forward timing and profile of the full-length block model vs the
+  block-length cached one; `build/bench [adamw|muon [batch [diffusion|block<n>|ar]]]`
+  (`build/bench muon 8 block` is the default training config).
 - `src/train_tokenizer.c` -- trains `models/vocab.txt` from `data/corpus.txt`.
 - `src/probe_coopmat.c` -- lists the device's cooperative-matrix configs.
 - `src/probe_memory.c` -- lists memory heaps/types with GPU and host bandwidth per type.
@@ -142,9 +174,13 @@ RWKV-7 blocks trained as a masked-diffusion text denoiser, in raw Vulkan compute
   whose fp16 forward overflows, checks the fp32 forward, prints per-layer max
   activations.
 - `src/test_matmul_f16.c` -- fp16 coopmat matmuls vs the scalar fp32 matmul, plus the
-  scaled fp16 path on an operand far past fp16's range.
+  scaled fp16 path on an operand far past fp16's range, both kernels with plain and
+  transposed operands (including shapes that leave the 128x128 tiles partial in both
+  directions), and the output stage (`alpha * AB + beta * P` from a separate buffer, fp32
+  and fp16 stores).
 - `src/test_grad.c` -- train vs inference loss, fp16 vs fp32 backward,
-  finite-difference check of every param's gradient along sign(g) (tiny model, fp32
+  finite-difference check of every param's gradient along sign(g), best of two step
+  sizes and a Richardson extrapolation of the small one (tiny model, fp32
   reference mode `ref32`, in diffusion, causal and block mode), gradient accumulation vs
   summed grads, the GPU AdamW step, Muon updates vs a host Newton-Schulz, the overflow
   skip, one-block block mode equal to plain diffusion, block causality (no leak

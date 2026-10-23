@@ -18,6 +18,7 @@ struct mda_train_args_t {
     float lr_peak;
     uint32_t stop;
     uint32_t accum;
+    uint32_t batch;
     uint32_t sched;
     bool muon;
 };

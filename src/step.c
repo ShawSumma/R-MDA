@@ -30,48 +30,36 @@ void mda_step_head_bwd(mda_model_t *m, mda_fwd_scratch_t *sc) {
     uint32_t vocab = cfg.vocab;
     mda_model_param_t *e = m->tok_emb;
     if (m->ref32) {
+        mda_fwd_ce(m, sc, 1, MDA_PC_NO_SLOT);
         mda_fwd_mm(m, &sc->logits, &e->w, &sc->dnorm, bt, d, vocab);
         mda_bwd_mm_db(m, &sc->logits, &sc->xn, &e->g, bt, d, vocab);
     } else {
-        uint32_t sd = mda_fwd_cast_act(m, &sc->logits, &sc->dc16, bt * vocab);
-        mda_fwd_transpose16(m, &sc->logits, &sc->dlt16, bt, vocab, sd);
-        uint32_t sx = mda_fwd_cast_act(m, &sc->xn, &sc->a16, bt * d);
+        mda_fwd_ce(m, sc, 2, sc->ce_slot);
         mda_vkc_set_nobar(m->c, true);
-        mda_fwd_mm16_raw(m, &sc->dc16, sd, &e->w16, MDA_PC_NO_SLOT, &sc->dnorm, bt, d, vocab, false);
+        mda_fwd_mm16_raw(m, &sc->dc16, sc->ce_slot, &e->w16, MDA_PC_NO_SLOT, &sc->dnorm, bt, d, vocab, false, MDA_FWD_AB);
         mda_vkc_set_nobar(m->c, false);
-        mda_fwd_mm16_raw(m, &sc->dlt16, sd, &sc->a16, sx, &e->g, vocab, d, bt, m->grad_acc);
+        mda_fwd_mm16_raw(m, &sc->dc16, sc->ce_slot, &sc->a16, sc->a16_slot, &e->g, vocab, d, bt, m->grad_acc, MDA_FWD_AT);
     }
 }
 
-void mda_step_ffn_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly, mda_fwd_act_t *a, mda_vkc_buf_t *ada4) {
+void mda_step_ffn_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly, mda_fwd_act_t *a) {
     mda_model_cfg_t cfg = m->cfg;
     uint32_t bt = cfg.batch * cfg.seqlen;
     uint32_t d = cfg.d;
     uint32_t hid = cfg.ffn_hidden;
-    mda_bwd_mm_at(m, sc, &a->h, bt, hid);
-    mda_bwd_mm(m, sc, &a->h, ly->w_down, &sc->dxh_buf, &sc->dh, bt, d, hid);
-    mda_pc_elem_t pc = {
-        .n = bt * hid,
-        .op = 1,
-    };
-    mda_vkc_buf_t *bufs[5] = {
-        &sc->dh,
-        &a->gate_pre,
-        &a->up,
-        &a->gate,
-        &sc->dup,
-    };
-    mda_vkc_run(m->c, &m->k_elem, bufs, (bt * hid + 255) / 256, 1, 1, &pc);
-    mda_bwd_mm_at(m, sc, &a->n2, bt, d);
-    mda_bwd_mm(m, sc, &a->n2, ly->w_up, &sc->dup, &sc->dnorm, bt, hid, d);
-    mda_bwd_mm(m, sc, &a->n2, ly->w_gate, &sc->dh, &sc->dtmp2, bt, hid, d);
-    mda_fwd_vec_op(m, &sc->dnorm, &sc->dtmp2, bt * d, MDA_PC_VEC_ADD);
-    mda_fwd_adaln(m, &a->n2_pre, ada4, &sc->dnorm, &sc->dtmp, &sc->dada4, 1, 2);
+    uint32_t sx = mda_fwd_absmax(m, &sc->dxh_buf, bt * d);
+    mda_bwd_mm(m, sc, &a->h, &a->h16, a->h_slot, ly->w_down, &sc->dxh_buf, sx, &sc->dh, bt, d, hid, false);
+    uint32_t sh = mda_fwd_slot(m);
+    uint32_t su = mda_fwd_slot(m);
+    mda_fwd_elem(m, &sc->dh, a, &sc->dup, 1, sh, su);
+    mda_bwd_mm(m, sc, &a->n2, &a->n2_16, a->n2_slot, ly->w_up, &sc->dup, su, &sc->dnorm, bt, hid, d, false);
+    mda_bwd_mm(m, sc, &a->n2, &a->n2_16, a->n2_slot, ly->w_gate, &sc->dh, sh, &sc->dnorm, bt, hid, d, true);
+    mda_fwd_adaln(m, &a->n2_pre, ly->ada, &sc->dnorm, &sc->dtmp, 1, 2);
     mda_step_rmsnorm_bwd(m, &a->x_mid, &ly->n2->w, &sc->dtmp, &a->rms2, &ly->n2->g, &sc->dxh_buf, bt, d);
 }
 
-void mda_step_heads_run(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a, mda_vkc_buf_t **d2) {
-    mda_vkc_buf_t *hb[19] = {
+void mda_step_heads_run(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a, mda_vkc_buf_t **d2, uint32_t slot) {
+    mda_vkc_buf_t *hb[20] = {
         &sc->dpk,
         &sc->dpv,
         &sc->dpr,
@@ -91,11 +79,20 @@ void mda_step_heads_run(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a,
         &sc->pr,
         &sc->pw,
         &sc->pa,
+        &m->amax,
     };
-    mda_fwd_heads(m, &m->k_heads_b, hb);
+    mda_fwd_heads(m, &m->k_heads_b, hb, slot);
 }
 
-void mda_step_heads_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a) {
+uint32_t mda_step_heads_slots(mda_model_t *m) {
+    uint32_t slot = mda_fwd_slot(m);
+    for (uint32_t j = 1; j < 5; j += 1) {
+        mda_fwd_slot(m);
+    }
+    return slot;
+}
+
+uint32_t mda_step_heads_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a) {
     mda_vkc_buf_t *own[5] = {
         &sc->dpk,
         &sc->dpv,
@@ -110,14 +107,16 @@ void mda_step_heads_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a)
         &sc->dpw2,
         &sc->dpa2,
     };
+    uint32_t slot = mda_step_heads_slots(m);
     if (m->causal) {
-        mda_step_heads_run(m, sc, a, own);
+        mda_step_heads_run(m, sc, a, own, slot);
     } else {
-        mda_step_heads_run(m, sc, a, other);
+        mda_step_heads_run(m, sc, a, other, slot);
     }
+    return slot;
 }
 
-void mda_step_wkv_bwd_run(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a, uint32_t dir, uint32_t seq0, uint32_t count) {
+void mda_step_wkv_bwd_run(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a, uint32_t dir, uint32_t seq0, uint32_t count, uint32_t split) {
     mda_model_cfg_t cfg = m->cfg;
     mda_pc_wkv_bwd_t pc = {
         .bsz = cfg.batch,
@@ -128,6 +127,7 @@ void mda_step_wkv_bwd_run(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *
         .blk = cfg.block,
         .nclean = mda_model_nclean(cfg),
         .seq0 = seq0,
+        .split = split,
     };
     mda_vkc_buf_t *fwd0[6] = {
         &a->sstate,
@@ -164,18 +164,19 @@ void mda_step_wkv_bwd_run(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *
         d[5],
         &sc->dbstate,
     };
-    mda_vkc_run(m->c, &m->k_wkv_b, bufs, count * cfg.n_head, 1, 1, &pc);
+    mda_vkc_run(m->c, &m->k_wkv_b, bufs, count * cfg.n_head * split, 1, 1, &pc);
 }
 
 void mda_step_wkv_bwd_blocks(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a) {
     mda_model_cfg_t cfg = m->cfg;
     uint32_t nclean = mda_model_nclean(cfg);
+    uint32_t split = cfg.seqlen / cfg.block;
     uint32_t n = nclean * cfg.seqlen * cfg.d;
     mda_vkc_set_nobar(m->c, true);
-    mda_step_wkv_bwd_run(m, sc, a, 0, nclean, nclean);
+    mda_step_wkv_bwd_run(m, sc, a, 0, nclean, nclean, split);
     mda_vkc_set_nobar(m->c, false);
-    mda_step_wkv_bwd_run(m, sc, a, 1, nclean, nclean);
-    mda_step_wkv_bwd_run(m, sc, a, 0, 0, nclean);
+    mda_step_wkv_bwd_run(m, sc, a, 1, nclean, nclean, split);
+    mda_step_wkv_bwd_run(m, sc, a, 0, 0, nclean, 1);
     mda_vkc_buf_t *from[5] = {
         &sc->dpk,
         &sc->dpv,
@@ -198,30 +199,30 @@ void mda_step_wkv_bwd_blocks(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_
     }
 }
 
-void mda_step_wkv_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a) {
+uint32_t mda_step_wkv_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a) {
     mda_model_cfg_t cfg = m->cfg;
     if (m->causal) {
-        mda_step_wkv_bwd_run(m, sc, a, 0, 0, cfg.batch);
+        mda_step_wkv_bwd_run(m, sc, a, 0, 0, cfg.batch, 1);
     } else if (cfg.block > 0) {
         mda_step_wkv_bwd_blocks(m, sc, a);
     } else {
         mda_vkc_set_nobar(m->c, true);
-        mda_step_wkv_bwd_run(m, sc, a, 0, 0, cfg.batch);
+        mda_step_wkv_bwd_run(m, sc, a, 0, 0, cfg.batch, 1);
         mda_vkc_set_nobar(m->c, false);
-        mda_step_wkv_bwd_run(m, sc, a, 1, 0, cfg.batch);
+        mda_step_wkv_bwd_run(m, sc, a, 1, 0, cfg.batch, 1);
     }
-    mda_step_heads_bwd(m, sc, a);
+    return mda_step_heads_bwd(m, sc, a);
 }
 
-void mda_step_time_mix_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly, mda_fwd_act_t *a, mda_vkc_buf_t *ada4) {
+void mda_step_time_mix_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly, mda_fwd_act_t *a) {
     mda_model_cfg_t cfg = m->cfg;
     uint32_t bt = cfg.batch * cfg.seqlen;
     uint32_t d = cfg.d;
-    mda_bwd_mm_at(m, sc, &a->wkv, bt, d);
-    mda_bwd_mm(m, sc, &a->wkv, ly->wo, &sc->dxh_buf, &sc->dtmp, bt, d, d);
+    uint32_t sx = mda_fwd_absmax(m, &sc->dxh_buf, bt * d);
+    mda_bwd_mm(m, sc, &a->wkv, &a->wkv16, a->wkv_slot, ly->wo, &sc->dxh_buf, sx, &sc->dtmp, bt, d, d, false);
     mda_fwd_headnorm(m, &a->wkv_raw, &sc->dtmp, &a->rmsx, &sc->dtmp2, 1);
     mda_fwd_repack(m, &sc->dtmp2, &sc->dwkv, 0);
-    mda_step_wkv_bwd(m, sc, a);
+    uint32_t sd = mda_step_wkv_bwd(m, sc, a);
     mda_vkc_buf_t *dps[5] = {
         &sc->pk,
         &sc->pv,
@@ -236,11 +237,8 @@ void mda_step_time_mix_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_laye
         ly->ww,
         ly->wa,
     };
-    mda_bwd_mm_at(m, sc, &a->shift, bt, d);
-    mda_bwd_mm(m, sc, &a->shift, wps[0], dps[0], &sc->dnorm, bt, d, d);
-    for (uint32_t j = 1; j < 5; j += 1) {
-        mda_bwd_mm(m, sc, &a->shift, wps[j], dps[j], &sc->dtmp2, bt, d, d);
-        mda_fwd_vec_op(m, &sc->dnorm, &sc->dtmp2, bt * d, MDA_PC_VEC_ADD);
+    for (uint32_t j = 0; j < 5; j += 1) {
+        mda_bwd_mm(m, sc, &a->shift, &a->shift16, a->shift_slot, wps[j], dps[j], sd + j, &sc->dnorm, bt, d, d, j > 0);
     }
     mda_vkc_fill(m->c, &sc->dtmp, 0);
     mda_pc_ts_t pc = {
@@ -261,20 +259,8 @@ void mda_step_time_mix_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_laye
         &sc->dg_dummy,
     };
     mda_vkc_run(m->c, &m->k_tshift, bufs, (bt * d + 255) / 256, 1, 1, &pc);
-    mda_fwd_adaln(m, &a->n1_pre, ada4, &sc->dtmp, &sc->dh, &sc->dada4, 1, 0);
+    mda_fwd_adaln(m, &a->n1_pre, ly->ada, &sc->dtmp, &sc->dh, 1, 0);
     mda_step_rmsnorm_bwd(m, &a->x_in, &ly->n1->w, &sc->dh, &a->rms1, &ly->n1->g, &sc->dxh_buf, bt, d);
-}
-
-void mda_step_ada_bwd(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly) {
-    uint32_t crow = mda_fwd_cond_rows(m->cfg);
-    uint32_t d = m->cfg.d;
-    if (m->ref32) {
-        mda_bwd_mm_db(m, &sc->temb, &sc->dada4, &ly->ada->g, crow, 4 * d, d);
-    } else {
-        mda_bwd_mm_at(m, sc, &sc->temb, crow, d);
-        uint32_t sd = mda_fwd_cast_act(m, &sc->dada4, &sc->dc16, crow * 4 * d);
-        mda_fwd_mm16_raw(m, &sc->at16, sc->at16_slot, &sc->dc16, sd, &ly->ada->g, d, 4 * d, crow, m->grad_acc);
-    }
 }
 
 void mda_step_embed_bwd(mda_model_t *m, mda_fwd_scratch_t *sc) {
@@ -311,10 +297,8 @@ void mda_step_rec(mda_step_trainer_t *tr) {
     mda_step_head_bwd(m, sc);
     mda_step_rmsnorm_bwd(m, &sc->x, &m->n_out->w, &sc->dnorm, &sc->rms_stash, &m->n_out->g, &sc->dxh_buf, bt, m->cfg.d);
     for (uint32_t i = m->cfg.n_layer; i > 0; i -= 1) {
-        mda_vkc_fill(m->c, &sc->dada4, 0);
-        mda_step_ffn_bwd(m, sc, &m->layers[i - 1], &sc->acts[i - 1], &sc->ada4[i - 1]);
-        mda_step_time_mix_bwd(m, sc, &m->layers[i - 1], &sc->acts[i - 1], &sc->ada4[i - 1]);
-        mda_step_ada_bwd(m, sc, &m->layers[i - 1]);
+        mda_step_ffn_bwd(m, sc, &m->layers[i - 1], &sc->acts[i - 1]);
+        mda_step_time_mix_bwd(m, sc, &m->layers[i - 1], &sc->acts[i - 1]);
     }
     mda_step_embed_bwd(m, sc);
 }
@@ -341,23 +325,24 @@ void mda_step_sumsq_rec(mda_step_trainer_t *tr, float clip) {
     mda_vkc_run(m->c, &m->k_sumsq, sbufs, 1, 1, 1, &rpc);
 }
 
-void mda_step_adam_run(mda_step_trainer_t *tr, mda_vkc_buf_t *w, mda_vkc_buf_t *g, mda_vkc_buf_t *mom, mda_vkc_buf_t *v, mda_vkc_buf_t *w16, uint32_t n) {
+void mda_step_adam_run(mda_step_trainer_t *tr, mda_model_param_t *p) {
     mda_pc_adam_t pc = {
-        .n = n,
+        .n = p->n,
         .beta1 = MDA_STEP_ADAM_B1,
         .beta2 = MDA_STEP_ADAM_B2,
         .eps = 1e-8f,
         .wd = 0.0f,
+        .lr_mul = p->lr_mul,
     };
     mda_vkc_buf_t *bufs[6] = {
-        w,
-        g,
-        mom,
-        v,
-        w16,
+        &p->w,
+        &p->g,
+        &p->m,
+        &p->v,
+        &p->w16,
         &tr->sc.opt,
     };
-    mda_vkc_run(tr->m->c, &tr->m->k_adamw, bufs, (n + 255) / 256, 1, 1, &pc);
+    mda_vkc_run(tr->m->c, &tr->m->k_adamw, bufs, (p->n + 255) / 256, 1, 1, &pc);
 }
 
 bool mda_step_is_muon(const mda_step_trainer_t *tr, const mda_model_param_t *p) {
@@ -368,7 +353,7 @@ bool mda_step_is_muon(const mda_step_trainer_t *tr, const mda_model_param_t *p) 
     return hits > 0;
 }
 
-void mda_step_adam_rest_rec(mda_step_trainer_t *tr) {
+void mda_step_adam_rec(mda_step_trainer_t *tr) {
     mda_model_t *m = tr->m;
     uint32_t last = 0;
     for (uint32_t i = 0; i < m->n_params; i += 1) {
@@ -380,19 +365,10 @@ void mda_step_adam_rest_rec(mda_step_trainer_t *tr) {
         mda_model_param_t *p = &m->params[i];
         mda_vkc_set_nobar(m->c, i != last);
         if (mda_step_is_muon(tr, p) == false) {
-            mda_step_adam_run(tr, &p->w, &p->g, &p->m, &p->v, &p->w16, p->n);
+            mda_step_adam_run(tr, p);
         }
     }
     mda_vkc_set_nobar(m->c, false);
-}
-
-void mda_step_adam_rec(mda_step_trainer_t *tr) {
-    mda_model_t *m = tr->m;
-    if (tr->muon) {
-        mda_step_adam_rest_rec(tr);
-    } else {
-        mda_step_adam_run(tr, &m->w_all, &m->g_all, &m->m_all, &m->v_all, &m->w16_all, m->n_all);
-    }
 }
 
 uint32_t mda_step_muon_groups(uint32_t op, uint32_t n) {
@@ -423,85 +399,90 @@ void mda_step_muon_op(mda_step_trainer_t *tr, mda_step_muon_t *u, uint32_t op, m
     mda_vkc_run(tr->m->c, &tr->m->k_muon, bufs, mda_step_muon_groups(op, n), 1, 1, &pc);
 }
 
-void mda_step_muon_gram(mda_model_t *m, mda_step_muon_t *u) {
+void mda_step_muon_gram(mda_model_t *m, mda_step_muon_t *u, mda_vkc_buf_t *x16) {
+    mda_fwd_epi_t epi = {
+        .prev = &u->a,
+        .alpha = 1.0f,
+        .beta = 0.0f,
+        .store = MDA_FWD_STORE32 | MDA_FWD_STORE16 | MDA_FWD_STORE_SYM,
+    };
     if (u->wide) {
-        mda_fwd_mm16_raw(m, &u->x16, MDA_PC_NO_SLOT, &u->xt16, MDA_PC_NO_SLOT, &u->a, u->rows, u->rows, u->cols, false);
+        mda_fwd_mm16_epi(m, x16, MDA_PC_NO_SLOT, x16, MDA_PC_NO_SLOT, &u->a, &u->a16, u->rows, u->rows, u->cols, MDA_FWD_BT, epi);
     } else {
-        mda_fwd_mm16_raw(m, &u->xt16, MDA_PC_NO_SLOT, &u->x16, MDA_PC_NO_SLOT, &u->a, u->cols, u->cols, u->rows, false);
+        mda_fwd_mm16_epi(m, x16, MDA_PC_NO_SLOT, x16, MDA_PC_NO_SLOT, &u->a, &u->a16, u->cols, u->cols, u->rows, MDA_FWD_AT, epi);
     }
 }
 
-void mda_step_muon_bx(mda_model_t *m, mda_step_muon_t *u) {
+void mda_step_muon_poly(mda_model_t *m, mda_step_muon_t *u) {
+    mda_fwd_epi_t epi = {
+        .prev = &u->a,
+        .alpha = MDA_STEP_MUON_C,
+        .beta = MDA_STEP_MUON_B,
+        .store = MDA_FWD_STORE16 | MDA_FWD_STORE_SYM,
+    };
+    mda_fwd_mm16_epi(m, &u->a16, MDA_PC_NO_SLOT, &u->a16, MDA_PC_NO_SLOT, &u->a, &u->b16, u->side, u->side, u->side, MDA_FWD_AB, epi);
+}
+
+void mda_step_muon_iterate(mda_model_t *m, mda_step_muon_t *u, mda_vkc_buf_t *x16, mda_vkc_buf_t *next16) {
+    mda_fwd_epi_t epi = {
+        .prev = &u->x,
+        .alpha = 1.0f,
+        .beta = MDA_STEP_MUON_A,
+        .store = MDA_FWD_STORE32 | MDA_FWD_STORE16,
+    };
     if (u->wide) {
-        mda_fwd_mm16_raw(m, &u->b16, MDA_PC_NO_SLOT, &u->x16, MDA_PC_NO_SLOT, &u->bx, u->rows, u->cols, u->rows, false);
+        mda_fwd_mm16_epi(m, &u->b16, MDA_PC_NO_SLOT, x16, MDA_PC_NO_SLOT, &u->x, next16, u->rows, u->cols, u->rows, MDA_FWD_AB, epi);
     } else {
-        mda_fwd_mm16_raw(m, &u->x16, MDA_PC_NO_SLOT, &u->b16, MDA_PC_NO_SLOT, &u->bx, u->rows, u->cols, u->cols, false);
+        mda_fwd_mm16_epi(m, x16, MDA_PC_NO_SLOT, &u->b16, MDA_PC_NO_SLOT, &u->x, next16, u->rows, u->cols, u->cols, MDA_FWD_AB, epi);
     }
 }
 
-void mda_step_muon_stage(mda_step_trainer_t *tr, mda_step_muon_t *u, mda_step_muon_phase_t phase) {
+void mda_step_muon_stage(mda_step_trainer_t *tr, mda_step_muon_t *u, mda_step_muon_phase_t phase, uint32_t it) {
     mda_model_t *m = tr->m;
     mda_model_param_t *p = u->p;
     uint32_t n = u->rows * u->cols;
-    uint32_t sq = u->side * u->side;
     switch (phase) {
     case MDA_STEP_MUON_PHASE_MOMENTUM:
-        mda_step_muon_op(tr, u, 0, &p->g, &p->m, &u->x16, n, MDA_STEP_MUON_MOMENTUM, 0.0f);
+        mda_step_muon_op(tr, u, 0, &p->g, &p->m, &u->x16[0], n, MDA_STEP_MUON_MOMENTUM, 0.0f);
         break;
     case MDA_STEP_MUON_PHASE_NORM:
-        mda_step_muon_op(tr, u, 1, &p->g, &p->m, &u->x16, u->groups, 0.0f, 0.0f);
+        mda_step_muon_op(tr, u, 1, &p->g, &p->m, &u->x16[0], u->groups, 0.0f, 0.0f);
         break;
     case MDA_STEP_MUON_PHASE_NORMALIZE:
-        mda_step_muon_op(tr, u, 2, &p->g, &p->m, &u->x16, n, 0.0f, 0.0f);
-        break;
-    case MDA_STEP_MUON_PHASE_TRANSPOSE:
-        mda_fwd_transpose16(m, &u->x, &u->xt16, u->rows, u->cols, MDA_PC_NO_SLOT);
+        mda_step_muon_op(tr, u, 2, &p->g, &p->m, &u->x16[0], n, 0.0f, 0.0f);
         break;
     case MDA_STEP_MUON_PHASE_GRAM:
-        mda_step_muon_gram(m, u);
-        break;
-    case MDA_STEP_MUON_PHASE_CAST:
-        mda_fwd_cast(m, &u->a, &u->a16, sq, MDA_PC_NO_SLOT);
-        break;
-    case MDA_STEP_MUON_PHASE_SQUARE:
-        mda_fwd_mm16_raw(m, &u->a16, MDA_PC_NO_SLOT, &u->a16, MDA_PC_NO_SLOT, &u->aa, u->side, u->side, u->side, false);
+        mda_step_muon_gram(m, u, &u->x16[it % 2]);
         break;
     case MDA_STEP_MUON_PHASE_POLY:
-        mda_step_muon_op(tr, u, 3, &u->a, &u->aa, &u->b16, sq, MDA_STEP_MUON_B, MDA_STEP_MUON_C);
-        break;
-    case MDA_STEP_MUON_PHASE_BX:
-        mda_step_muon_bx(m, u);
+        mda_step_muon_poly(m, u);
         break;
     case MDA_STEP_MUON_PHASE_ITERATE:
-        mda_step_muon_op(tr, u, 4, &u->bx, &u->aa, &u->x16, n, MDA_STEP_MUON_A, 0.0f);
+        mda_step_muon_iterate(m, u, &u->x16[it % 2], &u->x16[(it + 1) % 2]);
         break;
     case MDA_STEP_MUON_PHASE_UPDATE:
-        mda_step_muon_op(tr, u, 5, &p->w, &p->m, &p->w16, n, MDA_STEP_MUON_RMS * sqrtf((float)mda_util_max_u32(u->rows, u->cols)), 0.0f);
+        mda_step_muon_op(tr, u, 3, &p->w, &p->m, &p->w16, n, MDA_STEP_MUON_RMS * sqrtf((float)mda_util_max_u32(u->rows, u->cols)), 0.0f);
         break;
     }
 }
 
-void mda_step_muon_phase(mda_step_trainer_t *tr, mda_step_muon_phase_t phase) {
+void mda_step_muon_phase(mda_step_trainer_t *tr, mda_step_muon_phase_t phase, uint32_t it) {
     for (uint32_t j = 0; j < tr->n_mats; j += 1) {
         mda_vkc_set_nobar(tr->m->c, j + 1 < tr->n_mats);
-        mda_step_muon_stage(tr, &tr->mats[j], phase);
+        mda_step_muon_stage(tr, &tr->mats[j], phase, it);
     }
 }
 
 void mda_step_muon_rec(mda_step_trainer_t *tr) {
-    mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_MOMENTUM);
-    mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_NORM);
-    mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_NORMALIZE);
+    mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_MOMENTUM, 0);
+    mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_NORM, 0);
+    mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_NORMALIZE, 0);
     for (uint32_t it = 0; it < MDA_STEP_MUON_ITERS; it += 1) {
-        mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_TRANSPOSE);
-        mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_GRAM);
-        mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_CAST);
-        mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_SQUARE);
-        mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_POLY);
-        mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_BX);
-        mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_ITERATE);
+        mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_GRAM, it);
+        mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_POLY, it);
+        mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_ITERATE, it);
     }
-    mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_UPDATE);
+    mda_step_muon_phase(tr, MDA_STEP_MUON_PHASE_UPDATE, 0);
 }
 
 void mda_step_opt_rec(mda_step_trainer_t *tr, float clip) {
@@ -519,13 +500,13 @@ mda_step_muon_t mda_step_muon_alloc(mda_vkc_t *c, mda_model_param_t *p) {
     uint32_t groups = (n + 255) / 256;
     return (mda_step_muon_t) {
         .x = mda_vkc_alloc(c, n * sizeof(float)),
-        .x16 = mda_vkc_alloc(c, n * sizeof(uint16_t)),
-        .xt16 = mda_vkc_alloc(c, n * sizeof(uint16_t)),
+        .x16 = {
+            mda_vkc_alloc(c, n * sizeof(uint16_t)),
+            mda_vkc_alloc(c, n * sizeof(uint16_t)),
+        },
         .a = mda_vkc_alloc(c, side * side * sizeof(float)),
         .a16 = mda_vkc_alloc(c, side * side * sizeof(uint16_t)),
-        .aa = mda_vkc_alloc(c, side * side * sizeof(float)),
         .b16 = mda_vkc_alloc(c, side * side * sizeof(uint16_t)),
-        .bx = mda_vkc_alloc(c, n * sizeof(float)),
         .red = mda_vkc_alloc(c, (groups + 1) * sizeof(float)),
         .p = p,
         .rows = p->rows,

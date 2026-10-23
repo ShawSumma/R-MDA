@@ -33,6 +33,7 @@ layout(push_constant) uniform pc {
     float beta2;
     float eps;
     float wd;
+    float lr_mul;
 };
 
 void main() {
@@ -44,7 +45,7 @@ void main() {
         m[i] = mi;
         v[i] = vi;
         float w0 = w[i];
-        float wi = w0 - lr * ((mi / bc1) / (sqrt(vi / bc2) + eps) + wd * w0);
+        float wi = w0 - lr * lr_mul * ((mi / bc1) / (sqrt(vi / bc2) + eps) + wd * w0);
         w[i] = wi;
         w16[i] = float16_t(wi);
     }
