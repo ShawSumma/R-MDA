@@ -2,31 +2,30 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer B0 { float DK[]; };
-layout(std430, binding = 1) readonly buffer B1 { float DV[]; };
-layout(std430, binding = 2) readonly buffer B2 { float DR[]; };
-layout(std430, binding = 3) readonly buffer B3 { float DW[]; };
-layout(std430, binding = 4) readonly buffer B4 { float DA[]; };
-layout(std430, binding = 5) readonly buffer B5 { float DK2[]; };
-layout(std430, binding = 6) readonly buffer B6 { float DV2[]; };
-layout(std430, binding = 7) readonly buffer B7 { float DR2[]; };
-layout(std430, binding = 8) readonly buffer B8 { float DW2[]; };
-layout(std430, binding = 9) readonly buffer B9 { float DA2[]; };
-layout(std430, binding = 10) readonly buffer B10 { float khat[]; };
-layout(std430, binding = 11) readonly buffer B11 { float kinv[]; };
-layout(std430, binding = 12) readonly buffer B12 { float PW[]; };
-layout(std430, binding = 13) readonly buffer B13 { float PA[]; };
-layout(std430, binding = 14) writeonly buffer B14 { float OK[]; };
-layout(std430, binding = 15) writeonly buffer B15 { float OV[]; };
-layout(std430, binding = 16) writeonly buffer B16 { float OR[]; };
-layout(std430, binding = 17) writeonly buffer B17 { float OW[]; };
-layout(std430, binding = 18) writeonly buffer B18 { float OA[]; };
-layout(std430, binding = 19) buffer B19 { uint amax[]; };
+layout(std430, binding = 0) readonly buffer B0 { float D0[]; };
+layout(std430, binding = 1) readonly buffer B1 { float D1[]; };
+layout(std430, binding = 2) readonly buffer B2 { float DVB[]; };
+layout(std430, binding = 3) readonly buffer B3 { float DBS[]; };
+layout(std430, binding = 4) readonly buffer B4 { float HEADS[]; };
+layout(std430, binding = 5) readonly buffer B5 { float kinv[]; };
+layout(std430, binding = 6) readonly buffer B6 { float KV[]; };
+layout(std430, binding = 7) readonly buffer B7 { float VG[]; };
+layout(std430, binding = 8) readonly buffer B8 { float V0[]; };
+layout(std430, binding = 9) readonly buffer B9 { float WALL[]; };
+layout(std430, binding = 10) writeonly buffer B10 { float RAWG[]; };
+layout(std430, binding = 11) writeonly buffer B11 { float CON[]; };
+layout(std430, binding = 12) buffer B12 { float DV0[]; };
+layout(std430, binding = 13) buffer B13 { uint amax[]; };
 layout(push_constant) uniform pc {
     uint n_vec;
+    uint sec;
     uint hd;
     uint seqlen;
+    uint first_row;
     uint slot;
+    uint kk;
+    uint ka;
+    uint rk;
 };
 
 const float C = 0.60653066;
@@ -52,6 +51,10 @@ void note_max(uint s, float v) {
     }
 }
 
+float avg(uint s, uint pi, uint n) {
+    return 0.5 * (D0[s * n + pi] + D1[s * n + pi]);
+}
+
 void main() {
     uint lid = gl_LocalInvocationID.x;
     uint vec = gl_WorkGroupID.x * 4u + (lid >> 6);
@@ -59,37 +62,57 @@ void main() {
     bool live = vec < n_vec;
     uint t = vec % seqlen;
     uint bh = vec / seqlen;
-    uint ui = ((bh / hd) * seqlen + t) * hd * 64u + (bh % hd) * 64u + e;
+    uint ch = (bh % hd) * 64u + e;
+    uint row = (bh / hd) * seqlen + t;
+    uint ui = row * hd * 64u + ch;
     uint pi = vec * 64u + e;
-    float dk = 0.0;
+    uint n = sec;
     float kh = 0.0;
+    float dkh = 0.0;
     if (live) {
-        dk = 0.5 * (DK[pi] + DK2[pi]);
-        kh = khat[pi];
+        kh = HEADS[pi];
+        dkh = avg(0u, pi, n);
     }
-    float dot = group_sum(kh * dk, lid);
-    vec4 o = vec4(0.0);
-    float oa = 0.0;
+    float dot = group_sum(kh * dkh, lid);
+    float g[6];
+    for (uint i = 0u; i < 6u; i += 1u) {
+        g[i] = 0.0;
+    }
     if (live) {
-        float w = PW[pi];
+        float kt = HEADS[n + pi];
+        float r = HEADS[3u * n + pi];
+        float w = HEADS[4u * n + pi];
+        float a = HEADS[5u * n + pi];
+        float k = KV[ui];
+        float dbs = DBS[vec];
+        float rho = WALL[rk + ch];
+        float al = WALL[ka + ch];
+        float dkap = (dkh - kh * dot) * kinv[vec];
+        float dkt = avg(1u, pi, n) + dbs * r * rho;
+        float dv = avg(2u, pi, n) + DVB[pi];
+        float da = avg(5u, pi, n) + dkt * k * al;
         float s = -log(w) / C;
-        float a = PA[pi];
-        o = vec4(
-            (dk - kh * dot) * kinv[vec],
-            0.5 * (DV[pi] + DV2[pi]),
-            0.5 * (DR[pi] + DR2[pi]),
-            0.5 * (DW[pi] + DW2[pi]) * (-C * w * s * (1.0 - s))
-        );
-        oa = 0.5 * (DA[pi] + DA2[pi]) * a * (1.0 - a);
-        OK[ui] = o.x;
-        OV[ui] = o.y;
-        OR[ui] = o.z;
-        OW[ui] = o.w;
-        OA[ui] = oa;
+        g[0] = dkt * (1.0 + (a - 1.0) * al) + dkap * WALL[kk + ch];
+        g[2] = avg(3u, pi, n) + dbs * rho * kt;
+        g[3] = avg(4u, pi, n) * (-C * w * s * (1.0 - s));
+        g[4] = da * a * (1.0 - a);
+        if (row >= first_row) {
+            g[1] = dv + DV0[ui];
+        } else {
+            float vg = VG[ui];
+            float d0 = V0[ui];
+            g[1] = dv * vg;
+            g[5] = dv * (KV[n + ui] - d0) * vg * (1.0 - vg);
+            DV0[ui] += dv * (1.0 - vg);
+        }
+        for (uint i = 0u; i < 6u; i += 1u) {
+            RAWG[i * n + ui] = g[i];
+        }
+        CON[ui] = dkap * k;
+        CON[n + ui] = dkt * k * (a - 1.0);
+        CON[2u * n + ui] = dbs * r * kt;
     }
-    note_max(slot, abs(o.x));
-    note_max(slot + 1u, abs(o.y));
-    note_max(slot + 2u, abs(o.z));
-    note_max(slot + 3u, abs(o.w));
-    note_max(slot + 4u, abs(oa));
+    for (uint i = 0u; i < 6u; i += 1u) {
+        note_max(slot + i, abs(g[i]));
+    }
 }

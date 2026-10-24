@@ -135,7 +135,7 @@ bool mda_sample_scratch(mda_model_t *m, const mda_data_corpus_t *cp, mda_fwd_scr
     if (loaded.ok == false) {
         return false;
     } else {
-        if (loaded.step == 0) {
+        if (loaded.found == false) {
             fprintf(stderr, "no checkpoint: evaluating the random init\n");
         }
         return mda_sample_eval(m, cp, sc, loaded.step);
@@ -144,7 +144,7 @@ bool mda_sample_scratch(mda_model_t *m, const mda_data_corpus_t *cp, mda_fwd_scr
 
 bool mda_sample_model(mda_vkc_t *c, const mda_data_corpus_t *cp, const char *path, const char *mode) {
     mda_model_t *m = mda_model_init(c, mda_model_cfg_mode(cp->tok.count, mode, mda_model_cfg(cp->tok.count).batch));
-    if (m == NULL) {
+    if (m == NULL || mda_model_set_dec(m, mda_model_dec_of(mode)) == false) {
         return false;
     } else {
         m->causal = strcmp(mode, "ar") == 0;

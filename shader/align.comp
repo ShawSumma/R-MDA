@@ -1,0 +1,50 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float XM[]; };
+layout(std430, binding = 1) readonly buffer B1 { float XI[]; };
+layout(std430, binding = 2) readonly buffer B2 { float AO[]; };
+layout(std430, binding = 3) writeonly buffer B3 { float DX[]; };
+layout(std430, binding = 4) readonly buffer B4 {
+    float lr;
+    float bc1;
+    float bc2;
+    float norm;
+    float scale;
+    float gmul;
+};
+layout(std430, binding = 5) buffer B5 { float stats[]; };
+layout(push_constant) uniform pc {
+    uint n;
+    uint d;
+    uint slot;
+};
+
+shared float red[2][256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint i = gl_GlobalInvocationID.x;
+    float e = 0.0;
+    float t = 0.0;
+    if (i < n) {
+        t = AO[i];
+        e = XM[i] - XI[i] - t;
+        DX[i] = gmul * 2.0 * e / float(d);
+    }
+    red[0][lid] = e * e;
+    red[1][lid] = t * t;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            red[0][lid] += red[0][lid + s];
+            red[1][lid] += red[1][lid + s];
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        atomicAdd(stats[2u * slot], red[0][0]);
+        atomicAdd(stats[2u * slot + 1u], red[1][0]);
+    }
+}

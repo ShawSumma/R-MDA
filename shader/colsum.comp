@@ -1,0 +1,25 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float X[]; };
+layout(std430, binding = 1) buffer B1 { float DP[]; };
+layout(push_constant) uniform pc {
+    uint rows;
+    uint d;
+    uint rows_per;
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint col = gid % d;
+    uint r0 = gid / d * rows_per;
+    if (r0 < rows) {
+        uint r1 = min(r0 + rows_per, rows);
+        float s = 0.0;
+        for (uint r = r0; r < r1; r = r + 1u) {
+            s += X[r * d + col];
+        }
+        atomicAdd(DP[col], s);
+    }
+}

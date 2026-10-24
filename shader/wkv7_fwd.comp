@@ -1,24 +1,22 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_clustered : require
 layout(local_size_x = 256) in;
 
 const uint CH = 4u;
 
-layout(std430,binding=0) readonly  buffer BK { float K[]; };
-layout(std430,binding=1) readonly  buffer BV { float V[]; };
-layout(std430,binding=2) readonly  buffer BR { float R[]; };
-layout(std430,binding=3) readonly  buffer BW { float W[]; };
-layout(std430,binding=4) readonly  buffer BA { float A[]; };
-layout(std430,binding=5) writeonly buffer BO { float O[]; };
-layout(std430,binding=6) writeonly buffer BS { float16_t Sout[]; };
-layout(std430,binding=7) buffer BB { float Bst[]; };
-layout(std430,binding=8) readonly buffer BCI { float Cin[]; };
-layout(std430,binding=9) writeonly buffer BCO { float Cout[]; };
+layout(std430,binding=0) readonly  buffer BH { float H[]; };
+layout(std430,binding=1) writeonly buffer BO { float O[]; };
+layout(std430,binding=2) writeonly buffer BS { float Sout[]; };
+layout(std430,binding=3) buffer BB { float Bst[]; };
+layout(std430,binding=4) readonly buffer BCI { float Cin[]; };
+layout(std430,binding=5) writeonly buffer BCO { float Cout[]; };
+layout(std430,binding=6) writeonly buffer BK { float SK[]; };
 
-layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir, save, blk, nclean, seq0, cache; };
+layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir, save, blk, nclean, seq0, cache, sec, split; };
 
-shared float kc[CH][64], vc[CH][64], rc[CH][64], wc[CH][64], ac[CH][64];
-shared float p0[256], p1[256];
+shared vec4 hv[CH][64];
+shared vec2 hu[CH][64];
 
 uint step_t(uint ti) {
     if (dir == 0u) {
@@ -36,10 +34,15 @@ uint block_slot(uint seq, uint h, uint t) {
     return ((c*Hd + h)*(T/blk) + t/blk)*4096u;
 }
 
-void run(uint bh) {
+void run(uint bh, uint seg) {
+    uint len = T / split;
+    uint t0 = seg*len;
+    uint t1 = t0 + len;
     uint lid = gl_LocalInvocationID.x;
-    uint g = lid >> 6;
-    uint e = lid & 63u;
+    uint e = lid >> 2;
+    uint p = lid & 3u;
+    uint lj = lid >> 6;
+    uint lx = lid & 63u;
     uint base = bh*T*64u;
     uint seq = bh / Hd;
     uint h = bh % Hd;
@@ -51,60 +54,75 @@ void run(uint bh) {
     uint cslot = (seq*Hd + h)*4096u + lid;
 
     float S[16];
-    for (uint q = 0; q < 16u; q += 1u) S[q] = 0.0;
+    [[unroll]] for (uint q = 0; q < 16u; q += 1u) S[q] = 0.0;
     if (cached) {
-        for (uint q = 0; q < 16u; q += 1u) S[q] = Cin[cslot + q*256u];
+        [[unroll]] for (uint q = 0; q < 16u; q += 1u) S[q] = Cin[cslot + q*256u];
     }
 
-    for (uint ti = 0; ti < T; ti += 1u) {
+    float pre[6];
+    {
+        uint lrow = base + step_t(t0 + lj)*64u + lx;
+        [[unroll]] for (uint s = 0; s < 6u; s += 1u) pre[s] = H[s*sec + lrow];
+    }
+
+    for (uint ti = t0; ti < t1; ti += 1u) {
         uint t = step_t(ti);
         uint row = base + t*64u;
         uint j = ti % CH;
         if (j == 0u) {
-            uint lrow = base + step_t(ti + g)*64u + e;
             barrier();
-            kc[g][e] = K[lrow]; vc[g][e] = V[lrow];
-            rc[g][e] = R[lrow]; wc[g][e] = W[lrow]; ac[g][e] = A[lrow];
+            hv[lj][lx] = vec4(pre[0], pre[1], pre[3], pre[4]);
+            hu[lj][lx] = vec2(pre[5]*pre[0], pre[2]);
             barrier();
+            if (ti + CH < t1) {
+                uint lrow = base + step_t(ti + CH + lj)*64u + lx;
+                [[unroll]] for (uint s = 0; s < 6u; s += 1u) pre[s] = H[s*sec + lrow];
+            }
         }
         if (noisy && ti % blk == 0u && dir == 0u) {
             uint sb = block_slot(seq, h, t) + lid;
-            for (uint q = 0; q < 16u; q += 1u) S[q] = Bst[sb + q*256u];
+            [[unroll]] for (uint q = 0; q < 16u; q += 1u) S[q] = Bst[sb + q*256u];
         }
         if (noisy && ti % blk == 0u && dir == 1u) {
-            for (uint q = 0; q < 16u; q += 1u) S[q] = 0.0;
+            [[unroll]] for (uint q = 0; q < 16u; q += 1u) S[q] = 0.0;
         }
         if (clean && ti % blk == 0u) {
             uint sb = block_slot(seq, h, t) + lid;
-            for (uint q = 0; q < 16u; q += 1u) Bst[sb + q*256u] = S[q];
+            [[unroll]] for (uint q = 0; q < 16u; q += 1u) Bst[sb + q*256u] = S[q];
         }
         if (save == 1u && j == 0u) {
             uint sb = bh*(T/CH)*4096u + (ti/CH)*4096u + lid;
-            for (uint q = 0; q < 16u; q += 1u) Sout[sb + q*256u] = float16_t(S[q]);
+            [[unroll]] for (uint q = 0; q < 16u; q += 1u) Sout[sb + q*256u] = S[q];
         }
-        float s = 0.0;
-        for (uint q = 0; q < 16u; q += 1u) s += S[q]*kc[j][g + 4u*q];
-        p0[lid] = s;
-        barrier();
-        float sk = p0[e] + p0[64u+e] + p0[128u+e] + p0[192u+e];
+        vec4 g[16];
+        float sk = 0.0;
+        [[unroll]] for (uint q = 0; q < 16u; q += 1u) {
+            g[q] = hv[j][p + 4u*q];
+            sk += S[q]*g[q].x;
+        }
+        sk = subgroupClusteredAdd(sk, 4u);
+        float ve = hu[j][e].y;
         float o = 0.0;
-        for (uint q = 0; q < 16u; q += 1u) {
-            uint i = g + 4u*q;
-            S[q] = wc[j][e]*S[q] + ac[j][i]*kc[j][i]*(vc[j][e] - sk);
-            o += rc[j][i]*S[q];
+        [[unroll]] for (uint q = 0; q < 16u; q += 1u) {
+            S[q] = g[q].w*S[q] - hu[j][p + 4u*q].x*sk + g[q].y*ve;
+            o += g[q].z*S[q];
         }
-        p1[lid] = o;
-        barrier();
-        if (lid < 64u) O[row+lid] = p1[lid] + p1[64u+lid] + p1[128u+lid] + p1[192u+lid];
+        o = subgroupClusteredAdd(o, 4u);
+        if (p == 0u) {
+            O[row + e] = o;
+            if (save == 1u) {
+                SK[row + e] = sk;
+            }
+        }
     }
     if (cached) {
-        for (uint q = 0; q < 16u; q += 1u) Cout[cslot + q*256u] = S[q];
+        [[unroll]] for (uint q = 0; q < 16u; q += 1u) Cout[cslot + q*256u] = S[q];
     }
 }
 
 void main(){
-    uint bh = seq0*Hd + gl_WorkGroupID.x;
+    uint bh = seq0*Hd + gl_WorkGroupID.x / split;
     if (bh < Bsz*Hd) {
-        run(bh);
+        run(bh, gl_WorkGroupID.x % split);
     }
 }

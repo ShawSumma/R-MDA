@@ -1,30 +1,21 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_clustered : require
 layout(local_size_x = 256) in;
 
 const uint CH = 4u;
 
-layout(std430,binding=0) readonly  buffer BK  { float K[]; };
-layout(std430,binding=1) readonly  buffer BV  { float V[]; };
-layout(std430,binding=2) readonly  buffer BR  { float R[]; };
-layout(std430,binding=3) readonly  buffer BW  { float W[]; };
-layout(std430,binding=4) readonly  buffer BA  { float A[]; };
-layout(std430,binding=5) readonly  buffer BSP { float16_t Sprev[]; };
-layout(std430,binding=6) readonly  buffer BdO { float dO[]; };
-layout(std430,binding=7) writeonly buffer BdK { float dK[]; };
-layout(std430,binding=8) writeonly buffer BdV { float dV[]; };
-layout(std430,binding=9) writeonly buffer BdR { float dR[]; };
-layout(std430,binding=10) writeonly buffer BdW{ float dW[]; };
-layout(std430,binding=11) writeonly buffer BdA{ float dA[]; };
-layout(std430,binding=12) buffer BdB { float Dbst[]; };
-layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir, blk, nclean, seq0, split; };
+layout(std430,binding=0) readonly  buffer BH  { float H[]; };
+layout(std430,binding=1) readonly  buffer BSP { float Sprev[]; };
+layout(std430,binding=2) readonly  buffer BdO { float dO[]; };
+layout(std430,binding=3) writeonly buffer BD  { float D[]; };
+layout(std430,binding=4) buffer BdB { float Dbst[]; };
+layout(std430,binding=5) readonly  buffer BK  { float SK[]; };
+layout(push_constant) uniform P { uint Bsz, Hd, T, DH, dir, blk, nclean, seq0, split, sec; };
 
-shared float kc[CH][64], vc[CH][64], rc[CH][64], wc[CH][64], ac[CH][64], dc[CH][64];
-shared float p0[256], p1[256], p2[256];
-shared float h0[128];
-shared vec2 h1[128];
+shared vec4 hv[CH][64];
+shared vec4 hu[CH][64];
+shared float dsks[2][64];
 
 uint step_row(uint base, uint tf) {
     if (dir == 0u) {
@@ -42,115 +33,154 @@ uint block_slot(uint seq, uint h, uint t) {
     return ((c*Hd + h)*(T/blk) + t/blk)*4096u;
 }
 
+uint fidx(uint i, uint e) {
+    return (i >> 2)*256u + e*4u + (i & 3u);
+}
+
+float load_vec(uint s, uint lrow) {
+    if (s < 6u) {
+        return H[s*sec + lrow];
+    } else if (s == 6u) {
+        return dO[lrow];
+    } else {
+        return SK[lrow];
+    }
+}
+
 void run(uint bh, uint seg) {
     uint lid = gl_LocalInvocationID.x;
-    uint g = lid >> 6;
-    uint e = lid & 63u;
-    uint half_ = e >> 5;
-    bool lead = (e & 31u) == 0u;
+    uint u = lid >> 2;
+    uint p = lid & 3u;
+    uint lj = lid >> 6;
+    uint lx = lid & 63u;
     uint base = bh*T*64u;
     uint nc = T / CH;
     uint cps = nc / split;
-    uint cbase = bh*nc*4096u + lid;
+    uint cbase = bh*nc*4096u;
     uint seq = bh / Hd;
     uint h = bh % Hd;
     bool noisy = blk > 0u && seq >= nclean;
     bool clean = blk > 0u && seq < nclean;
 
     float Ps[CH][16];
-    float dS[16];
-    for (uint q = 0; q < 16u; q += 1u) dS[q] = 0.0;
+    float dA[16];
+    float dB[16];
+    [[unroll]] for (uint q = 0; q < 16u; q += 1u) {
+        dA[q] = 0.0;
+        dB[q] = 0.0;
+    }
+
+    float pre[8];
+    float preS[16];
+    {
+        uint c = (seg + 1u)*cps - 1u;
+        uint lrow = step_row(base, c*CH + lj) + lx;
+        [[unroll]] for (uint s = 0; s < 8u; s += 1u) pre[s] = load_vec(s, lrow);
+        [[unroll]] for (uint q = 0; q < 16u; q += 1u) preS[q] = Sprev[cbase + c*4096u + fidx(u, p + 4u*q)];
+    }
 
     for (uint ci = 0; ci < cps; ci += 1u) {
         uint c = (seg + 1u)*cps - 1u - ci;
-
-        {
-            uint lj = lid >> 6;
-            uint lrow = step_row(base, c*CH + lj) + e;
-            barrier();
-            kc[lj][e] = K[lrow]; vc[lj][e] = V[lrow]; rc[lj][e] = R[lrow];
-            wc[lj][e] = W[lrow]; ac[lj][e] = A[lrow]; dc[lj][e] = dO[lrow];
-            barrier();
+        barrier();
+        hv[lj][lx] = vec4(pre[0], pre[1], pre[3], pre[4]);
+        hu[lj][lx] = vec4(pre[5], pre[2], pre[6], pre[7]);
+        barrier();
+        float S[16];
+        [[unroll]] for (uint q = 0; q < 16u; q += 1u) S[q] = preS[q];
+        if (ci + 1u < cps) {
+            uint lrow = step_row(base, (c - 1u)*CH + lj) + lx;
+            [[unroll]] for (uint s = 0; s < 8u; s += 1u) pre[s] = load_vec(s, lrow);
+            [[unroll]] for (uint q = 0; q < 16u; q += 1u) preS[q] = Sprev[cbase + (c - 1u)*4096u + fidx(u, p + 4u*q)];
         }
 
-        float S[16];
-        for (uint q = 0; q < 16u; q += 1u) S[q] = float(Sprev[cbase + c*4096u + q*256u]);
         [[unroll]] for (uint j = 0; j < CH; j += 1u) {
-            for (uint q = 0; q < 16u; q += 1u) Ps[j][q] = S[q];
+            [[unroll]] for (uint q = 0; q < 16u; q += 1u) Ps[j][q] = S[q];
             if (j + 1u < CH) {
-                float s = 0.0;
-                for (uint q = 0; q < 16u; q += 1u) s += S[q]*kc[j][g + 4u*q];
-                p0[lid] = s;
-                barrier();
-                float sk = p0[e] + p0[64u+e] + p0[128u+e] + p0[192u+e];
-                for (uint q = 0; q < 16u; q += 1u) {
-                    uint i = g + 4u*q;
-                    S[q] = wc[j][e]*S[q] + ac[j][i]*kc[j][i]*(vc[j][e] - sk);
+                vec4 gi = hv[j][u];
+                float aki = hu[j][u].x*gi.x;
+                [[unroll]] for (uint q = 0; q < 16u; q += 1u) {
+                    vec4 ge = hu[j][p + 4u*q];
+                    S[q] = gi.w*S[q] - aki*ge.w + gi.y*ge.y;
                 }
-                barrier();
             }
         }
 
         [[unroll]] for (uint jj = 0; jj < CH; jj += 1u) {
             uint j = CH - 1u - jj;
-            uint row = step_row(base, c*CH + j);
-
-            float s = 0.0;
-            for (uint q = 0; q < 16u; q += 1u) s += Ps[j][q]*kc[j][g + 4u*q];
-            p0[lid] = s;
-            barrier();
-            float sk = p0[e] + p0[64u+e] + p0[128u+e] + p0[192u+e];
-            float we = wc[j][e];
-            float ve = vc[j][e];
-            float doe = dc[j][e];
-
-            float dw = 0.0;
-            float dv = 0.0;
-            for (uint q = 0; q < 16u; q += 1u) {
-                uint i = g + 4u*q;
-                float ak = ac[j][i]*kc[j][i];
-                float x = subgroupAdd((we*Ps[j][q] + ak*(ve - sk))*doe);
-                if (lead) h0[(g*16u + q)*2u + half_] = x;
-                dS[q] += rc[j][i]*doe;
-                dw += dS[q]*Ps[j][q];
-                dv += dS[q]*ak;
-            }
-            p1[lid] = dw;
-            p2[lid] = dv;
-            barrier();
-            float dve = p2[e] + p2[64u+e] + p2[128u+e] + p2[192u+e];
-            float dsk = -dve;
-            if (lid < 64u) {
-                uint hi = ((lid & 3u)*16u + (lid >> 2))*2u;
-                dR[row + lid] = h0[hi] + h0[hi + 1u];
-                dW[row + lid] = p1[lid] + p1[64u+lid] + p1[128u+lid] + p1[192u+lid];
-                dV[row + lid] = dve;
-            }
-
-            for (uint q = 0; q < 16u; q += 1u) {
-                uint i = g + 4u*q;
-                vec2 y = subgroupAdd(vec2(dS[q]*(ve - sk), dsk*Ps[j][q]));
-                if (lead) h1[(g*16u + q)*2u + half_] = y;
-                dS[q] = we*dS[q] + dsk*kc[j][i];
-            }
             uint tf = c*CH + j;
+            uint row = step_row(base, tf);
+
+            vec4 gu = hv[j][u];
+            vec4 hl = hu[j][u];
+            float doe = hl.z;
+            float dvp = 0.0;
+            float nskp = 0.0;
+            [[unroll]] for (uint q = 0; q < 16u; q += 1u) {
+                vec4 gi = hv[j][p + 4u*q];
+                float ai = hu[j][p + 4u*q].x;
+                dA[q] += gi.z*doe;
+                dvp += dA[q]*gi.y;
+                nskp += dA[q]*ai*gi.x;
+                dA[q] = gi.w*dA[q];
+            }
+            float dve = subgroupClusteredAdd(dvp, 4u);
+            float dsk = -subgroupClusteredAdd(nskp, 4u);
+            if (p == 0u) {
+                dsks[j & 1u][u] = dsk;
+                D[2u*sec + row + u] = dve;
+            }
+            [[unroll]] for (uint q = 0; q < 16u; q += 1u) {
+                dA[q] += hv[j][p + 4u*q].x*dsk;
+            }
+
+            float wi = gu.w;
+            float ki = gu.x;
+            float ai = hl.x;
+            float kti = gu.y;
+            float ri = gu.z;
+            vec4 x = vec4(0.0);
+            [[unroll]] for (uint q = 0; q < 16u; q += 1u) {
+                vec4 ge = hu[j][p + 4u*q];
+                float dov = ge.z;
+                float ske = ge.w;
+                float ve = ge.y;
+                float st = wi*Ps[j][q] - ai*ki*ske + kti*ve;
+                dB[q] += ri*dov;
+                x += vec4(st*dov, dB[q]*Ps[j][q], dB[q]*ve, dB[q]*ske);
+            }
+            x = subgroupClusteredAdd(x, 4u);
+            barrier();
+            float yp = 0.0;
+            [[unroll]] for (uint q = 0; q < 16u; q += 1u) {
+                float dske = dsks[j & 1u][p + 4u*q];
+                yp += dske*Ps[j][q];
+                dB[q] = wi*dB[q] + ki*dske;
+            }
+            float y = subgroupClusteredAdd(yp, 4u);
+            if (p == 0u) {
+                D[row + u] = y - ai*x.w;
+                D[sec + row + u] = x.z;
+                D[3u*sec + row + u] = x.x;
+                D[4u*sec + row + u] = x.y;
+                D[5u*sec + row + u] = -ki*x.w;
+            }
+
             if (noisy && tf % blk == 0u && dir == 0u) {
-                uint sb = block_slot(seq, h, tf) + lid;
-                for (uint q = 0; q < 16u; q += 1u) Dbst[sb + q*256u] = 0.5*dS[q];
+                uint sb = block_slot(seq, h, tf);
+                [[unroll]] for (uint q = 0; q < 16u; q += 1u) Dbst[sb + q*256u + lid] = 0.5*dA[q];
             }
             if (noisy && tf % blk == 0u) {
-                for (uint q = 0; q < 16u; q += 1u) dS[q] = 0.0;
+                [[unroll]] for (uint q = 0; q < 16u; q += 1u) {
+                    dA[q] = 0.0;
+                    dB[q] = 0.0;
+                }
             }
             if (clean && tf % blk == 0u && tf > 0u) {
-                uint sb = block_slot(seq, h, tf) + lid;
-                for (uint q = 0; q < 16u; q += 1u) dS[q] += Dbst[sb + q*256u];
-            }
-            barrier();
-            if (lid < 64u) {
-                uint hi = ((lid & 3u)*16u + (lid >> 2))*2u;
-                vec2 y = h1[hi] + h1[hi + 1u];
-                dA[row + lid] = y.x*kc[j][lid];
-                dK[row + lid] = y.x*ac[j][lid] + y.y;
+                uint sb = block_slot(seq, h, tf);
+                [[unroll]] for (uint q = 0; q < 16u; q += 1u) {
+                    dA[q] += Dbst[sb + q*256u + lid];
+                    dB[q] += Dbst[sb + fidx(u, p + 4u*q)];
+                }
             }
         }
     }

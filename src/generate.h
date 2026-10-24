@@ -20,6 +20,7 @@ typedef struct mda_generate_ctx_t mda_generate_ctx_t;
 enum {
     MDA_GENERATE_RANDOM,
     MDA_GENERATE_LTR,
+    MDA_GENERATE_CONF,
     MDA_GENERATE_SPEC,
 };
 

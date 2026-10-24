@@ -1,21 +1,26 @@
 #version 450
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer B0 { float K[]; };
-layout(std430, binding = 1) readonly buffer B1 { float V[]; };
-layout(std430, binding = 2) readonly buffer B2 { float R[]; };
-layout(std430, binding = 3) readonly buffer B3 { float W[]; };
-layout(std430, binding = 4) readonly buffer B4 { float A[]; };
-layout(std430, binding = 5) writeonly buffer B5 { float PK[]; };
-layout(std430, binding = 6) writeonly buffer B6 { float PV[]; };
-layout(std430, binding = 7) writeonly buffer B7 { float PR[]; };
-layout(std430, binding = 8) writeonly buffer B8 { float PW[]; };
-layout(std430, binding = 9) writeonly buffer B9 { float PA[]; };
-layout(std430, binding = 10) writeonly buffer B10 { float kinv[]; };
+layout(std430, binding = 0) readonly buffer B0 { float KV[]; };
+layout(std430, binding = 1) readonly buffer B1 { float RAW[]; };
+layout(std430, binding = 2) buffer B2 { float V0[]; };
+layout(std430, binding = 3) readonly buffer B3 { float WALL[]; };
+layout(std430, binding = 4) writeonly buffer B4 { float HEADS[]; };
+layout(std430, binding = 5) writeonly buffer B5 { float VG[]; };
+layout(std430, binding = 6) writeonly buffer B6 { float kinv[]; };
+layout(std430, binding = 7) writeonly buffer B7 { float BS[]; };
 layout(push_constant) uniform pc {
     uint n_vec;
+    uint sec;
     uint hd;
     uint seqlen;
+    uint first_row;
+    uint w0;
+    uint a0;
+    uint v0;
+    uint kk;
+    uint ka;
+    uint rk;
 };
 
 const float C = 0.60653066;
@@ -23,6 +28,7 @@ const float C = 0.60653066;
 shared float red[256];
 
 float group_sum(float x, uint lid) {
+    barrier();
     red[lid] = x;
     barrier();
     for (uint s = 32u; s > 0u; s >>= 1) {
@@ -34,6 +40,10 @@ float group_sum(float x, uint lid) {
     return red[lid & ~63u];
 }
 
+float sigmoidf(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
 void main() {
     uint lid = gl_LocalInvocationID.x;
     uint vec = gl_WorkGroupID.x * 4u + (lid >> 6);
@@ -41,21 +51,46 @@ void main() {
     bool live = vec < n_vec;
     uint t = vec % seqlen;
     uint bh = vec / seqlen;
-    uint ui = ((bh / hd) * seqlen + t) * hd * 64u + (bh % hd) * 64u + e;
+    uint ch = (bh % hd) * 64u + e;
+    uint row = (bh / hd) * seqlen + t;
+    uint ui = row * hd * 64u + ch;
     uint pi = vec * 64u + e;
+    uint n = sec;
     float k = 0.0;
+    float kap = 0.0;
     if (live) {
-        k = K[ui];
+        k = KV[ui];
+        kap = k * WALL[kk + ch];
     }
-    float scale = 1.0 / (sqrt(group_sum(k * k, lid)) + 1e-6);
+    float scale = 1.0 / (sqrt(group_sum(kap * kap, lid)) + 1e-6);
+    float a = 0.0;
+    float kt = 0.0;
+    float r = 0.0;
     if (live) {
-        PK[pi] = k * scale;
+        a = sigmoidf(RAW[4u * n + ui] + WALL[a0 + ch]);
+        kt = k * (1.0 + (a - 1.0) * WALL[ka + ch]);
+        r = RAW[2u * n + ui];
+    }
+    float bonus = group_sum(r * WALL[rk + ch] * kt, lid);
+    if (live) {
+        float vp = KV[n + ui];
+        float v = vp;
+        if (row >= first_row) {
+            V0[ui] = vp;
+        } else {
+            float vg = sigmoidf(RAW[5u * n + ui] + WALL[v0 + ch]);
+            v = V0[ui] + vg * (vp - V0[ui]);
+            VG[ui] = vg;
+        }
+        HEADS[pi] = kap * scale;
+        HEADS[n + pi] = kt;
+        HEADS[2u * n + pi] = v;
+        HEADS[3u * n + pi] = r;
+        HEADS[4u * n + pi] = exp(-C * sigmoidf(RAW[3u * n + ui] + WALL[w0 + ch]));
+        HEADS[5u * n + pi] = a;
         if (e == 0u) {
             kinv[vec] = scale;
+            BS[vec] = bonus;
         }
-        PV[pi] = V[ui];
-        PR[pi] = R[ui];
-        PW[pi] = exp(-C / (1.0 + exp(-W[ui])));
-        PA[pi] = 1.0 / (1.0 + exp(-A[ui]));
     }
 }

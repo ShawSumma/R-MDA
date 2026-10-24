@@ -1,0 +1,95 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float RAW[]; };
+layout(std430, binding = 1) readonly buffer B1 { float HEADS[]; };
+layout(std430, binding = 2) readonly buffer B2 { float BS[]; };
+layout(std430, binding = 3) readonly buffer B3 { float G[]; };
+layout(std430, binding = 4) buffer B4 { float P[]; };
+layout(std430, binding = 5) buffer B5 { float Y[]; };
+layout(std430, binding = 6) buffer B6 { float RMS[]; };
+layout(std430, binding = 7) writeonly buffer B7 { float DRAW[]; };
+layout(std430, binding = 8) writeonly buffer B8 { float DG[]; };
+layout(std430, binding = 9) writeonly buffer B9 { float DBS[]; };
+layout(std430, binding = 10) writeonly buffer B10 { float DVB[]; };
+layout(std430, binding = 11) buffer B11 { uint amax[]; };
+layout(push_constant) uniform pc {
+    uint n_vec;
+    uint sec;
+    uint hd;
+    uint seqlen;
+    uint op;
+    uint slot;
+};
+
+shared float red[256];
+
+float group_sum(float v, uint lid) {
+    barrier();
+    red[lid] = v;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if ((lid & 63u) < s) {
+            red[lid] += red[lid + s];
+        }
+        barrier();
+    }
+    return red[lid & ~63u];
+}
+
+void note_max(uint s, float v) {
+    float m = subgroupMax(v);
+    if (subgroupElect() && m > uintBitsToFloat(amax[s])) {
+        atomicMax(amax[s], floatBitsToUint(m));
+    }
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint vec = gl_WorkGroupID.x * 4u + (lid >> 6);
+    uint e = lid & 63u;
+    bool live = vec < n_vec;
+    uint row = vec / hd;
+    uint vp = ((row / seqlen) * hd + vec % hd) * seqlen + row % seqlen;
+    uint i = vec * 64u + e;
+    uint pi = vp * 64u + e;
+    uint n = sec;
+    float x = 0.0;
+    if (live) {
+        x = RAW[i];
+    }
+    if (op == 0u) {
+        float r = sqrt(group_sum(x * x, lid) / 64.0 + 1e-5);
+        if (live) {
+            float p = x / r + BS[vp] * HEADS[2u * n + pi];
+            P[i] = p;
+            Y[i] = p * G[i];
+            if (e == 0u) {
+                RMS[vec] = r;
+            }
+        }
+    } else {
+        float dp = 0.0;
+        float dg = 0.0;
+        float v = 0.0;
+        if (live) {
+            float dy = Y[i];
+            dp = dy * G[i];
+            dg = dy * P[i];
+            v = HEADS[2u * n + pi];
+        }
+        float dbs = group_sum(dp * v, lid);
+        float s = group_sum(x * dp, lid);
+        if (live) {
+            float r = RMS[vec];
+            DRAW[i] = dp / r - x * s / (64.0 * r * r * r);
+            DG[i] = dg;
+            DVB[pi] = dp * BS[vp];
+            if (e == 0u) {
+                DBS[vp] = dbs;
+            }
+        }
+        note_max(slot, abs(dg));
+    }
+}

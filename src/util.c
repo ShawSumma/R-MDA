@@ -58,3 +58,11 @@ size_t mda_util_min_size(size_t a, size_t b) {
         return b;
     }
 }
+
+size_t mda_util_max_size(size_t a, size_t b) {
+    if (a > b) {
+        return a;
+    } else {
+        return b;
+    }
+}

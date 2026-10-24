@@ -3,34 +3,95 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 128) in;
-layout(std430, binding = 0) readonly buffer BA { float16_t A[]; };
-layout(std430, binding = 1) readonly buffer BB { float16_t B[]; };
+layout(std430, binding = 0) readonly buffer BA { uvec4 A[]; };
+layout(std430, binding = 1) readonly buffer BB { uvec4 B[]; };
 layout(std430, binding = 2) buffer BC { float C[]; };
 layout(std430, binding = 3) readonly buffer BS { uint amax[]; };
 layout(std430, binding = 4) writeonly buffer BH { float16_t H[]; };
 layout(std430, binding = 5) readonly buffer BP { float P[]; };
 layout(push_constant) uniform pc { uint m, n, k, sa, sb, ta, tb, store; float alpha, beta; };
-const uint T = 16;
+const uint T = 16u;
+const uint BK = 32u;
+const uint TILE = 128u;
+const uint WIDE = 5u;
+const uint LONG = 17u;
+const uint STAGE = 640u;
+shared uvec4 sA[2u * STAGE];
+shared uvec4 sB[2u * STAGE];
+uvec4 ra[4];
+uvec4 rb[4];
 
-#define LOAD_A_N coopMatLoad(a[i], A, (row0 + i * 16u) * k + kk, k, gl_CooperativeMatrixLayoutRowMajor)
-#define LOAD_A_T coopMatLoad(a[i], A, kk * m + row0 + i * 16u, m, gl_CooperativeMatrixLayoutColumnMajor)
-#define LOAD_B_N coopMatLoad(mb, B, kk * n + col0 + t * 16u, n, gl_CooperativeMatrixLayoutRowMajor)
-#define LOAD_B_T coopMatLoad(mb, B, (col0 + t * 16u) * k + kk, k, gl_CooperativeMatrixLayoutColumnMajor)
-#define MM_LOOP(LOAD_A, LOAD_B) \
-    for (uint kk = 0; kk < k; kk = kk + T) { \
-        coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseA> a[4]; \
-        for (uint i = 0; i < 4u; i = i + 1) { \
-            LOAD_A; \
-        } \
-        for (uint t = 0; t < 4u; t = t + 1) { \
-            coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseB> mb; \
-            LOAD_B; \
-            for (uint i = 0; i < 4u; i = i + 1) { \
-                ac[i][t] = coopMatMulAdd(a[i], mb, ac[i][t]); \
-            } \
-        } \
+uvec4 fetch_a(uint m0, uint k0, uint idx) {
+    if (ta == 0u) {
+        uint r = idx >> 2;
+        uint c = (idx & 3u) * 8u;
+        if (m0 + r < m) {
+            return A[((m0 + r) * k + k0 + c) >> 3];
+        } else {
+            return uvec4(0u);
+        }
+    } else {
+        uint r = idx >> 4;
+        uint c = (idx & 15u) * 8u;
+        if (m0 + c < m) {
+            return A[((k0 + r) * m + m0 + c) >> 3];
+        } else {
+            return uvec4(0u);
+        }
     }
+}
+
+uvec4 fetch_b(uint n0, uint k0, uint idx) {
+    if (tb == 0u) {
+        uint r = idx >> 4;
+        uint c = (idx & 15u) * 8u;
+        if (n0 + c < n) {
+            return B[((k0 + r) * n + n0 + c) >> 3];
+        } else {
+            return uvec4(0u);
+        }
+    } else {
+        uint r = idx >> 2;
+        uint c = (idx & 3u) * 8u;
+        if (n0 + r < n) {
+            return B[((n0 + r) * k + k0 + c) >> 3];
+        } else {
+            return uvec4(0u);
+        }
+    }
+}
+
+uint slot_a(uint idx) {
+    if (ta == 0u) {
+        return (idx >> 2) * WIDE + (idx & 3u);
+    } else {
+        return (idx >> 4) * LONG + (idx & 15u);
+    }
+}
+
+uint slot_b(uint idx) {
+    if (tb == 0u) {
+        return (idx >> 4) * LONG + (idx & 15u);
+    } else {
+        return (idx >> 2) * WIDE + (idx & 3u);
+    }
+}
+
+void fetch(uint m0, uint n0, uint k0, uint tid) {
+    [[unroll]] for (uint i = 0u; i < 4u; i = i + 1u) {
+        ra[i] = fetch_a(m0, k0, tid + i * 128u);
+        rb[i] = fetch_b(n0, k0, tid + i * 128u);
+    }
+}
+
+void put(uint base, uint tid) {
+    [[unroll]] for (uint i = 0u; i < 4u; i = i + 1u) {
+        sA[base + slot_a(tid + i * 128u)] = ra[i];
+        sB[base + slot_b(tid + i * 128u)] = rb[i];
+    }
+}
 
 float slot_scale(uint s) {
     if (s == ~0u) {
@@ -42,45 +103,75 @@ float slot_scale(uint s) {
     }
 }
 
-void tile(uint row0, uint col0) {
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint m0 = gl_WorkGroupID.y * TILE;
+    uint n0 = gl_WorkGroupID.x * TILE;
+    uint sr = (gl_SubgroupID & 1u) * 64u;
+    uint sc = (gl_SubgroupID >> 1) * 64u;
     coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator> ac[4][4];
-    for (uint i = 0; i < 4u; i = i + 1) {
-        for (uint j = 0; j < 4u; j = j + 1) {
+    [[unroll]] for (uint i = 0u; i < 4u; i = i + 1u) {
+        [[unroll]] for (uint j = 0u; j < 4u; j = j + 1u) {
             ac[i][j] = coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator>(0.0);
         }
     }
-    if (ta != 0u) {
-        MM_LOOP(LOAD_A_T, LOAD_B_N)
-    } else if (tb != 0u) {
-        MM_LOOP(LOAD_A_N, LOAD_B_T)
-    } else {
-        MM_LOOP(LOAD_A_N, LOAD_B_N)
-    }
-    float s = alpha / (slot_scale(sa) * slot_scale(sb));
-    for (uint i = 0; i < 4u; i = i + 1) {
-        for (uint t = 0; t < 4u; t = t + 1) {
-            uint at = (row0 + i * 16u) * n + col0 + t * 16u;
-            ac[i][t] = ac[i][t] * s;
-            if (beta != 0.0) {
-                coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator> prev;
-                coopMatLoad(prev, P, at, n, gl_CooperativeMatrixLayoutRowMajor);
-                ac[i][t] = ac[i][t] + prev * beta;
+    uint steps = k / BK;
+    fetch(m0, n0, 0u, tid);
+    put(0u, tid);
+    barrier();
+    for (uint s = 0u; s < steps; s = s + 1u) {
+        uint cur = (s & 1u) * STAGE;
+        bool more = s + 1u < steps;
+        if (more) {
+            fetch(m0, n0, (s + 1u) * BK, tid);
+        }
+        [[unroll]] for (uint kk = 0u; kk < BK; kk = kk + T) {
+            coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseA> a[4];
+            [[unroll]] for (uint i = 0u; i < 4u; i = i + 1u) {
+                if (ta == 0u) {
+                    coopMatLoad(a[i], sA, cur + (sr + i * T) * WIDE + kk / 8u, WIDE, gl_CooperativeMatrixLayoutRowMajor);
+                } else {
+                    coopMatLoad(a[i], sA, cur + kk * LONG + (sr + i * T) / 8u, LONG, gl_CooperativeMatrixLayoutColumnMajor);
+                }
             }
-            if ((store & 1u) != 0u) {
-                coopMatStore(ac[i][t], C, at, n, gl_CooperativeMatrixLayoutRowMajor);
-            }
-            if ((store & 2u) != 0u) {
-                coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator> h = coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator>(ac[i][t]);
-                coopMatStore(h, H, at, n, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint t = 0u; t < 4u; t = t + 1u) {
+                coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseB> mb;
+                if (tb == 0u) {
+                    coopMatLoad(mb, sB, cur + kk * LONG + (sc + t * T) / 8u, LONG, gl_CooperativeMatrixLayoutRowMajor);
+                } else {
+                    coopMatLoad(mb, sB, cur + (sc + t * T) * WIDE + kk / 8u, WIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                }
+                [[unroll]] for (uint i = 0u; i < 4u; i = i + 1u) {
+                    ac[i][t] = coopMatMulAdd(a[i], mb, ac[i][t]);
+                }
             }
         }
+        if (more) {
+            put(STAGE - cur, tid);
+        }
+        barrier();
     }
-}
-
-void main() {
-    uint row0 = gl_WorkGroupID.y * 128u + (gl_SubgroupID & 1u) * 64u;
-    uint col0 = gl_WorkGroupID.x * 128u + (gl_SubgroupID >> 1) * 64u;
+    uint row0 = m0 + sr;
+    uint col0 = n0 + sc;
     if (row0 < m && col0 < n) {
-        tile(row0, col0);
+        float s = alpha / (slot_scale(sa) * slot_scale(sb));
+        [[unroll]] for (uint i = 0u; i < 4u; i = i + 1u) {
+            [[unroll]] for (uint t = 0u; t < 4u; t = t + 1u) {
+                uint at = (row0 + i * 16u) * n + col0 + t * 16u;
+                ac[i][t] = ac[i][t] * s;
+                if (beta != 0.0) {
+                    coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator> prev;
+                    coopMatLoad(prev, P, at, n, gl_CooperativeMatrixLayoutRowMajor);
+                    ac[i][t] = ac[i][t] + prev * beta;
+                }
+                if ((store & 1u) != 0u) {
+                    coopMatStore(ac[i][t], C, at, n, gl_CooperativeMatrixLayoutRowMajor);
+                }
+                if ((store & 2u) != 0u) {
+                    coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator> h = coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator>(ac[i][t]);
+                    coopMatStore(h, H, at, n, gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+        }
     }
 }

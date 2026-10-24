@@ -7,7 +7,7 @@
 
 #include "model.h"
 
-#define MDA_CKPT_MAGIC 0x39504b4341444d52ull
+#define MDA_CKPT_MAGIC 0x3a504b4341444d52ull
 #define MDA_CKPT_OVERFLOW_PATH "models/ckpt-overflow.bin"
 #define MDA_CKPT_PATH "models/ckpt.bin"
 
@@ -25,6 +25,7 @@ struct mda_ckpt_hdr_t {
 struct mda_ckpt_res_t {
     uint32_t step;
     bool ok;
+    bool found;
 };
 
 bool mda_ckpt_write(mda_model_t *m, uint64_t vocab_hash, uint32_t step, FILE *f);

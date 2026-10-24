@@ -1,0 +1,58 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float H[]; };
+layout(std430, binding = 1) buffer B1 { float X[]; };
+layout(std430, binding = 2) buffer B2 { uint amax[]; };
+layout(push_constant) uniform pc {
+    uint n;
+    uint op;
+    uint act;
+    uint slot;
+};
+
+shared float red[256];
+
+float f(float h) {
+    if (act == 1u) {
+        return tanh(h);
+    } else {
+        return 1.0 / (1.0 + exp(-h));
+    }
+}
+
+float df(float h) {
+    float y = f(h);
+    if (act == 1u) {
+        return 1.0 - y * y;
+    } else {
+        return y * (1.0 - y);
+    }
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint stride = gl_NumWorkGroups.x * 256u;
+    float m = 0.0;
+    for (uint i = gl_GlobalInvocationID.x; i < n; i += stride) {
+        float y = 0.0;
+        if (op == 0u) {
+            y = f(H[i]);
+        } else {
+            y = X[i] * df(H[i]);
+        }
+        X[i] = y;
+        m = max(m, abs(y));
+    }
+    red[lid] = m;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            red[lid] = max(red[lid], red[lid + s]);
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        atomicMax(amax[slot], floatBitsToUint(red[0]));
+    }
+}

@@ -79,14 +79,16 @@ void mda_probe_acts_table(mda_step_trainer_t *tr, mda_vkc_buf_t *stage) {
     );
     for (uint32_t l = 0; l < cfg.n_layer; l += 1) {
         mda_fwd_act_t *a = &tr->sc.acts[l];
+        mda_vkc_buf_t v = mda_fwd_section(&a->heads, cfg, 2);
+        mda_vkc_buf_t r = mda_fwd_section(&a->heads, cfg, 3);
         printf(
             "%5u %9.3g %9.3g %9.3g %9.3g %9.3g %9.3g %9.3g %9.3g %9.3g %9.3g %9.3g %9u %9u\n",
             l,
             mda_probe_acts_maxabs(c, &a->x_in, bt * d, stage),
             mda_probe_acts_maxabs(c, &a->n1, bt * d, stage),
             mda_probe_acts_maxabs(c, &a->shift, bt * d, stage),
-            mda_probe_acts_maxabs(c, &a->pv, bt * d, stage),
-            mda_probe_acts_maxabs(c, &a->pr, bt * d, stage),
+            mda_probe_acts_maxabs(c, &v, bt * d, stage),
+            mda_probe_acts_maxabs(c, &r, bt * d, stage),
             mda_probe_acts_maxabs(c, &a->wkv_raw, bt * d, stage),
             mda_probe_acts_maxabs(c, &a->x_mid, bt * d, stage),
             mda_probe_acts_maxabs(c, &a->n2, bt * d, stage),
@@ -134,7 +136,7 @@ bool mda_probe_acts_trainer(mda_step_trainer_t *tr, const mda_data_corpus_t *cp,
     mda_ckpt_res_t loaded = mda_ckpt_load(tr->m, mda_tokenizer_hash(&cp->tok), path, false);
     if (loaded.ok == false) {
         return false;
-    } else if (loaded.step == 0) {
+    } else if (loaded.found == false) {
         fprintf(stderr, "%s: no checkpoint\n", path);
         return false;
     } else {
@@ -147,7 +149,7 @@ bool mda_probe_acts_model(mda_vkc_t *c, const mda_data_corpus_t *cp, const char 
     if (m == NULL) {
         return false;
     } else {
-        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, false);
+        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, false, NULL);
         if (c->fail) {
             return false;
         } else {

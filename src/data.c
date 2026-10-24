@@ -9,16 +9,26 @@
 #include "hash.h"
 #include "util.h"
 
+size_t mda_data_cut(const char *bytes, size_t at, size_t hi) {
+    size_t i = at;
+    while (i < hi && (bytes[i] != '\n' || (uint8_t)bytes[i - 1] < 0x21 || (uint8_t)bytes[i - 1] > 0x7e)) {
+        i += 1;
+    }
+    return i;
+}
+
 void *mda_data_job_run(void *arg) {
     mda_data_job_t *j = arg;
     j->ids = malloc((j->hi - j->lo) * sizeof(uint32_t));
     j->n = 0;
-    for (size_t pos = j->lo; pos < j->hi; pos += MDA_DATA_TOK_WINDOW) {
-        uint32_t chunk = (uint32_t)mda_util_min_size(j->hi - pos, MDA_DATA_TOK_WINDOW);
-        mda_tokenizer_ids_t r = mda_tokenizer_encode(j->tok, j->bytes + pos, chunk);
+    size_t pos = j->lo;
+    while (pos < j->hi) {
+        size_t end = mda_data_cut(j->bytes, mda_util_min_size(pos + MDA_DATA_TOK_WINDOW, j->hi), j->hi);
+        mda_tokenizer_ids_t r = mda_tokenizer_encode(j->tok, j->bytes + pos, (uint32_t)(end - pos));
         memcpy(j->ids + j->n, r.ids, r.n * sizeof(uint32_t));
         j->n += r.n;
         free(r.ids);
+        pos = end;
     }
     return NULL;
 }
@@ -32,20 +42,21 @@ mda_tokenizer_ids_t mda_data_ids_none(void) {
 
 mda_tokenizer_ids_t mda_data_tokenize_bytes(const mda_tokenizer_t *tok, const char *path, const char *bytes, size_t n) {
     size_t nt = (size_t)sysconf(_SC_NPROCESSORS_ONLN);
-    size_t windows = (n + MDA_DATA_TOK_WINDOW - 1) / MDA_DATA_TOK_WINDOW;
-    size_t per = (windows + nt - 1) / nt * MDA_DATA_TOK_WINDOW;
+    size_t per = (n + nt - 1) / nt;
     fprintf(stderr, "%s: tokenizing %zu bytes on %zu threads...\n", path, n, nt);
     mda_data_job_t *jobs = malloc(nt * sizeof(mda_data_job_t));
     pthread_t *threads = malloc(nt * sizeof(pthread_t));
+    size_t lo = 0;
     for (size_t i = 0; i < nt; i += 1) {
-        size_t lo = mda_util_min_size(i * per, n);
+        size_t hi = mda_data_cut(bytes, mda_util_min_size(mda_util_max_size(lo + 1, (i + 1) * per), n), n);
         jobs[i] = (mda_data_job_t) {
             .tok = tok,
             .bytes = bytes,
             .lo = lo,
-            .hi = mda_util_min_size(lo + per, n),
+            .hi = hi,
         };
         pthread_create(&threads[i], NULL, mda_data_job_run, &jobs[i]);
+        lo = hi;
     }
     size_t total = 0;
     for (size_t i = 0; i < nt; i += 1) {

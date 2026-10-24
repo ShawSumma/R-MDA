@@ -6,9 +6,9 @@ CFLAGS = -std=gnu17 -O2 -Isrc -MMD -MP
 LDLIBS = -lvulkan -lm
 GLSLC = glslc --target-env=vulkan1.3
 
-MODS = vkc util hash sort tokenizer vocab data model fwd bwd step ckpt
+MODS = vkc util hash sort unicode tokenizer safet data model fwd bwd teacher step ckpt
 TESTS = test_ckpt test_grad test_matmul_f16 test_tokenizer
-PROGS = bench generate probe_acts probe_coopmat probe_memory sample train train_tokenizer ${TESTS}
+PROGS = bench check_teacher generate import probe_acts probe_coopmat probe_memory sample train ${TESTS}
 KERNELS != cd shader && echo *.comp
 
 OBJS = ${MODS:%=build/obj/%.o}

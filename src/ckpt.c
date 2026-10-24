@@ -20,6 +20,7 @@ mda_ckpt_res_t mda_ckpt_bad(void) {
     return (mda_ckpt_res_t) {
         .step = 0,
         .ok = false,
+        .found = true,
     };
 }
 
@@ -113,6 +114,7 @@ mda_ckpt_res_t mda_ckpt_read_body(mda_model_t *m, FILE *f, bool moments, const c
         return (mda_ckpt_res_t) {
             .step = step,
             .ok = true,
+            .found = true,
         };
     } else {
         return mda_ckpt_bad();
@@ -177,6 +179,7 @@ mda_ckpt_res_t mda_ckpt_load(mda_model_t *m, uint64_t vocab_hash, const char *pa
         return (mda_ckpt_res_t) {
             .step = 0,
             .ok = true,
+            .found = false,
         };
     } else {
         mda_ckpt_res_t r = mda_ckpt_read(m, vocab_hash, f, moments, path);

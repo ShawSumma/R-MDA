@@ -15,7 +15,9 @@ typedef struct mda_train_log_t mda_train_log_t;
 struct mda_train_args_t {
     const char *ckpt_path;
     const char *mode;
+    const char *teacher;
     float lr_peak;
+    float teach;
     uint32_t stop;
     uint32_t accum;
     uint32_t batch;
@@ -34,6 +36,7 @@ struct mda_train_log_t {
     uint32_t n_skipped;
     uint32_t skip_run;
     uint32_t n_logged;
+    bool reported;
 };
 
 #endif

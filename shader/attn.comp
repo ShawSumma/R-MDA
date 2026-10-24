@@ -1,0 +1,66 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float Q[]; };
+layout(std430, binding = 1) readonly buffer B1 { float K[]; };
+layout(std430, binding = 2) readonly buffer B2 { float V[]; };
+layout(std430, binding = 3) writeonly buffer B3 { float O[]; };
+layout(push_constant) uniform pc {
+    uint seqlen;
+    uint heads;
+    uint kv_heads;
+};
+
+shared float ks[64][64];
+shared float vs[64][64];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint sh = gl_WorkGroupID.x;
+    uint seq = sh / heads;
+    uint h = sh % heads;
+    uint kvh = h / (heads / kv_heads);
+    uint qi = gl_WorkGroupID.y * 64u + tid;
+    uint d = heads * 64u;
+    uint dkv = kv_heads * 64u;
+    uint qrow = seq * seqlen + min(qi, seqlen - 1u);
+    float q[64];
+    float o[64];
+    [[unroll]] for (uint e = 0u; e < 64u; e += 1u) {
+        q[e] = Q[qrow * d + h * 64u + e] * 0.125;
+        o[e] = 0.0;
+    }
+    float mx = -1e30;
+    float sum = 0.0;
+    uint last = min(gl_WorkGroupID.y * 64u + 63u, seqlen - 1u);
+    for (uint t0 = 0u; t0 <= last; t0 += 64u) {
+        barrier();
+        for (uint e = 0u; e < 64u; e += 1u) {
+            uint krow = seq * seqlen + min(t0 + e, seqlen - 1u);
+            ks[e][tid] = K[krow * dkv + kvh * 64u + tid];
+            vs[e][tid] = V[krow * dkv + kvh * 64u + tid];
+        }
+        barrier();
+        uint n = min(64u, qi + 1u - min(t0, qi + 1u));
+        for (uint j = 0u; j < n; j += 1u) {
+            float s = 0.0;
+            [[unroll]] for (uint e = 0u; e < 64u; e += 1u) {
+                s += q[e] * ks[j][e];
+            }
+            float nm = max(mx, s);
+            float keep = exp(mx - nm);
+            float p = exp(s - nm);
+            sum = sum * keep + p;
+            [[unroll]] for (uint e = 0u; e < 64u; e += 1u) {
+                o[e] = o[e] * keep + p * vs[j][e];
+            }
+            mx = nm;
+        }
+    }
+    if (qi < seqlen) {
+        [[unroll]] for (uint e = 0u; e < 64u; e += 1u) {
+            O[qrow * d + h * 64u + e] = o[e] / sum;
+        }
+    }
+}

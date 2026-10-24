@@ -9,6 +9,7 @@
 #include "vkc.h"
 #include "hash.h"
 #include "util.h"
+#include "sort.h"
 #include "tokenizer.h"
 #include "model.h"
 #include "fwd.h"
@@ -37,7 +38,31 @@ uint32_t mda_generate_pick(uint64_t key, uint32_t i, uint32_t n, mda_generate_or
     }
 }
 
-void mda_generate_reveal(uint32_t *ids, const uint32_t *tok, uint32_t *open, uint32_t n, uint32_t mask_id, uint64_t key, uint32_t remaining, uint32_t base, mda_generate_order_t order) {
+void mda_generate_reveal_order(uint32_t *ids, const uint32_t *tok, uint32_t *open, uint32_t n_open, uint32_t reveal, uint64_t key, uint32_t base, mda_generate_order_t order) {
+    for (uint32_t r = 0; r < reveal; r += 1) {
+        uint32_t j = r + mda_generate_pick(key, base + r, n_open - r, order);
+        uint32_t p = open[j];
+        open[j] = open[r];
+        ids[p] = tok[p];
+    }
+}
+
+void mda_generate_reveal_conf(uint32_t *ids, const uint32_t *tok, const float *conf, const uint32_t *open, uint32_t n_open, uint32_t reveal) {
+    mda_sort_item_t *items = malloc(n_open * sizeof(mda_sort_item_t));
+    for (uint32_t j = 0; j < n_open; j += 1) {
+        items[j] = (mda_sort_item_t) {
+            .key = -(double)conf[open[j]],
+            .idx = open[j],
+        };
+    }
+    mda_sort_items(items, n_open);
+    for (uint32_t r = 0; r < reveal; r += 1) {
+        ids[items[r].idx] = tok[items[r].idx];
+    }
+    free(items);
+}
+
+void mda_generate_reveal(uint32_t *ids, const uint32_t *tok, const float *conf, uint32_t *open, uint32_t n, uint32_t mask_id, uint64_t key, uint32_t remaining, uint32_t base, mda_generate_order_t order) {
     uint32_t n_open = 0;
     for (uint32_t p = 0; p < n; p += 1) {
         if (ids[p] == mask_id) {
@@ -46,11 +71,13 @@ void mda_generate_reveal(uint32_t *ids, const uint32_t *tok, uint32_t *open, uin
         }
     }
     uint32_t reveal = (n_open + remaining - 1) / remaining;
-    for (uint32_t r = 0; r < reveal; r += 1) {
-        uint32_t j = r + mda_generate_pick(key, base + r, n_open - r, order);
-        uint32_t p = open[j];
-        open[j] = open[r];
-        ids[p] = tok[p];
+    switch (order) {
+    case MDA_GENERATE_CONF:
+        mda_generate_reveal_conf(ids, tok, conf, open, n_open, reveal);
+        break;
+    default:
+        mda_generate_reveal_order(ids, tok, open, n_open, reveal, key, base, order);
+        break;
     }
 }
 
@@ -215,9 +242,10 @@ uint32_t mda_generate_block_fixed(mda_generate_ctx_t *g, uint32_t lo, uint32_t r
         g->sc->seed = (uint32_t)mda_hash_u64(MDA_HASH_GEN, key, 0);
         mda_fwd_run(g->m, g->sc);
         uint32_t *tok = g->sc->tok.ptr;
+        float *conf = g->sc->conf.ptr;
         for (uint32_t s = 0; s < g->nseq; s += 1) {
             uint32_t *row = g->done + s * g->len + lo;
-            mda_generate_reveal(row, tok + (g->nseq + s) * blk, g->open, blk, g->mask_id, key, g->steps - step, s * blk, g->policy.order);
+            mda_generate_reveal(row, tok + (g->nseq + s) * blk, conf + (g->nseq + s) * blk, g->open, blk, g->mask_id, key, g->steps - step, s * blk, g->policy.order);
             if (step + 1 < g->steps) {
                 mda_generate_remask(row, blk, (uint32_t)(lo == 0), g->mask_id, key, s * blk, g->policy.remask);
             }
@@ -288,9 +316,10 @@ uint32_t mda_generate_round_plain(mda_generate_ctx_t *g, uint32_t round) {
         g->sc->seed = (uint32_t)mda_hash_u64(MDA_HASH_GEN, key, 0);
         mda_fwd_run(g->m, g->sc);
         uint32_t *tok = g->sc->tok.ptr;
+        float *conf = g->sc->conf.ptr;
         for (uint32_t s = 0; s < g->nseq; s += 1) {
             uint32_t *row = g->done + s * g->len;
-            mda_generate_reveal(row, tok + s * g->len, g->open, g->len, g->mask_id, key, g->steps - step, s * g->len, g->policy.order);
+            mda_generate_reveal(row, tok + s * g->len, conf + s * g->len, g->open, g->len, g->mask_id, key, g->steps - step, s * g->len, g->policy.order);
             if (step + 1 < g->steps) {
                 mda_generate_remask(row, g->len, 1, g->mask_id, key, s * g->len, g->policy.remask);
             }
@@ -416,9 +445,9 @@ uint32_t mda_generate_newline(const mda_tokenizer_t *tk) {
     return id;
 }
 
-mda_model_t *mda_generate_load(mda_vkc_t *c, const mda_tokenizer_t *tk, const char *path, mda_model_cfg_t cfg, bool causal) {
+mda_model_t *mda_generate_load(mda_vkc_t *c, const mda_tokenizer_t *tk, const char *path, mda_model_cfg_t cfg, bool causal, uint32_t dec) {
     mda_model_t *m = mda_model_init(c, cfg);
-    if (m == NULL) {
+    if (m == NULL || mda_model_set_dec(m, dec) == false) {
         return NULL;
     } else {
         m->causal = causal;
@@ -438,7 +467,11 @@ mda_model_cfg_t mda_generate_cfg(uint32_t vocab, const char *mode) {
     if (strcmp(mode, "ar") == 0) {
         block = MDA_MODEL_BLOCK;
     }
-    if (block > 0) {
+    if (block > 0 && mda_model_dec_of(mode) > 0) {
+        base.seqlen = block;
+        base.batch = mda_util_max_u32(base.batch, 64 / block);
+        return mda_model_cfg_block(base, block);
+    } else if (block > 0) {
         base.seqlen = block;
         return mda_model_cfg_block(base, block);
     } else {
@@ -450,7 +483,7 @@ bool mda_generate_judged(mda_vkc_t *c, const mda_tokenizer_t *tk, mda_generate_c
     if (strlen(judge) == 0) {
         return mda_generate_rounds(g, NULL, NULL, tk);
     } else {
-        mda_model_t *j = mda_generate_load(c, tk, judge, mda_model_cfg(tk->count), true);
+        mda_model_t *j = mda_generate_load(c, tk, judge, mda_model_cfg(tk->count), true, 0);
         if (j == NULL) {
             return false;
         } else {
@@ -508,6 +541,8 @@ mda_generate_policy_t mda_generate_policy(const char *name, const char *mode) {
         p.order = MDA_GENERATE_SPEC;
     } else if (strcmp(name, "ltr") == 0) {
         p.order = MDA_GENERATE_LTR;
+    } else if (strcmp(name, "conf") == 0) {
+        p.order = MDA_GENERATE_CONF;
     } else if (strncmp(name, "remdm", 5) == 0) {
         p.remask = strtof(name + 5, NULL);
     } else if (strncmp(name, "spec", 4) == 0) {
@@ -525,7 +560,7 @@ bool mda_generate_device(mda_vkc_t *c, const char *path, const char *judge, cons
         fprintf(stderr, "generate: spec needs block or ar mode\n");
         return false;
     } else {
-        mda_model_t *m = mda_generate_load(c, &tk, path, mda_generate_cfg(tk.count, mode), false);
+        mda_model_t *m = mda_generate_load(c, &tk, path, mda_generate_cfg(tk.count, mode), false, mda_model_dec_of(mode));
         if (m == NULL) {
             return false;
         } else {

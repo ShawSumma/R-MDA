@@ -2,6 +2,7 @@
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer L { float logits[]; };
 layout(std430, binding = 1) writeonly buffer T { uint tok[]; };
+layout(std430, binding = 2) writeonly buffer F { float conf[]; };
 layout(push_constant) uniform pc { uint rows; uint vocab; float temp; uint seed; };
 shared float sval[256];
 shared uint sidx[256];
@@ -21,6 +22,40 @@ float gumbel_key(float logit, uint rs, uint v) {
     }
 }
 
+float scale() {
+    if (temp > 0.0) {
+        return 1.0 / temp;
+    } else {
+        return 1.0;
+    }
+}
+
+float reduce_max(float x, uint tid) {
+    sval[tid] = x;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride = stride / 2u) {
+        if (tid < stride) {
+            sval[tid] = max(sval[tid], sval[tid + stride]);
+        }
+        barrier();
+    }
+    float m = sval[0];
+    barrier();
+    return m;
+}
+
+float reduce_sum(float x, uint tid) {
+    sval[tid] = x;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride = stride / 2u) {
+        if (tid < stride) {
+            sval[tid] += sval[tid + stride];
+        }
+        barrier();
+    }
+    return sval[0];
+}
+
 void main() {
     uint row = gl_WorkGroupID.x;
     if (row < rows) {
@@ -29,8 +64,11 @@ void main() {
         uint rs = hash(seed ^ hash(row));
         float best = -1e30;
         uint bi = 0;
+        float top = -1e30;
         for (uint v = tid; v < vocab; v += 256u) {
-            float key = gumbel_key(logits[base + v], rs, v);
+            float l = logits[base + v];
+            float key = gumbel_key(l, rs, v);
+            top = max(top, l);
             if (key > best) {
                 best = key;
                 bi = v;
@@ -46,8 +84,18 @@ void main() {
             }
             barrier();
         }
+        uint pick = sidx[0];
+        barrier();
+        float sc = scale();
+        float m = reduce_max(top, tid) * sc;
+        float sum = 0.0;
+        for (uint v = tid; v < vocab; v += 256u) {
+            sum += exp(logits[base + v] * sc - m);
+        }
+        float total = reduce_sum(sum, tid);
         if (tid == 0u) {
-            tok[row] = sidx[0];
+            tok[row] = pick;
+            conf[row] = exp(logits[base + pick] * sc - m) / total;
         }
     }
 }

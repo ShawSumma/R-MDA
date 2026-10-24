@@ -94,6 +94,11 @@ void mda_train_step(mda_train_log_t *log, mda_step_trainer_t *tr, const mda_data
     mda_step_begin(tr, lr, s);
     double bytes = mda_train_micros(tr, cp, args.sched, s);
     float loss = (float)tr->loss;
+    if (tr->skipped && log->reported == false) {
+        fprintf(stderr, "step %u skipped, the first in this run:\n", s);
+        mda_step_print_nonfinite(tr);
+        log->reported = true;
+    }
     if (tr->m->c->fail == false) {
         double bpb = tr->ce_sum / bytes / 0.6931472;
         mda_train_record(log, tr, loss, bpb);
@@ -132,8 +137,8 @@ bool mda_train_resume(mda_step_trainer_t *tr, const mda_data_corpus_t *cp, mda_t
     if (loaded.ok == false) {
         return false;
     } else {
-        if (loaded.step != 0) {
-            fprintf(stderr, "resumed from checkpoint at step %u\n", loaded.step);
+        if (loaded.found) {
+            fprintf(stderr, "resumed from %s at step %u\n", args.ckpt_path, loaded.step);
         }
         if (args.stop != 0) {
             fprintf(stderr, "lr %g, decaying to 0 over steps %u..%u\n", args.lr_peak, mda_train_decay_from(args.stop), args.stop);
@@ -154,14 +159,53 @@ bool mda_train_trainer(mda_step_trainer_t *tr, const mda_data_corpus_t *cp, mda_
     }
 }
 
+uint32_t mda_train_teacher_rows(const mda_model_t *m) {
+    mda_model_cfg_t cfg = m->cfg;
+    if (m->causal) {
+        return cfg.batch * cfg.seqlen;
+    } else {
+        return mda_model_nclean(cfg) * cfg.seqlen;
+    }
+}
+
+bool mda_train_aligning(mda_train_args_t args) {
+    return strcmp(args.mode, "align") == 0;
+}
+
+bool mda_train_distill(mda_model_t *m, const mda_data_corpus_t *cp, mda_train_args_t args) {
+    uint32_t rows = mda_train_teacher_rows(m);
+    mda_teacher_t *t = NULL;
+    if (rows > 0) {
+        t = mda_teacher_load(m, args.teacher, rows, mda_train_aligning(args));
+    } else {
+        fprintf(stderr, "distillation needs block, ar or align mode\n");
+    }
+    if (t == NULL) {
+        return false;
+    } else {
+        t->teach = args.teach;
+        if (t->keep) {
+            mda_model_freeze_channel(m);
+        }
+        mda_step_trainer_t tr = mda_step_init(m, MDA_TRAIN_CLIP, args.accum, args.muon, t);
+        return mda_train_trainer(&tr, cp, args);
+    }
+}
+
 bool mda_train_model(mda_vkc_t *c, const mda_data_corpus_t *cp, mda_train_args_t args) {
     mda_model_cfg_t cfg = mda_model_cfg_mode(cp->tok.count, args.mode, args.batch);
     mda_model_t *m = mda_model_init(c, cfg);
-    if (m == NULL) {
+    if (m == NULL || mda_model_set_dec(m, mda_model_dec_of(args.mode)) == false) {
         return false;
+    } else if (mda_train_aligning(args) && strlen(args.teacher) == 0) {
+        fprintf(stderr, "align mode needs a teacher\n");
+        return false;
+    } else if (strlen(args.teacher) > 0) {
+        m->causal = args.sched == MDA_DATA_SCHED_AR;
+        return mda_train_distill(m, cp, args);
     } else {
         m->causal = args.sched == MDA_DATA_SCHED_AR;
-        mda_step_trainer_t tr = mda_step_init(m, MDA_TRAIN_CLIP, args.accum, args.muon);
+        mda_step_trainer_t tr = mda_step_init(m, MDA_TRAIN_CLIP, args.accum, args.muon, NULL);
         return mda_train_trainer(&tr, cp, args);
     }
 }
@@ -176,7 +220,7 @@ bool mda_train_device(mda_vkc_t *c, mda_train_args_t args) {
 }
 
 mda_data_sched_t mda_train_sched(const char *name) {
-    if (strcmp(name, "ar") == 0) {
+    if (strcmp(name, "ar") == 0 || strcmp(name, "align") == 0) {
         return MDA_DATA_SCHED_AR;
     } else {
         return MDA_DATA_SCHED_BELL;
@@ -187,11 +231,13 @@ bool mda_train_main(uint32_t argc, char **argv) {
     mda_train_args_t args = {
         .ckpt_path = mda_util_arg(argc, argv, 2, MDA_CKPT_PATH),
         .lr_peak = strtof(mda_util_arg(argc, argv, 1, "3e-4"), NULL),
+        .teach = strtof(mda_util_arg(argc, argv, 9, "1"), NULL),
         .stop = (uint32_t)strtoul(mda_util_arg(argc, argv, 3, "0"), NULL, 10),
         .accum = (uint32_t)strtoul(mda_util_arg(argc, argv, 4, "2"), NULL, 10),
         .batch = (uint32_t)strtoul(mda_util_arg(argc, argv, 7, "8"), NULL, 10),
         .muon = strcmp(mda_util_arg(argc, argv, 5, "muon"), "muon") == 0,
         .mode = mda_util_arg(argc, argv, 6, "diffusion"),
+        .teacher = mda_util_arg(argc, argv, 8, ""),
         .sched = mda_train_sched(mda_util_arg(argc, argv, 6, "diffusion")),
     };
     mda_vkc_t c = mda_vkc_init();

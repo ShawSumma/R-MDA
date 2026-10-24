@@ -34,11 +34,19 @@ layout(std430, binding = 7) writeonly buffer buf_h {
 layout(std430, binding = 8) buffer buf_amax {
     uint amax[];
 };
+layout(std430, binding = 9) readonly buffer buf_tl {
+    float tl[];
+};
+layout(std430, binding = 10) buffer buf_tz {
+    float tz[];
+};
 layout(push_constant) uniform pc {
     uint rows;
     uint vocab;
     uint op;
     uint slot;
+    uint soft;
+    float teach;
 };
 
 shared float red[256];
@@ -81,6 +89,19 @@ float slot_scale(uint s) {
     }
 }
 
+float teacher_logz(uint base, uint lid) {
+    float part_mx = -1e30;
+    for (uint i = lid; i < vocab; i += 256) {
+        part_mx = max(part_mx, tl[base + i]);
+    }
+    float mx = reduce_max(part_mx, lid);
+    float part_se = 0.0;
+    for (uint i = lid; i < vocab; i += 256) {
+        part_se += exp(tl[base + i] - mx);
+    }
+    return mx + log(reduce_sum(part_se, lid));
+}
+
 void row_stats(uint row, uint lid) {
     uint base = row * vocab;
     uint tgt = target[row];
@@ -100,15 +121,23 @@ void row_stats(uint row, uint lid) {
         part_se += exp(logits[base + i] - mx);
     }
     float lz = mx + log(reduce_sum(part_se, lid));
+    float tlz = 0.0;
+    if (row < soft) {
+        tlz = teacher_logz(base, lid);
+    }
     if (lid == 0u) {
         float m = mask[row];
         float wt = weight[row];
         float lt = logits[base + tgt];
         logz[row] = lz;
         loss[row] = -m * wt * (lt - lz);
+        float bound = max(1.0 - exp(lt - lz), exp(mo - lz));
+        if (row < soft) {
+            tz[row] = tlz;
+            bound = 1.0;
+        }
         if (slot != ~0u) {
-            float g = abs(gmul * m * wt) * max(1.0 - exp(lt - lz), exp(mo - lz));
-            atomicMax(amax[slot], floatBitsToUint(g));
+            atomicMax(amax[slot], floatBitsToUint(abs(gmul * m * wt) * bound));
         }
     }
 }
@@ -122,7 +151,11 @@ void row_grad(uint row, uint lid) {
     for (uint i = lid; i < vocab; i += 256) {
         float p = exp(logits[base + i] - lz);
         float g = gm * p;
-        if (i == tgt) {
+        if (row < soft && i == tgt) {
+            g = gm * (p - teach * exp(tl[base + i] - tz[row]) - (1.0 - teach));
+        } else if (row < soft) {
+            g = gm * (p - teach * exp(tl[base + i] - tz[row]));
+        } else if (i == tgt) {
             g = gm * (p - 1.0);
         }
         if (op == 1u) {

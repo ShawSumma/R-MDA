@@ -132,8 +132,8 @@ const char *mda_vkc_missing_feature(VkInstance inst, VkPhysicalDevice pd) {
         return "missing a required feature";
     } else if (p13.minSubgroupSize > 32 || p13.maxSubgroupSize < 32 || (p13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
         return "no wave32 compute";
-    } else if ((p11.subgroupSupportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) == 0 || (p11.subgroupSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
-        return "no subgroup arithmetic in compute";
+    } else if ((p11.subgroupSupportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) == 0 || (p11.subgroupSupportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) == 0 || (p11.subgroupSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
+        return "no subgroup arithmetic or clustered ops in compute";
     } else if (mda_vkc_has_tile(inst, pd) == false) {
         return "no 16x16x16 f16 cooperative matrix";
     } else if (mda_vkc_compute_family(pd) == MDA_VKC_NO_FAMILY) {

@@ -6,30 +6,41 @@
 #include <stdio.h>
 
 #define MDA_TOKENIZER_CORPUS_PATH "data/corpus.txt"
-#define MDA_TOKENIZER_MAX_LEN 32
-#define MDA_TOKENIZER_VOCAB_PATH "models/vocab.txt"
+#define MDA_TOKENIZER_MAX_LEN 1024
+#define MDA_TOKENIZER_VOCAB_PATH "models/tokenizer.txt"
 
+typedef uint32_t mda_tokenizer_class_t;
 typedef struct mda_tokenizer_entry_t mda_tokenizer_entry_t;
-typedef struct mda_tokenizer_node_t mda_tokenizer_node_t;
+typedef struct mda_tokenizer_merge_t mda_tokenizer_merge_t;
 typedef struct mda_tokenizer_t mda_tokenizer_t;
 typedef struct mda_tokenizer_ids_t mda_tokenizer_ids_t;
+typedef struct mda_tokenizer_char_t mda_tokenizer_char_t;
+
+enum {
+    MDA_TOKENIZER_SPACE,
+    MDA_TOKENIZER_LETTER,
+    MDA_TOKENIZER_NUMBER,
+    MDA_TOKENIZER_OTHER,
+};
 
 struct mda_tokenizer_entry_t {
     char *bytes;
     uint32_t len;
-    float logp;
 };
 
-struct mda_tokenizer_node_t {
-    uint32_t child[256];
-    int32_t token;
+struct mda_tokenizer_merge_t {
+    uint64_t key;
+    uint32_t rank;
+    uint32_t id;
 };
 
 struct mda_tokenizer_t {
     mda_tokenizer_entry_t *entries;
-    mda_tokenizer_node_t *nodes;
+    mda_tokenizer_merge_t *merges;
+    uint32_t byte_id[256];
     uint32_t count;
-    uint32_t node_count;
+    uint32_t n_merges;
+    uint32_t cap;
 };
 
 struct mda_tokenizer_ids_t {
@@ -37,7 +48,12 @@ struct mda_tokenizer_ids_t {
     size_t n;
 };
 
-void mda_tokenizer_write_entry(FILE *f, float logp, const char *bytes, uint32_t len);
+struct mda_tokenizer_char_t {
+    uint32_t cp;
+    uint32_t len;
+};
+
+void mda_tokenizer_write_entry(FILE *f, const char *bytes, uint32_t len);
 mda_tokenizer_t mda_tokenizer_read(FILE *f, const char *path);
 mda_tokenizer_t mda_tokenizer_load(const char *path);
 uint64_t mda_tokenizer_hash(const mda_tokenizer_t *t);

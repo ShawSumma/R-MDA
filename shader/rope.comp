@@ -1,0 +1,27 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer B0 { float X[]; };
+layout(push_constant) uniform pc {
+    uint rows;
+    uint heads;
+    uint seqlen;
+    float theta;
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint i = gid % 32u;
+    uint vec = gid / 32u;
+    uint row = vec / heads;
+    if (row < rows) {
+        uint base = vec * 64u;
+        float ang = float(row % seqlen) * pow(theta, -float(i) / 32.0);
+        float c = cos(ang);
+        float s = sin(ang);
+        float x1 = X[base + i];
+        float x2 = X[base + i + 32u];
+        X[base + i] = x1 * c - x2 * s;
+        X[base + i + 32u] = x2 * c + x1 * s;
+    }
+}

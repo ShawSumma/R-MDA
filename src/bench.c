@@ -194,9 +194,9 @@ void mda_bench_decode_profile(mda_model_t *m, mda_fwd_scratch_t *sc, const char 
     }
 }
 
-bool mda_bench_decode(mda_vkc_t *c, mda_model_cfg_t cfg, const char *name, bool cached) {
+bool mda_bench_decode(mda_vkc_t *c, mda_model_cfg_t cfg, const char *name, bool cached, uint32_t dec) {
     mda_model_t *m = mda_model_init(c, cfg);
-    if (m == NULL) {
+    if (m == NULL || mda_model_set_dec(m, dec) == false) {
         return false;
     } else {
         m->infer = true;
@@ -215,13 +215,16 @@ bool mda_bench_decode(mda_vkc_t *c, mda_model_cfg_t cfg, const char *name, bool 
     }
 }
 
-bool mda_bench_decoders(mda_vkc_t *c) {
+bool mda_bench_decoders(mda_vkc_t *c, uint32_t dec) {
     mda_model_cfg_t base = mda_model_cfg(MDA_BENCH_VOCAB);
+    if (dec > 0) {
+        base.batch = mda_util_max_u32(base.batch, 64 / MDA_MODEL_BLOCK);
+    }
     mda_model_cfg_t full = mda_model_cfg_block(base, MDA_MODEL_BLOCK);
     base.seqlen = MDA_MODEL_BLOCK;
     mda_model_cfg_t blk = mda_model_cfg_block(base, MDA_MODEL_BLOCK);
-    if (mda_bench_decode(c, full, "full", false)) {
-        return mda_bench_decode(c, blk, "cached", true);
+    if (mda_bench_decode(c, full, "full", false, dec)) {
+        return mda_bench_decode(c, blk, "cached", true, dec);
     } else {
         return false;
     }
@@ -229,16 +232,18 @@ bool mda_bench_decoders(mda_vkc_t *c) {
 
 bool mda_bench_device(mda_vkc_t *c, bool muon, uint32_t batch, const char *mode) {
     mda_model_t *m = mda_model_init(c, mda_model_cfg_mode(MDA_BENCH_VOCAB, mode, batch));
-    if (m == NULL) {
+    uint32_t dec = mda_model_dec_of(mode);
+    if (m == NULL || mda_model_set_dec(m, dec) == false) {
         return false;
     } else {
-        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, muon);
+        m->causal = strcmp(mode, "ar") == 0;
+        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, muon, NULL);
         printf("training uses %.2f GB of GPU memory\n", (double)c->dev_bytes / 1e9);
         mda_bench_matmuls(m);
         if (c->fail) {
             return false;
         } else if (mda_bench_trainer(&tr)) {
-            return mda_bench_decoders(c);
+            return mda_bench_decoders(c, dec);
         } else {
             return false;
         }

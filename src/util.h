@@ -12,5 +12,6 @@ const char *mda_util_verdict(bool ok);
 uint32_t mda_util_max_u32(uint32_t a, uint32_t b);
 uint32_t mda_util_min_u32(uint32_t a, uint32_t b);
 size_t mda_util_min_size(size_t a, size_t b);
+size_t mda_util_max_size(size_t a, size_t b);
 
 #endif

@@ -74,7 +74,7 @@ float mda_test_grad_sign(uint64_t h) {
 void mda_test_grad_perturb(mda_model_t *m) {
     for (uint32_t i = 0; i < m->n_params; i += 1) {
         mda_model_param_t *p = &m->params[i];
-        if (p->n >= m->cfg.d * m->cfg.d) {
+        if (p->rows > 1 && p->cols > 1 && p != m->tok_emb) {
             float *w = malloc(p->n * sizeof(float));
             for (uint32_t j = 0; j < p->n; j += 1) {
                 w[j] = 0.1f * mda_hash_normal(MDA_HASH_TEST, p->off, j);
@@ -89,6 +89,12 @@ void mda_test_grad_perturb(mda_model_t *m) {
         mda_test_grad_jitter(m->c, ly->n2, 0.2f);
         mda_test_grad_jitter(m->c, ly->shift_mix, 0.4f);
         mda_test_grad_jitter(m->c, ly->ada, 0.004f);
+        mda_test_grad_jitter(m->c, ly->w0, 1.0f);
+        mda_test_grad_jitter(m->c, ly->a0, 1.0f);
+        mda_test_grad_jitter(m->c, ly->v0, 1.0f);
+        mda_test_grad_jitter(m->c, ly->kk, 0.4f);
+        mda_test_grad_jitter(m->c, ly->ka, 0.4f);
+        mda_test_grad_jitter(m->c, ly->rk, 0.4f);
     }
     mda_test_grad_jitter(m->c, m->n_out, 0.2f);
 }
@@ -406,19 +412,19 @@ bool mda_test_grad_causal(mda_step_trainer_t *tr, const mda_data_corpus_t *cp) {
     return loss_ok && fails == 0;
 }
 
-bool mda_test_grad_blocks(mda_vkc_t *c, mda_model_cfg_t cfg, const mda_data_corpus_t *cp) {
+bool mda_test_grad_blocks(mda_vkc_t *c, mda_model_cfg_t cfg, const mda_data_corpus_t *cp, uint32_t dec) {
     mda_model_t *m = mda_model_init(c, mda_model_cfg_block(cfg, MDA_MODEL_BLOCK));
-    if (m == NULL) {
+    if (m == NULL || mda_model_set_dec(m, dec) == false) {
         return false;
     } else {
-        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, false);
+        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, false, NULL);
         mda_test_grad_perturb(m);
         mda_data_batch(&tr.sc.batch, cp, MDA_DATA_SPLIT_TRAIN, MDA_DATA_SCHED_BELL, 5);
         m->dirty16 = true;
         float l_train = mda_step_grad(&tr);
         float l_infer = mda_test_grad_loss(m, &tr.sc);
         bool loss_ok = fabsf(l_train - l_infer) <= 1e-5f * fabsf(l_train);
-        printf("block loss: train %.6f infer %.6f %s\n", l_train, l_infer, mda_util_verdict(loss_ok));
+        printf("block loss, %u decoder layers: train %.6f infer %.6f %s\n", dec, l_train, l_infer, mda_util_verdict(loss_ok));
         uint32_t fp16_fails = mda_test_grad_fp16(&tr);
         uint32_t fd_fails = mda_test_grad_fd_all(&tr, l_infer);
         return c->fail == false && loss_ok && fp16_fails == 0 && fd_fails == 0;
@@ -538,13 +544,13 @@ double mda_test_grad_slice_err(const float *full, const float *part, mda_model_c
     return err / scale;
 }
 
-bool mda_test_grad_cache(mda_vkc_t *c, mda_model_cfg_t cfg, const mda_data_corpus_t *cp) {
+bool mda_test_grad_cache(mda_vkc_t *c, mda_model_cfg_t cfg, const mda_data_corpus_t *cp, uint32_t dec) {
     uint32_t blk = cfg.seqlen / 2;
     mda_model_cfg_t short_cfg = cfg;
     short_cfg.seqlen = blk;
     mda_model_t *f = mda_test_grad_model(c, mda_model_cfg_block(cfg, blk));
     mda_model_t *d = mda_test_grad_model(c, mda_model_cfg_block(short_cfg, blk));
-    if (f == NULL || d == NULL) {
+    if (f == NULL || d == NULL || mda_model_set_dec(f, dec) == false || mda_model_set_dec(d, dec) == false) {
         return false;
     } else {
         mda_fwd_scratch_t sf = mda_fwd_alloc(f, 1);
@@ -563,7 +569,7 @@ bool mda_test_grad_cache(mda_vkc_t *c, mda_model_cfg_t cfg, const mda_data_corpu
         }
         free(full);
         bool ok = worst < 1e-4;
-        printf("cached block decoding vs full sequence: max rel loss err %.2e %s\n", worst, mda_util_verdict(ok));
+        printf("cached block decoding vs full sequence, %u decoder layers: max rel loss err %.2e %s\n", dec, worst, mda_util_verdict(ok));
         return ok;
     }
 }
@@ -596,12 +602,16 @@ bool mda_test_grad_trainer(mda_step_trainer_t *tr, mda_step_trainer_t *tr2, mda_
     bool muon_ok = mda_test_grad_muon(tr3, &cp);
     bool skip_ok = mda_test_grad_skip(tr);
     bool causal_ok = mda_test_grad_causal(tr, &cp);
-    bool block_ok = mda_test_grad_blocks(m->c, m->cfg, &cp);
+    bool block_ok = mda_test_grad_blocks(m->c, m->cfg, &cp, 0);
+    bool split_ok = mda_test_grad_blocks(m->c, m->cfg, &cp, 1);
     bool one_ok = mda_test_grad_one_block(m->c, m->cfg, &cp);
     bool order_ok = mda_test_grad_causal_blocks(m->c, m->cfg, &cp);
-    bool cache_ok = mda_test_grad_cache(m->c, m->cfg, &cp);
+    bool cache_ok = mda_test_grad_cache(m->c, m->cfg, &cp, 0);
+    mda_model_cfg_t wide = m->cfg;
+    wide.batch = 4;
+    bool split_cache_ok = mda_test_grad_cache(m->c, wide, &cp, 1);
     free(cids);
-    return m->c->fail == false && loss_ok && fp16_fails == 0 && fd_fails == 0 && accum_ok && opt_ok && muon_ok && skip_ok && causal_ok && block_ok && one_ok && order_ok && cache_ok;
+    return m->c->fail == false && loss_ok && fp16_fails == 0 && fd_fails == 0 && accum_ok && opt_ok && muon_ok && skip_ok && causal_ok && block_ok && split_ok && one_ok && order_ok && cache_ok && split_cache_ok;
 }
 
 bool mda_test_grad_device(mda_vkc_t *c) {
@@ -618,9 +628,9 @@ bool mda_test_grad_device(mda_vkc_t *c) {
     if (m == NULL) {
         return false;
     } else {
-        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, false);
-        mda_step_trainer_t tr2 = mda_step_init(m, 1.0f, 2, false);
-        mda_step_trainer_t tr3 = mda_step_init(m, 1.0f, 1, true);
+        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, false, NULL);
+        mda_step_trainer_t tr2 = mda_step_init(m, 1.0f, 2, false, NULL);
+        mda_step_trainer_t tr3 = mda_step_init(m, 1.0f, 1, true, NULL);
         if (c->fail) {
             return false;
         } else {
