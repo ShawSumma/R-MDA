@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -128,7 +129,7 @@ const char *mda_vkc_missing_feature(VkInstance inst, VkPhysicalDevice pd) {
         .pNext = &f13,
     };
     vkGetPhysicalDeviceFeatures2(pd, &f);
-    if (coopmat.cooperativeMatrix == 0 || atomic_float.shaderBufferFloat32AtomicAdd == 0 || f11.storageBuffer16BitAccess == 0 || f12.shaderFloat16 == 0 || f13.subgroupSizeControl == 0) {
+    if (coopmat.cooperativeMatrix == 0 || atomic_float.shaderBufferFloat32AtomicAdd == 0 || atomic_float.shaderSharedFloat32AtomicAdd == 0 || f11.storageBuffer16BitAccess == 0 || f12.shaderFloat16 == 0 || f13.subgroupSizeControl == 0) {
         return "missing a required feature";
     } else if (p13.minSubgroupSize > 32 || p13.maxSubgroupSize < 32 || (p13.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) == 0) {
         return "no wave32 compute";
@@ -230,6 +231,7 @@ mda_vkc_t mda_vkc_init_device(mda_vkc_t c) {
         c.max_groups[i] = pr.limits.maxComputeWorkGroupCount[i];
     }
     c.ts_period = pr.limits.timestampPeriod;
+    c.max_range = pr.limits.maxStorageBufferRange;
     c.mem_dev = (uint32_t)mda_vkc_memtype(c.pd, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     c.mem_cached = (uint32_t)mda_vkc_memtype(c.pd, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
     c.qfi = mda_vkc_compute_family(c.pd);
@@ -248,6 +250,7 @@ mda_vkc_t mda_vkc_init_device(mda_vkc_t c) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
         .pNext = &coopmat,
         .shaderBufferFloat32AtomicAdd = VK_TRUE,
+        .shaderSharedFloat32AtomicAdd = VK_TRUE,
     };
     VkPhysicalDeviceVulkan11Features f11 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
@@ -757,10 +760,23 @@ void mda_vkc_finish(mda_vkc_t *c, bool oneshot, const char *name) {
     }
 }
 
+uint32_t mda_vkc_oversized(mda_vkc_t *c, mda_vkc_kernel_t *k, mda_vkc_buf_t **bufs) {
+    uint32_t i = 0;
+    while (i < k->nbuf && bufs[i]->sz <= c->max_range) {
+        i += 1;
+    }
+    return i;
+}
+
 void mda_vkc_run(mda_vkc_t *c, mda_vkc_kernel_t *k, mda_vkc_buf_t **bufs, uint32_t gx, uint32_t gy, uint32_t gz, void *push) {
     bool oneshot = c->recording == false;
+    uint32_t big = mda_vkc_oversized(c, k, bufs);
     if (c->fail == false && (gx > c->max_groups[0] || gy > c->max_groups[1] || gz > c->max_groups[2])) {
         fprintf(stderr, "vkc: dispatch %ux%ux%u exceeds the device limit\n", gx, gy, gz);
+        c->fail = true;
+    }
+    if (c->fail == false && big < k->nbuf) {
+        fprintf(stderr, "vkc: %s binding %u is %" PRIu64 " bytes, over the device's storage buffer range\n", k->name, big, (uint64_t)bufs[big]->sz);
         c->fail = true;
     }
     if (c->fail == false && oneshot) {

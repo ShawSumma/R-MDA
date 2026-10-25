@@ -29,14 +29,12 @@ float mda_probe_acts_maxabs(mda_vkc_t *c, mda_vkc_buf_t *b, uint32_t n, mda_vkc_
     }
 }
 
-uint32_t mda_probe_acts_bad16(mda_vkc_t *c, mda_vkc_buf_t *b, uint32_t n, mda_vkc_buf_t *stage) {
-    mda_vkc_copy(c, stage, b, (VkDeviceSize)n * sizeof(uint16_t));
-    const uint16_t *p = stage->ptr;
+uint32_t mda_probe_acts_bad(mda_vkc_t *c, mda_vkc_buf_t *b, uint32_t n, mda_vkc_buf_t *stage) {
+    mda_vkc_copy(c, stage, b, (VkDeviceSize)n * sizeof(float));
+    const float *p = stage->ptr;
     uint32_t bad = 0;
     for (uint32_t i = 0; i < n; i += 1) {
-        if ((p[i] & 0x7c00u) == 0x7c00u) {
-            bad += 1;
-        }
+        bad += isfinite(p[i]) == 0;
     }
     return bad;
 }
@@ -71,9 +69,9 @@ void mda_probe_acts_table(mda_step_trainer_t *tr, mda_vkc_buf_t *stage) {
         "wkv_raw",
         "x_mid",
         "n2",
-        "gate",
-        "up",
+        "key",
         "h",
+        "fshift",
         "inf S l2r",
         "inf S r2l"
     );
@@ -86,17 +84,17 @@ void mda_probe_acts_table(mda_step_trainer_t *tr, mda_vkc_buf_t *stage) {
             l,
             mda_probe_acts_maxabs(c, &a->x_in, bt * d, stage),
             mda_probe_acts_maxabs(c, &a->n1, bt * d, stage),
-            mda_probe_acts_maxabs(c, &a->shift, bt * d, stage),
+            mda_probe_acts_maxabs(c, &a->shift, MDA_MODEL_MIXES * bt * d, stage),
             mda_probe_acts_maxabs(c, &v, bt * d, stage),
             mda_probe_acts_maxabs(c, &r, bt * d, stage),
             mda_probe_acts_maxabs(c, &a->wkv_raw, bt * d, stage),
             mda_probe_acts_maxabs(c, &a->x_mid, bt * d, stage),
             mda_probe_acts_maxabs(c, &a->n2, bt * d, stage),
-            mda_probe_acts_maxabs(c, &a->gate_pre, bt * hid, stage),
-            mda_probe_acts_maxabs(c, &a->up, bt * hid, stage),
+            mda_probe_acts_maxabs(c, &a->kpre, bt * hid, stage),
             mda_probe_acts_maxabs(c, &a->h, bt * hid, stage),
-            mda_probe_acts_bad16(c, &a->sstate, ns, stage),
-            mda_probe_acts_bad16(c, &a->sstate2, ns, stage)
+            mda_probe_acts_maxabs(c, &a->fshift, bt * d, stage),
+            mda_probe_acts_bad(c, &a->sstate, ns, stage),
+            mda_probe_acts_bad(c, &a->sstate2, ns, stage)
         );
     }
     printf("final xn %.3g\n", mda_probe_acts_maxabs(c, &tr->sc.xn, bt * d, stage));
@@ -113,7 +111,8 @@ bool mda_probe_acts_inspect(mda_step_trainer_t *tr) {
     m->ref32 = false;
     m->dirty16 = true;
     mda_step_grad(tr);
-    mda_vkc_buf_t stage = mda_vkc_alloc_cached(m->c, (VkDeviceSize)mda_util_max_u32(cfg.batch * cfg.seqlen * mda_util_max_u32(cfg.ffn_hidden, cfg.vocab), ns / 2) * sizeof(float));
+    uint32_t widest = mda_util_max_u32(mda_util_max_u32(cfg.ffn_hidden, cfg.vocab), MDA_MODEL_MIXES * cfg.d);
+    mda_vkc_buf_t stage = mda_vkc_alloc_cached(m->c, (VkDeviceSize)mda_util_max_u32(cfg.batch * cfg.seqlen * widest, ns) * sizeof(float));
     if (m->c->fail == false) {
         mda_probe_acts_table(tr, &stage);
     }
@@ -145,11 +144,11 @@ bool mda_probe_acts_trainer(mda_step_trainer_t *tr, const mda_data_corpus_t *cp,
 }
 
 bool mda_probe_acts_model(mda_vkc_t *c, const mda_data_corpus_t *cp, const char *path, uint32_t batches) {
-    mda_model_t *m = mda_model_init(c, mda_model_cfg(cp->tok.count));
+    mda_model_t *m = mda_model_init(c, mda_ckpt_shape(path, mda_model_cfg(cp->tok.count)));
     if (m == NULL) {
         return false;
     } else {
-        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, false, NULL);
+        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, false);
         if (c->fail) {
             return false;
         } else {

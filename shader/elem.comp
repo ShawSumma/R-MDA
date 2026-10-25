@@ -1,44 +1,29 @@
 #version 450
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) buffer buf_x {
-    float x[];
-};
-layout(std430, binding = 1) readonly buffer buf_pre {
-    float pre[];
-};
-layout(std430, binding = 2) readonly buffer buf_up {
-    float up[];
-};
-layout(std430, binding = 3) writeonly buffer buf_dup {
-    float dup[];
-};
-layout(std430, binding = 4) buffer buf_amax {
-    uint amax[];
-};
+layout(std430, binding = 0) buffer B0 { float x[]; };
+layout(std430, binding = 1) readonly buffer B1 { float pre[]; };
+layout(std430, binding = 2) buffer B2 { uint amax[]; };
 layout(push_constant) uniform pc {
     uint n;
     uint op;
     uint slot;
-    uint slot2;
 };
 
 shared float red[256];
-shared float red2[256];
 
-float sigmoidf(float v) {
-    return 1.0 / (1.0 + exp(-v));
-}
-
-void forward() {
+void main() {
     uint lid = gl_LocalInvocationID.x;
     uint stride = gl_NumWorkGroups.x * 256u;
     float m = 0.0;
     for (uint i = gl_GlobalInvocationID.x; i < n; i += stride) {
-        float v = pre[i];
-        float h = v * sigmoidf(v) * up[i];
-        x[i] = h;
-        m = max(m, abs(h));
+        float r = max(pre[i], 0.0);
+        float y = r * r;
+        if (op == 1u) {
+            y = x[i] * 2.0 * r;
+        }
+        x[i] = y;
+        m = max(m, abs(y));
     }
     red[lid] = m;
     barrier();
@@ -50,45 +35,5 @@ void forward() {
     }
     if (lid == 0u) {
         atomicMax(amax[slot], floatBitsToUint(red[0]));
-    }
-}
-
-void backward() {
-    uint lid = gl_LocalInvocationID.x;
-    uint stride = gl_NumWorkGroups.x * 256u;
-    float mx = 0.0;
-    float mu = 0.0;
-    for (uint i = gl_GlobalInvocationID.x; i < n; i += stride) {
-        float dh = x[i];
-        float v = pre[i];
-        float sg = sigmoidf(v);
-        float du = dh * v * sg;
-        float dg = dh * up[i] * (sg + v * sg * (1.0 - sg));
-        dup[i] = du;
-        x[i] = dg;
-        mx = max(mx, abs(dg));
-        mu = max(mu, abs(du));
-    }
-    red[lid] = mx;
-    red2[lid] = mu;
-    barrier();
-    for (uint s = 128u; s > 0u; s >>= 1) {
-        if (lid < s) {
-            red[lid] = max(red[lid], red[lid + s]);
-            red2[lid] = max(red2[lid], red2[lid + s]);
-        }
-        barrier();
-    }
-    if (lid == 0u) {
-        atomicMax(amax[slot], floatBitsToUint(red[0]));
-        atomicMax(amax[slot2], floatBitsToUint(red2[0]));
-    }
-}
-
-void main() {
-    if (op == 0u) {
-        forward();
-    } else {
-        backward();
     }
 }

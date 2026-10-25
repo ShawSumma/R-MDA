@@ -55,7 +55,39 @@ bool mda_ckpt_write(mda_model_t *m, uint64_t vocab_hash, uint32_t step, FILE *f)
 }
 
 bool mda_ckpt_same_shape(mda_model_cfg_t a, mda_model_cfg_t b) {
-    return a.d == b.d && a.n_layer == b.n_layer && a.n_head == b.n_head && a.ffn_hidden == b.ffn_hidden && a.vocab == b.vocab;
+    bool lora = memcmp(a.lora, b.lora, sizeof(a.lora)) == 0;
+    return a.d == b.d && a.n_layer == b.n_layer && a.n_head == b.n_head && a.ffn_hidden == b.ffn_hidden && a.vocab == b.vocab && lora;
+}
+
+mda_model_cfg_t mda_ckpt_with_shape(mda_model_cfg_t base, mda_model_cfg_t shape) {
+    mda_model_cfg_t cfg = base;
+    cfg.d = shape.d;
+    cfg.n_layer = shape.n_layer;
+    cfg.n_head = shape.n_head;
+    cfg.ffn_hidden = shape.ffn_hidden;
+    cfg.vocab = shape.vocab;
+    memcpy(cfg.lora, shape.lora, sizeof(cfg.lora));
+    return cfg;
+}
+
+mda_model_cfg_t mda_ckpt_shape_file(FILE *f, mda_model_cfg_t base) {
+    mda_ckpt_hdr_t h;
+    size_t got = fread(&h, sizeof(h), 1, f);
+    fclose(f);
+    if (got != 1 || h.magic != MDA_CKPT_MAGIC) {
+        return base;
+    } else {
+        return mda_ckpt_with_shape(base, h.cfg);
+    }
+}
+
+mda_model_cfg_t mda_ckpt_shape(const char *path, mda_model_cfg_t base) {
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        return base;
+    } else {
+        return mda_ckpt_shape_file(f, base);
+    }
 }
 
 const char *mda_ckpt_mismatch(mda_ckpt_hdr_t h, mda_ckpt_hdr_t want, size_t got, int64_t size, VkDeviceSize bytes, bool moments) {

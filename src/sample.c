@@ -143,7 +143,7 @@ bool mda_sample_scratch(mda_model_t *m, const mda_data_corpus_t *cp, mda_fwd_scr
 }
 
 bool mda_sample_model(mda_vkc_t *c, const mda_data_corpus_t *cp, const char *path, const char *mode) {
-    mda_model_t *m = mda_model_init(c, mda_model_cfg_mode(cp->tok.count, mode, mda_model_cfg(cp->tok.count).batch));
+    mda_model_t *m = mda_model_init(c, mda_ckpt_shape(path, mda_model_cfg_mode(cp->tok.count, mode, mda_model_cfg(cp->tok.count).batch)));
     if (m == NULL || mda_model_set_dec(m, mda_model_dec_of(mode)) == false) {
         return false;
     } else {

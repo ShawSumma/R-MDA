@@ -446,7 +446,7 @@ uint32_t mda_generate_newline(const mda_tokenizer_t *tk) {
 }
 
 mda_model_t *mda_generate_load(mda_vkc_t *c, const mda_tokenizer_t *tk, const char *path, mda_model_cfg_t cfg, bool causal, uint32_t dec) {
-    mda_model_t *m = mda_model_init(c, cfg);
+    mda_model_t *m = mda_model_init(c, mda_ckpt_shape(path, cfg));
     if (m == NULL || mda_model_set_dec(m, dec) == false) {
         return NULL;
     } else {
@@ -508,7 +508,7 @@ bool mda_generate_with(mda_vkc_t *c, const mda_tokenizer_t *tk, mda_model_t *m, 
         .policy = policy,
         .len = mda_model_cfg(vocab).seqlen,
         .nseq = m->cfg.batch,
-        .mask_id = tk->count,
+        .mask_id = m->cfg.vocab,
         .newline = mda_generate_newline(tk),
         .steps = steps,
     };

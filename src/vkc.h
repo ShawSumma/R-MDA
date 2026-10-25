@@ -32,6 +32,7 @@ struct mda_vkc_t {
     const char *prof_name[MDA_VKC_MAX_LABELS];
     double prof_ms[MDA_VKC_MAX_LABELS];
     VkDeviceSize dev_bytes;
+    VkDeviceSize max_range;
     uint32_t prof_count[MDA_VKC_MAX_LABELS];
     uint32_t max_groups[3];
     uint32_t qfi;

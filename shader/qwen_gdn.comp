@@ -1,0 +1,88 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float qkv[]; };
+layout(std430, binding = 1) readonly buffer B1 { float proj[]; };
+layout(std430, binding = 2) readonly buffer B2 { float vec[]; };
+layout(std430, binding = 3) writeonly buffer B3 { float o[]; };
+layout(push_constant) uniform pc {
+    uint seqlen;
+    uint vheads;
+    uint kheads;
+    uint qkv_stride;
+    uint k_off;
+    uint v_off;
+    uint ps;
+    uint boff;
+    uint aoff;
+    uint a_log;
+    uint dt_bias;
+};
+
+const uint D = 128u;
+const uint TB = 16u;
+
+shared vec4 sk[TB][D / 4u];
+shared vec4 sq[TB][D / 4u];
+shared float sal[TB];
+shared float sbe[TB];
+
+float softplus(float v) {
+    if (v > 20.0) {
+        return v;
+    } else {
+        return log(1.0 + exp(v));
+    }
+}
+
+void main() {
+    uint e = gl_LocalInvocationID.x;
+    uint seq = gl_WorkGroupID.x / vheads;
+    uint h = gl_WorkGroupID.x % vheads;
+    uint kh = h / (vheads / kheads);
+    uint od = vheads * D;
+    float A = -exp(vec[a_log + h]);
+    float dtb = vec[dt_bias + h];
+    float S[D];
+    [[unroll]] for (uint i = 0u; i < D; i += 1u) {
+        S[i] = 0.0;
+    }
+    for (uint t0 = 0u; t0 < seqlen; t0 += TB) {
+        uint row0 = seq * seqlen + t0;
+        barrier();
+        float vv[TB];
+        [[unroll]] for (uint j = 0u; j < TB; j += 1u) {
+            uint at = (row0 + j) * qkv_stride;
+            sk[j][e >> 2][e & 3u] = qkv[at + k_off + kh * D + e];
+            sq[j][e >> 2][e & 3u] = qkv[at + kh * D + e];
+            vv[j] = qkv[at + v_off + h * D + e];
+        }
+        if (e < TB) {
+            uint at = (row0 + e) * ps;
+            sal[e] = exp(A * softplus(proj[at + aoff + h] + dtb));
+            sbe[e] = 1.0 / (1.0 + exp(-proj[at + boff + h]));
+        }
+        barrier();
+        [[unroll]] for (uint j = 0u; j < TB; j += 1u) {
+            float kv = 0.0;
+            [[unroll]] for (uint i = 0u; i < D / 4u; i += 1u) {
+                vec4 kq = sk[j][i];
+                kv += S[4u * i] * kq.x + S[4u * i + 1u] * kq.y + S[4u * i + 2u] * kq.z + S[4u * i + 3u] * kq.w;
+            }
+            float al = sal[j];
+            float delta = (vv[j] - al * kv) * sbe[j];
+            float out_e = 0.0;
+            [[unroll]] for (uint i = 0u; i < D / 4u; i += 1u) {
+                vec4 kq = sk[j][i];
+                vec4 qq = sq[j][i];
+                S[4u * i] = al * S[4u * i] + kq.x * delta;
+                S[4u * i + 1u] = al * S[4u * i + 1u] + kq.y * delta;
+                S[4u * i + 2u] = al * S[4u * i + 2u] + kq.z * delta;
+                S[4u * i + 3u] = al * S[4u * i + 3u] + kq.w * delta;
+                out_e += S[4u * i] * qq.x + S[4u * i + 1u] * qq.y + S[4u * i + 2u] * qq.z + S[4u * i + 3u] * qq.w;
+            }
+            o[(row0 + j) * od + h * D + e] = out_e;
+        }
+    }
+}

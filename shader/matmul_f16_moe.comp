@@ -1,0 +1,126 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer BA { uvec4 A[]; };
+layout(std430, binding = 1) readonly buffer BB { uvec4 B[]; };
+layout(std430, binding = 2) writeonly buffer BC { float C[]; };
+layout(std430, binding = 3) readonly buffer BS { uint amax[]; };
+layout(std430, binding = 4) readonly buffer BT { uint tiles[]; };
+layout(push_constant) uniform pc { uint m, n, k, sa, sb; };
+const uint T = 16u;
+const uint BK = 32u;
+const uint TILE = 128u;
+const uint WIDE = 5u;
+const uint LONG = 17u;
+const uint STAGE = 640u;
+shared uvec4 sA[2u * STAGE];
+shared uvec4 sB[2u * STAGE];
+uvec4 ra[4];
+uvec4 rb[4];
+
+uvec4 fetch_a(uint m0, uint k0, uint idx) {
+    uint r = idx >> 2;
+    uint c = (idx & 3u) * 8u;
+    if (m0 + r < m) {
+        return A[((m0 + r) * k + k0 + c) >> 3];
+    } else {
+        return uvec4(0u);
+    }
+}
+
+uvec4 fetch_b(uint base, uint n0, uint k0, uint idx) {
+    uint r = idx >> 2;
+    uint c = (idx & 3u) * 8u;
+    if (n0 + r < n) {
+        return B[base + (((n0 + r) * k + k0 + c) >> 3)];
+    } else {
+        return uvec4(0u);
+    }
+}
+
+void fetch(uint base, uint m0, uint n0, uint k0, uint tid) {
+    [[unroll]] for (uint i = 0u; i < 4u; i = i + 1u) {
+        ra[i] = fetch_a(m0, k0, tid + i * 128u);
+        rb[i] = fetch_b(base, n0, k0, tid + i * 128u);
+    }
+}
+
+void put(uint at, uint tid) {
+    [[unroll]] for (uint i = 0u; i < 4u; i = i + 1u) {
+        uint idx = tid + i * 128u;
+        sA[at + (idx >> 2) * WIDE + (idx & 3u)] = ra[i];
+        sB[at + (idx >> 2) * WIDE + (idx & 3u)] = rb[i];
+    }
+}
+
+float slot_scale(uint s) {
+    if (s == ~0u) {
+        return 1.0;
+    } else if (!(uintBitsToFloat(amax[s]) > 0.0) || isinf(uintBitsToFloat(amax[s]))) {
+        return 1.0;
+    } else {
+        return exp2(141.0 - float((amax[s] >> 23) & 0xffu));
+    }
+}
+
+void main() {
+    uint e = tiles[gl_WorkGroupID.y];
+    if (e == ~0u) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint m0 = gl_WorkGroupID.y * TILE;
+    uint n0 = gl_WorkGroupID.x * TILE;
+    uint base = e * ((n * k) >> 3);
+    uint sr = (gl_SubgroupID & 1u) * 64u;
+    uint sc = (gl_SubgroupID >> 1) * 64u;
+    coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator> ac[4][4];
+    [[unroll]] for (uint i = 0u; i < 4u; i = i + 1u) {
+        [[unroll]] for (uint j = 0u; j < 4u; j = j + 1u) {
+            ac[i][j] = coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+    uint steps = k / BK;
+    fetch(base, m0, n0, 0u, tid);
+    put(0u, tid);
+    barrier();
+    for (uint s = 0u; s < steps; s = s + 1u) {
+        uint cur = (s & 1u) * STAGE;
+        bool more = s + 1u < steps;
+        if (more) {
+            fetch(base, m0, n0, (s + 1u) * BK, tid);
+        }
+        [[unroll]] for (uint kk = 0u; kk < BK; kk = kk + T) {
+            coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseA> a[4];
+            [[unroll]] for (uint i = 0u; i < 4u; i = i + 1u) {
+                coopMatLoad(a[i], sA, cur + (sr + i * T) * WIDE + kk / 8u, WIDE, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint t = 0u; t < 4u; t = t + 1u) {
+                coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseB> mb;
+                coopMatLoad(mb, sB, cur + (sc + t * T) * WIDE + kk / 8u, WIDE, gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint i = 0u; i < 4u; i = i + 1u) {
+                    ac[i][t] = coopMatMulAdd(a[i], mb, ac[i][t]);
+                }
+            }
+        }
+        if (more) {
+            put(STAGE - cur, tid);
+        }
+        barrier();
+    }
+    uint row0 = m0 + sr;
+    uint col0 = n0 + sc;
+    if (row0 < m && col0 < n) {
+        float s = 1.0 / (slot_scale(sa) * slot_scale(sb));
+        [[unroll]] for (uint i = 0u; i < 4u; i = i + 1u) {
+            [[unroll]] for (uint t = 0u; t < 4u; t = t + 1u) {
+                ac[i][t] = ac[i][t] * s;
+                coopMatStore(ac[i][t], C, (row0 + i * 16u) * n + col0 + t * 16u, n, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+    }
+}

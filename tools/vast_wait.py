@@ -18,6 +18,7 @@ FAILED = {"exited", "offline", "unknown"}
 
 class Instance(TypedDict):
     actual_status: str | None
+    intended_status: str | None
     status_msg: str | None
     ssh_host: str
     ssh_port: int
@@ -60,7 +61,7 @@ def main() -> None:
                 if port is not None:
                     print(f"direct: ssh -p {port} root@{inst['public_ipaddr'].strip()}")
                 return
-            case s if s in FAILED or msg.startswith("Error"):
+            case s if (s in FAILED and inst["intended_status"] != "running") or msg.startswith("Error"):
                 sys.exit(f"instance {args.id} is {s}: {msg}")
             case _:
                 time.sleep(15)

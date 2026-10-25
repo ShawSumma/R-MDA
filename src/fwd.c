@@ -28,21 +28,27 @@ mda_vkc_buf_t mda_fwd_section(mda_vkc_buf_t *b, mda_model_cfg_t cfg, uint32_t i)
     return mda_vkc_view(b, i * n, n);
 }
 
+mda_vkc_buf_t mda_fwd_section16(mda_vkc_buf_t *b, mda_model_cfg_t cfg, uint32_t i) {
+    VkDeviceSize n = (VkDeviceSize)cfg.batch * cfg.seqlen * cfg.d * sizeof(uint16_t);
+    return mda_vkc_view(b, i * n, n);
+}
+
 mda_fwd_act_t mda_fwd_act_alloc(mda_model_t *m, mda_model_layer_t *ly) {
     mda_model_cfg_t cfg = m->cfg;
     uint32_t bt = cfg.batch * cfg.seqlen;
-    uint32_t d = cfg.d;
     uint32_t hid = cfg.ffn_hidden;
-    uint32_t dh = d / cfg.n_head;
+    uint32_t dh = cfg.d / cfg.n_head;
     uint32_t ns = cfg.batch * cfg.n_head * cfg.seqlen / MDA_MODEL_WKV_CHUNK * dh * dh;
-    VkDeviceSize n = (VkDeviceSize)bt * d * sizeof(float);
+    VkDeviceSize n = (VkDeviceSize)bt * cfg.d * sizeof(float);
+    VkDeviceSize n16 = (VkDeviceSize)bt * cfg.d * sizeof(uint16_t);
+    VkDeviceSize nh = (VkDeviceSize)bt * hid;
     mda_vkc_t *c = m->c;
     mda_fwd_act_t a = {
         .x_in = mda_vkc_alloc(c, n),
-        .rms1 = mda_vkc_alloc(c, bt * sizeof(float)),
-        .n1_pre = mda_vkc_alloc(c, n),
+        .st1 = mda_vkc_alloc(c, 2 * bt * sizeof(float)),
         .n1 = mda_vkc_alloc(c, n),
-        .shift = mda_vkc_alloc(c, n),
+        .shift = mda_vkc_alloc(c, MDA_MODEL_MIXES * n),
+        .shift16 = mda_vkc_alloc(c, MDA_MODEL_MIXES * n16),
         .kv = mda_vkc_alloc(c, 2 * n),
         .heads = mda_vkc_alloc(c, 6 * n),
         .kinv = mda_vkc_alloc(c, bt * cfg.n_head * sizeof(float)),
@@ -56,18 +62,16 @@ mda_fwd_act_t mda_fwd_act_alloc(mda_model_t *m, mda_model_layer_t *ly) {
         .wkv_raw = mda_vkc_alloc(c, n),
         .p = mda_vkc_alloc(c, n),
         .wkv = mda_vkc_alloc(c, n),
-        .rmsx = mda_vkc_alloc(c, bt * cfg.n_head * sizeof(float)),
-        .x_mid = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .rms2 = mda_vkc_alloc(c, bt * sizeof(float)),
-        .n2_pre = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .n2 = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .gate_pre = mda_vkc_alloc(c, bt * hid * sizeof(float)),
-        .up = mda_vkc_alloc(c, bt * hid * sizeof(float)),
-        .h = mda_vkc_alloc(c, bt * hid * sizeof(float)),
-        .shift16 = mda_vkc_alloc(c, bt * d * sizeof(uint16_t)),
-        .wkv16 = mda_vkc_alloc(c, bt * d * sizeof(uint16_t)),
-        .n2_16 = mda_vkc_alloc(c, bt * d * sizeof(uint16_t)),
-        .h16 = mda_vkc_alloc(c, bt * hid * sizeof(uint16_t)),
+        .stx = mda_vkc_alloc(c, 2 * bt * cfg.n_head * sizeof(float)),
+        .x_mid = mda_vkc_alloc(c, n),
+        .st2 = mda_vkc_alloc(c, 2 * bt * sizeof(float)),
+        .n2 = mda_vkc_alloc(c, n),
+        .fshift = mda_vkc_alloc(c, n),
+        .fshift16 = mda_vkc_alloc(c, n16),
+        .kpre = mda_vkc_alloc(c, nh * sizeof(float)),
+        .h = mda_vkc_alloc(c, nh * sizeof(float)),
+        .wkv16 = mda_vkc_alloc(c, n16),
+        .h16 = mda_vkc_alloc(c, nh * sizeof(uint16_t)),
     };
     for (uint32_t i = 0; i < MDA_MODEL_LORAS; i += 1) {
         a.lora[i] = mda_fwd_lora_alloc(m, &ly->lora[i]);
@@ -116,7 +120,7 @@ mda_fwd_cache_t mda_fwd_cache_alloc(mda_model_t *m) {
     mda_fwd_cache_t cache;
     for (uint32_t i = 0; i < 2; i += 1) {
         cache.state[i] = mda_vkc_alloc(m->c, cfg.n_layer * mda_fwd_cache_state_bytes(cfg));
-        cache.carry[i] = mda_vkc_alloc(m->c, cfg.n_layer * mda_fwd_cache_carry_bytes(cfg));
+        cache.carry[i] = mda_vkc_alloc(m->c, 2 * cfg.n_layer * mda_fwd_cache_carry_bytes(cfg));
     }
     mda_fwd_cache_reset(m, &cache);
     return cache;
@@ -145,7 +149,9 @@ mda_fwd_scratch_t mda_fwd_alloc(mda_model_t *m, uint32_t n_acts) {
         acts[i] = mda_fwd_act_alloc(m, &m->layers[i]);
     }
     VkDeviceSize nstate = (VkDeviceSize)mda_util_max_u32(mda_fwd_block_states(cfg), 1) * 4096 * sizeof(float);
-    uint32_t widest = mda_util_max_u32(mda_util_max_u32(d, hid), cfg.vocab);
+    VkDeviceSize n = (VkDeviceSize)bt * d * sizeof(float);
+    uint32_t widest = mda_util_max_u32(hid, cfg.vocab);
+    uint32_t nkd = mda_fwd_kd_rows(m);
     mda_vkc_buf_t ids = mda_vkc_alloc_cached(c, bt * sizeof(uint32_t));
     mda_vkc_buf_t target = mda_vkc_alloc_cached(c, bt * sizeof(uint32_t));
     mda_vkc_buf_t mask = mda_vkc_alloc_cached(c, bt * sizeof(float));
@@ -156,46 +162,51 @@ mda_fwd_scratch_t mda_fwd_alloc(mda_model_t *m, uint32_t n_acts) {
         .target = target,
         .mask = mask,
         .weight = weight,
-        .x = mda_vkc_alloc(c, bt * d * sizeof(float)),
+        .emb = mda_vkc_alloc(c, n),
+        .st0 = mda_vkc_alloc(c, 2 * bt * sizeof(float)),
+        .x = mda_vkc_alloc(c, n),
         .bstate = mda_vkc_alloc(c, nstate),
         .dbstate = mda_vkc_alloc(c, nstate),
-        .dup = mda_vkc_alloc(c, bt * hid * sizeof(float)),
-        .rms_stash = mda_vkc_alloc(c, bt * sizeof(float)),
+        .stn = mda_vkc_alloc(c, 2 * bt * sizeof(float)),
         .dg_dummy = mda_vkc_alloc(c, d * sizeof(float)),
-        .raw = mda_vkc_alloc(c, 6 * bt * d * sizeof(float)),
-        .v0 = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .po = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .po2 = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .xn = mda_vkc_alloc(c, bt * d * sizeof(float)),
+        .raw = mda_vkc_alloc(c, 6 * n),
+        .v0 = mda_vkc_alloc(c, n),
+        .po = mda_vkc_alloc(c, n),
+        .po2 = mda_vkc_alloc(c, n),
+        .xn = mda_vkc_alloc(c, n),
         .logits = mda_vkc_alloc(c, (VkDeviceSize)bt * cfg.vocab * sizeof(float)),
         .loss = mda_vkc_alloc_cached(c, bt * sizeof(float)),
         .logz = mda_vkc_alloc(c, bt * sizeof(float)),
         .tok = mda_vkc_alloc_cached(c, bt * sizeof(uint32_t)),
         .conf = mda_vkc_alloc_cached(c, bt * sizeof(float)),
-        .dnorm = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .dtmp = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .dtmp2 = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .dh = mda_vkc_alloc(c, bt * hid * sizeof(float)),
+        .dnorm = mda_vkc_alloc(c, n),
+        .dtmp = mda_vkc_alloc(c, n),
+        .dtmp2 = mda_vkc_alloc(c, n),
+        .dh = mda_vkc_alloc(c, (VkDeviceSize)bt * hid * sizeof(float)),
+        .dshift = mda_vkc_alloc(c, MDA_MODEL_MIXES * n),
         .dheads = {
-            mda_vkc_alloc(c, 6 * bt * d * sizeof(float)),
-            mda_vkc_alloc(c, 6 * bt * d * sizeof(float)),
+            mda_vkc_alloc(c, 6 * n),
+            mda_vkc_alloc(c, 6 * n),
         },
-        .dv0 = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .con = mda_vkc_alloc(c, 3 * bt * d * sizeof(float)),
+        .dv0 = mda_vkc_alloc(c, n),
+        .con = mda_vkc_alloc(c, 3 * n),
         .dbs = mda_vkc_alloc(c, bt * cfg.n_head * sizeof(float)),
-        .dvb = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .dgate = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .dlora = mda_vkc_alloc(c, bt * MDA_FWD_LORA_MAX * sizeof(float)),
-        .dwkv = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .dxh_buf = mda_vkc_alloc(c, bt * d * sizeof(float)),
-        .a16 = mda_vkc_alloc(c, bt * d * sizeof(uint16_t)),
+        .dvb = mda_vkc_alloc(c, n),
+        .dgate = mda_vkc_alloc(c, n),
+        .dln = mda_vkc_alloc(c, 2 * n),
+        .dlora = mda_vkc_alloc(c, (VkDeviceSize)bt * mda_model_lora_max(cfg) * sizeof(float)),
+        .dwkv = mda_vkc_alloc(c, n),
+        .dxh_buf = mda_vkc_alloc(c, n),
+        .a16 = mda_vkc_alloc(c, (VkDeviceSize)bt * d * sizeof(uint16_t)),
         .dc16 = mda_vkc_alloc(c, (VkDeviceSize)bt * widest * sizeof(uint16_t)),
+        .kd_toks = mda_vkc_alloc(c, (VkDeviceSize)cfg.vocab * 5 * sizeof(uint32_t)),
+        .kd_cont = mda_vkc_alloc_cached(c, (VkDeviceSize)mda_util_max_u32(nkd, 1) * 5 * sizeof(uint32_t)),
+        .kd_tgt = mda_vkc_alloc_cached(c, (VkDeviceSize)mda_util_max_u32(nkd, 1) * MDA_KD_ENTRY * sizeof(uint32_t)),
+        .dkd = mda_vkc_alloc(c, (VkDeviceSize)mda_util_max_u32(nkd, 1) * cfg.vocab * sizeof(float)),
+        .kd_loss = mda_vkc_alloc_cached(c, (VkDeviceSize)mda_util_max_u32(nkd, 1) * sizeof(float)),
+        .kd_bits = mda_vkc_alloc_cached(c, (VkDeviceSize)mda_util_max_u32(nkd, 1) * 2 * sizeof(float)),
         .batch = mda_fwd_batch(cfg, &ids, &target, &mask, &weight),
         .acts = acts,
-        .soft_logits = NULL,
-        .soft_logz = NULL,
-        .soft_rows = 0,
-        .teach = 1.0f,
         .n_acts = n_acts,
     };
     if (c->fail == false) {
@@ -337,19 +348,16 @@ uint32_t mda_fwd_cast_act(mda_model_t *m, mda_vkc_buf_t *src, mda_vkc_buf_t *dst
     return slot;
 }
 
-void mda_fwd_elem(mda_model_t *m, mda_vkc_buf_t *x, mda_fwd_act_t *a, mda_vkc_buf_t *dup, uint32_t op, uint32_t slot, uint32_t slot2) {
+void mda_fwd_elem(mda_model_t *m, mda_vkc_buf_t *x, mda_vkc_buf_t *pre, uint32_t op, uint32_t slot) {
     uint32_t n = mda_fwd_rows(m) * m->cfg.ffn_hidden;
     mda_pc_elem_t pc = {
         .n = n,
         .op = op,
         .slot = slot,
-        .slot2 = slot2,
     };
-    mda_vkc_buf_t *bufs[5] = {
+    mda_vkc_buf_t *bufs[3] = {
         x,
-        &a->gate_pre,
-        &a->up,
-        dup,
+        pre,
         &m->amax,
     };
     mda_vkc_run(m->c, &m->k_elem, bufs, mda_util_min_u32((n + 255) / 256, MDA_FWD_ELEM_GROUPS), 1, 1, &pc);
@@ -386,10 +394,19 @@ void mda_fwd_refresh_wt16_rec(mda_model_t *m) {
     }
 }
 
+void mda_fwd_cast_all(mda_model_t *m) {
+    for (uint64_t lo = 0; lo < m->n_all; lo += MDA_FWD_CHUNK) {
+        uint32_t n = (uint32_t)mda_util_min_size(MDA_FWD_CHUNK, m->n_all - lo);
+        mda_vkc_buf_t w = mda_vkc_view(&m->w_all, lo * sizeof(float), (VkDeviceSize)n * sizeof(float));
+        mda_vkc_buf_t w16 = mda_vkc_view(&m->w16_all, lo * sizeof(uint16_t), (VkDeviceSize)n * sizeof(uint16_t));
+        mda_fwd_cast(m, &w, &w16, n, MDA_PC_NO_SLOT);
+    }
+}
+
 void mda_fwd_refresh_w16(mda_model_t *m) {
     if (m->dirty16) {
         mda_vkc_begin(m->c);
-        mda_fwd_cast(m, &m->w_all, &m->w16_all, m->n_all, MDA_PC_NO_SLOT);
+        mda_fwd_cast_all(m);
         mda_fwd_refresh_wt16_rec(m);
         mda_vkc_flush(m->c);
         m->dirty16 = false;
@@ -463,6 +480,66 @@ uint32_t mda_fwd_n_vec(const mda_model_t *m) {
     return mda_fwd_rows(m) * m->cfg.n_head;
 }
 
+void mda_fwd_layernorm(mda_model_t *m, mda_vkc_buf_t *x, mda_model_param_t *w, mda_model_param_t *b, mda_vkc_buf_t *y, mda_vkc_buf_t *stats, uint32_t rows, uint32_t op, mda_vkc_buf_t *dacc) {
+    mda_pc_ln_t pc = {
+        .rows = rows,
+        .d = m->cfg.d,
+        .op = op,
+        .eps = MDA_FWD_LN_EPS,
+    };
+    mda_vkc_buf_t *bufs[8] = {
+        x,
+        &w->w,
+        &b->w,
+        y,
+        stats,
+        &w->g,
+        &b->g,
+        dacc,
+    };
+    mda_vkc_run(m->c, &m->k_ln, bufs, rows, 1, 1, &pc);
+}
+
+void mda_fwd_tshift(mda_model_t *m, mda_fwd_scratch_t *sc, mda_vkc_buf_t *x, mda_model_param_t *mix, mda_vkc_buf_t *out, uint32_t nmix, uint32_t op, uint32_t carry, uint32_t l, mda_vkc_buf_t *dx) {
+    mda_model_cfg_t cfg = m->cfg;
+    uint32_t bt = mda_fwd_rows(m);
+    mda_pc_ts_t pc = {
+        .bt = bt,
+        .d = cfg.d,
+        .seqlen = cfg.seqlen,
+        .op = op,
+        .blk = cfg.block,
+        .nclean = mda_model_nclean(cfg),
+        .cache = sc->cache != NULL && op == 0,
+        .nmix = nmix,
+        .sec = cfg.batch * cfg.seqlen * cfg.d,
+        .rows_per = MDA_FWD_SUM_ROWS,
+    };
+    uint32_t cur = 0;
+    mda_vkc_buf_t *pair = &sc->dg_dummy;
+    if (sc->cache != NULL) {
+        cur = sc->cache->cur;
+        pair = sc->cache->carry;
+    }
+    VkDeviceSize per = mda_fwd_cache_carry_bytes(cfg);
+    mda_vkc_buf_t carry_in = mda_fwd_cache_view(sc, pair, &sc->dg_dummy, cur, 2 * l + carry, per);
+    mda_vkc_buf_t carry_out = mda_fwd_cache_view(sc, pair, &sc->dg_dummy, 1 - cur, 2 * l + carry, per);
+    mda_vkc_buf_t *bufs[7] = {
+        x,
+        &mix->w,
+        out,
+        dx,
+        &mix->g,
+        &carry_in,
+        &carry_out,
+    };
+    uint32_t groups = (bt * cfg.d + 255) / 256;
+    if (op == 2) {
+        groups = (cfg.d * nmix * ((bt + MDA_FWD_SUM_ROWS - 1) / MDA_FWD_SUM_ROWS) + 255) / 256;
+    }
+    mda_vkc_run(m->c, &m->k_tshift, bufs, groups, 1, 1, &pc);
+}
+
 void mda_fwd_lora_act(mda_model_t *m, mda_vkc_buf_t *h, mda_vkc_buf_t *x, uint32_t n, uint32_t op, mda_model_act_t act, uint32_t slot) {
     mda_pc_lora_t pc = {
         .n = n,
@@ -478,27 +555,38 @@ void mda_fwd_lora_act(mda_model_t *m, mda_vkc_buf_t *h, mda_vkc_buf_t *x, uint32
     mda_vkc_run(m->c, &m->k_lora, bufs, mda_util_min_u32((n + 255) / 256, MDA_FWD_ELEM_GROUPS), 1, 1, &pc);
 }
 
+mda_vkc_buf_t mda_fwd_layer_vecs(mda_model_t *m, const mda_model_layer_t *ly) {
+    VkDeviceSize lo = (VkDeviceSize)ly->w0->off * sizeof(float);
+    VkDeviceSize hi = ((VkDeviceSize)ly->lnx_b->off + ly->lnx_b->n) * sizeof(float);
+    return mda_vkc_view(&m->w_all, lo, hi - lo);
+}
+
+uint32_t mda_fwd_vec_off(const mda_model_layer_t *ly, const mda_model_param_t *p) {
+    return p->off - ly->w0->off;
+}
+
 void mda_fwd_heads(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly, mda_fwd_act_t *a, uint32_t first_row) {
     mda_model_cfg_t cfg = m->cfg;
     uint32_t n_vec = mda_fwd_n_vec(m);
+    mda_vkc_buf_t vecs = mda_fwd_layer_vecs(m, ly);
     mda_pc_heads_t pc = {
         .n_vec = n_vec,
         .sec = cfg.batch * cfg.seqlen * cfg.d,
         .hd = cfg.n_head,
         .seqlen = cfg.seqlen,
         .first_row = first_row,
-        .w0 = ly->w0->off,
-        .a0 = ly->a0->off,
-        .v0 = ly->v0->off,
-        .kk = ly->kk->off,
-        .ka = ly->ka->off,
-        .rk = ly->rk->off,
+        .w0 = mda_fwd_vec_off(ly, ly->w0),
+        .a0 = mda_fwd_vec_off(ly, ly->a0),
+        .v0 = mda_fwd_vec_off(ly, ly->v0),
+        .kk = mda_fwd_vec_off(ly, ly->kk),
+        .ka = mda_fwd_vec_off(ly, ly->ka),
+        .rk = mda_fwd_vec_off(ly, ly->rk),
     };
     mda_vkc_buf_t *bufs[8] = {
         &a->kv,
         &sc->raw,
         &sc->v0,
-        &m->w_all,
+        &vecs,
         &a->heads,
         &a->vg,
         &a->kinv,
@@ -507,9 +595,10 @@ void mda_fwd_heads(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly,
     mda_vkc_run(m->c, &m->k_heads_f, bufs, (n_vec + 3) / 4, 1, 1, &pc);
 }
 
-void mda_fwd_wout(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a, mda_vkc_buf_t *y, uint32_t op, uint32_t slot) {
+void mda_fwd_wout(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly, mda_fwd_act_t *a, mda_vkc_buf_t *y, uint32_t op, uint32_t slot) {
     mda_model_cfg_t cfg = m->cfg;
     uint32_t n_vec = mda_fwd_n_vec(m);
+    mda_vkc_buf_t vecs = mda_fwd_layer_vecs(m, ly);
     mda_pc_wout_t pc = {
         .n_vec = n_vec,
         .sec = cfg.batch * cfg.seqlen * cfg.d,
@@ -517,70 +606,27 @@ void mda_fwd_wout(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a, mda_v
         .seqlen = cfg.seqlen,
         .op = op,
         .slot = slot,
+        .lw = mda_fwd_vec_off(ly, ly->lnx_w),
+        .lb = mda_fwd_vec_off(ly, ly->lnx_b),
+        .eps = MDA_FWD_LNX_EPS,
     };
-    mda_vkc_buf_t *bufs[12] = {
+    mda_vkc_buf_t *bufs[14] = {
         &a->wkv_raw,
         &a->heads,
         &a->bs,
         &a->g,
         &a->p,
         y,
-        &a->rmsx,
+        &a->stx,
         &sc->dtmp2,
         &sc->dgate,
         &sc->dbs,
         &sc->dvb,
         &m->amax,
+        &vecs,
+        &sc->dln,
     };
     mda_vkc_run(m->c, &m->k_wout, bufs, (n_vec + 3) / 4, 1, 1, &pc);
-}
-
-void mda_fwd_rmsnorm(mda_model_t *m, mda_fwd_scratch_t *sc, mda_vkc_buf_t *x, mda_vkc_buf_t *g, mda_vkc_buf_t *out, mda_vkc_buf_t *stash, uint32_t rows, uint32_t d) {
-    mda_pc_rms_t pc = {
-        .rows = rows,
-        .d = d,
-        .op = 0,
-    };
-    mda_vkc_buf_t *bufs[6] = {
-        x,
-        g,
-        out,
-        stash,
-        &sc->dg_dummy,
-        &sc->dg_dummy,
-    };
-    mda_vkc_run(m->c, &m->k_rms, bufs, rows, 1, 1, &pc);
-}
-
-uint32_t mda_fwd_adaln_groups(mda_model_cfg_t cfg, uint32_t bt, uint32_t op) {
-    switch (op) {
-    case 0:
-        return (bt * cfg.d + 255) / 256;
-    default:
-        return (cfg.d * ((bt + MDA_FWD_ADALN_ROWS - 1) / MDA_FWD_ADALN_ROWS) + 255) / 256;
-    }
-}
-
-void mda_fwd_adaln(mda_model_t *m, mda_vkc_buf_t *x, mda_model_param_t *ada, mda_vkc_buf_t *y, mda_vkc_buf_t *dx, uint32_t op, uint32_t slot) {
-    mda_model_cfg_t cfg = m->cfg;
-    uint32_t bt = mda_fwd_rows(m);
-    mda_pc_adaln_t pc = {
-        .bt = bt,
-        .d = cfg.d,
-        .op = op,
-        .s_off = slot * cfg.d,
-        .sh_off = (slot + 1) * cfg.d,
-        .rows_per = MDA_FWD_ADALN_ROWS,
-        .scale = mda_model_ada_scale(cfg),
-    };
-    mda_vkc_buf_t *bufs[5] = {
-        x,
-        &ada->w,
-        y,
-        dx,
-        &ada->g,
-    };
-    mda_vkc_run(m->c, &m->k_adaln, bufs, mda_fwd_adaln_groups(cfg, bt, op), 1, 1, &pc);
 }
 
 mda_fwd_act_t *mda_fwd_layer_acts(mda_fwd_scratch_t *sc, uint32_t l, bool save) {
@@ -611,9 +657,10 @@ void mda_fwd_embed(mda_model_t *m, mda_fwd_scratch_t *sc) {
         &sc->ids,
         &m->tok_emb->w,
         &m->mask_emb->w,
-        &sc->acts[0].x_in,
+        &sc->emb,
     };
     mda_vkc_run(m->c, &m->k_embed, bufs, (bt * m->cfg.d + 255) / 256, 1, 1, &pc);
+    mda_fwd_layernorm(m, &sc->emb, m->ln0_w, m->ln0_b, &sc->acts[0].x_in, &sc->st0, bt, 0, &sc->dg_dummy);
 }
 
 void mda_fwd_wkv_run(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a, uint32_t l, uint32_t dir, bool save, uint32_t seq0, uint32_t count, uint32_t split) {
@@ -691,21 +738,40 @@ void mda_fwd_wkv(mda_model_t *m, mda_fwd_scratch_t *sc, mda_fwd_act_t *a, uint32
     }
 }
 
+uint32_t mda_fwd_lora_mix(uint32_t i) {
+    switch (i) {
+    case MDA_MODEL_LORA_W:
+        return MDA_MODEL_MIX_W;
+    case MDA_MODEL_LORA_A:
+        return MDA_MODEL_MIX_A;
+    case MDA_MODEL_LORA_V:
+        return MDA_MODEL_MIX_V;
+    default:
+        return MDA_MODEL_MIX_G;
+    }
+}
+
+void mda_fwd_proj(mda_model_t *m, mda_fwd_act_t *a, mda_model_param_t *p, uint32_t mix, mda_vkc_buf_t *out, uint32_t n) {
+    mda_model_cfg_t cfg = m->cfg;
+    mda_vkc_buf_t x = mda_fwd_section(&a->shift, cfg, mix);
+    mda_vkc_buf_t x16 = mda_fwd_section16(&a->shift16, cfg, mix);
+    mda_fwd_mm16_pre(m, &x, &x16, a->shift_slot[mix], p, out, mda_fwd_rows(m), n, cfg.d);
+}
+
 void mda_fwd_mix_proj(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly, mda_fwd_act_t *a) {
     mda_model_cfg_t cfg = m->cfg;
-    uint32_t bt = mda_fwd_rows(m);
     uint32_t d = cfg.d;
     mda_vkc_buf_t k = mda_fwd_section(&a->kv, cfg, 0);
     mda_vkc_buf_t v = mda_fwd_section(&a->kv, cfg, 1);
     mda_vkc_buf_t r = mda_fwd_section(&sc->raw, cfg, 2);
     mda_vkc_set_nobar(m->c, true);
-    mda_fwd_mm16_pre(m, &a->shift, &a->shift16, a->shift_slot, ly->wk, &k, bt, d, d);
-    mda_fwd_mm16_pre(m, &a->shift, &a->shift16, a->shift_slot, ly->wv, &v, bt, d, d);
-    mda_fwd_mm16_pre(m, &a->shift, &a->shift16, a->shift_slot, ly->wr, &r, bt, d, d);
+    mda_fwd_proj(m, a, ly->wk, MDA_MODEL_MIX_K, &k, d);
+    mda_fwd_proj(m, a, ly->wv, MDA_MODEL_MIX_V, &v, d);
+    mda_fwd_proj(m, a, ly->wr, MDA_MODEL_MIX_R, &r, d);
     for (uint32_t i = 0; i < MDA_MODEL_LORAS; i += 1) {
         mda_model_lora_t *l = &ly->lora[i];
         mda_vkc_set_nobar(m->c, i + 1 < MDA_MODEL_LORAS);
-        mda_fwd_mm16_pre(m, &a->shift, &a->shift16, a->shift_slot, l->a, &a->lora[i].h, bt, l->rank, d);
+        mda_fwd_proj(m, a, l->a, mda_fwd_lora_mix(i), &a->lora[i].h, l->rank);
     }
 }
 
@@ -749,79 +815,58 @@ void mda_fwd_lora_out(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *
     }
 }
 
+void mda_fwd_cast_shifts(mda_model_t *m, mda_fwd_act_t *a) {
+    mda_model_cfg_t cfg = m->cfg;
+    uint32_t n = mda_fwd_rows(m) * cfg.d;
+    for (uint32_t s = 0; s < MDA_MODEL_MIXES; s += 1) {
+        mda_vkc_buf_t x = mda_fwd_section(&a->shift, cfg, s);
+        mda_vkc_buf_t x16 = mda_fwd_section16(&a->shift16, cfg, s);
+        a->shift_slot[s] = mda_fwd_cast_act(m, &x, &x16, n);
+    }
+}
+
 void mda_fwd_time_mix(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly, mda_fwd_act_t *a, uint32_t l, bool save) {
     mda_model_cfg_t cfg = m->cfg;
     uint32_t bt = mda_fwd_rows(m);
     uint32_t d = cfg.d;
-    mda_fwd_rmsnorm(m, sc, &a->x_in, &ly->n1->w, &a->n1_pre, &a->rms1, bt, d);
-    mda_fwd_adaln(m, &a->n1_pre, ly->ada, &a->n1, &a->n1, 0, 0);
-    mda_pc_ts_t tpc = {
-        .bt = bt,
-        .d = d,
-        .seqlen = cfg.seqlen,
-        .op = 0,
-        .blk = cfg.block,
-        .nclean = mda_model_nclean(cfg),
-        .cache = sc->cache != NULL,
-    };
-    uint32_t cur = 0;
-    mda_vkc_buf_t *pair = &sc->dg_dummy;
-    if (sc->cache != NULL) {
-        cur = sc->cache->cur;
-        pair = sc->cache->carry;
-    }
-    VkDeviceSize per = mda_fwd_cache_carry_bytes(cfg);
-    mda_vkc_buf_t carry_in = mda_fwd_cache_view(sc, pair, &sc->dg_dummy, cur, l, per);
-    mda_vkc_buf_t carry_out = mda_fwd_cache_view(sc, pair, &sc->dg_dummy, 1 - cur, l, per);
-    mda_vkc_buf_t *tsb[7] = {
-        &a->n1,
-        &ly->shift_mix->w,
-        &a->shift,
-        &sc->dtmp,
-        &sc->dg_dummy,
-        &carry_in,
-        &carry_out,
-    };
-    mda_vkc_run(m->c, &m->k_tshift, tsb, (bt * d + 255) / 256, 1, 1, &tpc);
-    a->shift_slot = mda_fwd_cast_act(m, &a->shift, &a->shift16, bt * d);
+    mda_fwd_layernorm(m, &a->x_in, ly->ln1_w, ly->ln1_b, &a->n1, &a->st1, bt, 0, &sc->dg_dummy);
+    mda_fwd_tshift(m, sc, &a->n1, ly->att_mix, &a->shift, MDA_MODEL_MIXES, 0, 0, l, &sc->dg_dummy);
+    mda_fwd_cast_shifts(m, a);
     mda_fwd_mix_proj(m, sc, ly, a);
     mda_fwd_lora_hidden(m, ly, a);
     mda_fwd_lora_out(m, sc, ly, a);
     mda_fwd_heads(m, sc, ly, a, mda_fwd_first_row(m, l));
     mda_fwd_wkv(m, sc, a, l, save);
     mda_fwd_repack(m, &sc->po, &a->wkv_raw, 1);
-    mda_fwd_wout(m, sc, a, &a->wkv, 0, MDA_PC_NO_SLOT);
+    mda_fwd_wout(m, sc, ly, a, &a->wkv, 0, MDA_PC_NO_SLOT);
     a->wkv_slot = mda_fwd_cast_act(m, &a->wkv, &a->wkv16, bt * d);
     mda_fwd_mm16_res(m, &a->wkv, &a->wkv16, a->wkv_slot, ly->wo, &a->x_in, &a->x_mid, bt, d, d);
 }
 
-void mda_fwd_channel_mix(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly, mda_fwd_act_t *a, mda_vkc_buf_t *next) {
+void mda_fwd_channel_mix(mda_model_t *m, mda_fwd_scratch_t *sc, mda_model_layer_t *ly, mda_fwd_act_t *a, uint32_t l, mda_vkc_buf_t *next) {
     mda_model_cfg_t cfg = m->cfg;
     uint32_t bt = mda_fwd_rows(m);
     uint32_t d = cfg.d;
     uint32_t hid = cfg.ffn_hidden;
-    mda_fwd_rmsnorm(m, sc, &a->x_mid, &ly->n2->w, &a->n2_pre, &a->rms2, bt, d);
-    mda_fwd_adaln(m, &a->n2_pre, ly->ada, &a->n2, &a->n2, 0, 2);
-    a->n2_slot = mda_fwd_cast_act(m, &a->n2, &a->n2_16, bt * d);
-    mda_vkc_set_nobar(m->c, true);
-    mda_fwd_mm16_pre(m, &a->n2, &a->n2_16, a->n2_slot, ly->w_gate, &a->gate_pre, bt, hid, d);
-    mda_vkc_set_nobar(m->c, false);
-    mda_fwd_mm16_pre(m, &a->n2, &a->n2_16, a->n2_slot, ly->w_up, &a->up, bt, hid, d);
+    mda_fwd_layernorm(m, &a->x_mid, ly->ln2_w, ly->ln2_b, &a->n2, &a->st2, bt, 0, &sc->dg_dummy);
+    mda_fwd_tshift(m, sc, &a->n2, ly->ffn_mix, &a->fshift, 1, 0, 1, l, &sc->dg_dummy);
+    a->fshift_slot = mda_fwd_cast_act(m, &a->fshift, &a->fshift16, bt * d);
+    mda_fwd_mm16_pre(m, &a->fshift, &a->fshift16, a->fshift_slot, ly->w_key, &a->kpre, bt, hid, d);
     a->h_slot = mda_fwd_slot(m);
-    mda_fwd_elem(m, &a->h, a, &sc->dup, 0, a->h_slot, MDA_PC_NO_SLOT);
+    mda_fwd_elem(m, &a->h, &a->kpre, 0, a->h_slot);
     mda_fwd_cast(m, &a->h, &a->h16, bt * hid, a->h_slot);
-    mda_fwd_mm16_res(m, &a->h, &a->h16, a->h_slot, ly->w_down, &a->x_mid, next, bt, d, hid);
+    mda_fwd_mm16_res(m, &a->h, &a->h16, a->h_slot, ly->w_val, &a->x_mid, next, bt, d, hid);
 }
 
 void mda_fwd_head(mda_model_t *m, mda_fwd_scratch_t *sc) {
     mda_model_cfg_t cfg = m->cfg;
     uint32_t bt = cfg.batch * cfg.seqlen;
-    mda_fwd_rmsnorm(m, sc, &sc->x, &m->n_out->w, &sc->xn, &sc->rms_stash, bt, cfg.d);
+    mda_fwd_layernorm(m, &sc->x, m->ln_out_w, m->ln_out_b, &sc->xn, &sc->stn, bt, 0, &sc->dg_dummy);
     if (m->ref32) {
-        mda_bwd_mm_da(m, &m->tok_emb->w, &sc->xn, &sc->logits, bt, cfg.d, cfg.vocab, false);
+        mda_fwd_mm(m, &sc->xn, &m->head->w, &sc->logits, bt, cfg.vocab, cfg.d);
     } else {
         sc->a16_slot = mda_fwd_cast_act(m, &sc->xn, &sc->a16, bt * cfg.d);
-        mda_fwd_mm16_raw(m, &sc->a16, sc->a16_slot, &m->tok_emb->wt16, MDA_PC_NO_SLOT, &sc->logits, bt, cfg.vocab, cfg.d, false, MDA_FWD_AB);
+        mda_fwd_mm16_raw(m, &sc->a16, sc->a16_slot, &m->head->w16, MDA_PC_NO_SLOT, &sc->logits, bt, cfg.vocab, cfg.d, false, MDA_FWD_AB);
     }
 }
 
@@ -844,7 +889,7 @@ void mda_fwd_rec(mda_model_t *m, mda_fwd_scratch_t *sc, bool save) {
         mda_fwd_act_t *a = mda_fwd_layer_acts(sc, l, save);
         mda_fwd_set_live(m, l);
         mda_fwd_time_mix(m, sc, ly, a, l, save);
-        mda_fwd_channel_mix(m, sc, ly, a, mda_fwd_next(m, sc, l, save));
+        mda_fwd_channel_mix(m, sc, ly, a, l, mda_fwd_next(m, sc, l, save));
     }
     m->live = m->cfg.batch;
     mda_fwd_head(m, sc);
@@ -857,16 +902,9 @@ void mda_fwd_ce(mda_model_t *m, mda_fwd_scratch_t *sc, uint32_t op, uint32_t slo
         .vocab = m->cfg.vocab,
         .op = op,
         .slot = slot,
-        .soft = sc->soft_rows,
-        .teach = sc->teach,
+        .kd_rows = mda_fwd_kd_rows(m),
     };
-    mda_vkc_buf_t *tl = &sc->logits;
-    mda_vkc_buf_t *tz = &sc->logz;
-    if (sc->soft_rows > 0) {
-        tl = sc->soft_logits;
-        tz = sc->soft_logz;
-    }
-    mda_vkc_buf_t *bufs[11] = {
+    mda_vkc_buf_t *bufs[10] = {
         &sc->logits,
         &sc->target,
         &sc->mask,
@@ -876,8 +914,7 @@ void mda_fwd_ce(mda_model_t *m, mda_fwd_scratch_t *sc, uint32_t op, uint32_t slo
         &sc->logz,
         &sc->dc16,
         &m->amax,
-        tl,
-        tz,
+        &sc->dkd,
     };
     mda_vkc_run(m->c, &m->k_ce, bufs, bt, 1, 1, &pc);
 }
@@ -885,6 +922,37 @@ void mda_fwd_ce(mda_model_t *m, mda_fwd_scratch_t *sc, uint32_t op, uint32_t slo
 void mda_fwd_ce_rec(mda_model_t *m, mda_fwd_scratch_t *sc) {
     sc->ce_slot = mda_fwd_slot(m);
     mda_fwd_ce(m, sc, 0, sc->ce_slot);
+}
+
+uint32_t mda_fwd_kd_rows(const mda_model_t *m) {
+    if (m->kd) {
+        return mda_model_nclean(m->cfg) * m->cfg.seqlen;
+    } else {
+        return 0;
+    }
+}
+
+void mda_fwd_kd_rec(mda_model_t *m, mda_fwd_scratch_t *sc) {
+    uint32_t rows = mda_fwd_kd_rows(m);
+    mda_pc_kd_student_t pc = {
+        .rows = rows,
+        .vocab = m->cfg.vocab,
+        .slot = sc->ce_slot,
+        .lambda = m->kd_weight,
+    };
+    mda_vkc_buf_t *bufs[10] = {
+        &sc->logits,
+        &sc->kd_toks,
+        &sc->kd_cont,
+        &sc->kd_tgt,
+        &sc->logz,
+        &sc->dkd,
+        &sc->kd_loss,
+        &m->amax,
+        &sc->opt,
+        &sc->kd_bits,
+    };
+    mda_vkc_run(m->c, &m->k_kd, bufs, rows, 1, 1, &pc);
 }
 
 void mda_fwd_argmax_rec(mda_model_t *m, mda_fwd_scratch_t *sc) {

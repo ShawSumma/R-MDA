@@ -20,6 +20,7 @@ layout(std430, binding = 2) buffer buf_opt {
 layout(push_constant) uniform pc {
     uint n;
     uint op;
+    uint base;
     float gscale;
     float clip;
     float growth;
@@ -49,7 +50,7 @@ void main() {
         }
         float s = reduce_sum(v * v, lid);
         if (lid == 0) {
-            partial[gl_WorkGroupID.x] = s;
+            partial[base + gl_WorkGroupID.x] = s;
         }
     } else {
         float acc = 0.0;

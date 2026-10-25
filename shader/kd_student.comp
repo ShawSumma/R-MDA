@@ -1,0 +1,241 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float logits[]; };
+layout(std430, binding = 1) readonly buffer B1 { uint toks[]; };
+layout(std430, binding = 2) readonly buffer B2 { uint cont[]; };
+layout(std430, binding = 3) readonly buffer B3 { uint tgt[]; };
+layout(std430, binding = 4) readonly buffer B4 { float logz[]; };
+layout(std430, binding = 5) writeonly buffer B5 { float dkd[]; };
+layout(std430, binding = 6) writeonly buffer B6 { float kdloss[]; };
+layout(std430, binding = 7) buffer B7 { uint amax[]; };
+layout(std430, binding = 8) readonly buffer B8 {
+    float lr;
+    float bc1;
+    float bc2;
+    float norm;
+    float scale;
+    float gmul;
+};
+layout(std430, binding = 9) writeonly buffer B9 { float kdbits[]; };
+layout(push_constant) uniform pc {
+    uint rows;
+    uint vocab;
+    uint slot;
+    float lambda;
+};
+
+const uint D = 16u;
+const uint K = 8u;
+const uint WG = 256u;
+const float EPS = 1e-20;
+
+shared float A[D + 1u];
+shared float H[D][256];
+shared float invt[D];
+shared float rtrue[D];
+shared float S[D + 1u];
+shared uint valid[D];
+shared float kl[D];
+shared float ptrue[D];
+shared float red[WG];
+
+uint byte_at(uvec4 w, uint i) {
+    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+uint common_prefix(uvec4 a, uvec4 b) {
+    uint n = 16u;
+    for (uint i = 4u; i > 0u; i -= 1u) {
+        uint x = a[i - 1u] ^ b[i - 1u];
+        if (x != 0u) {
+            n = (i - 1u) * 4u + uint(findLSB(x)) / 8u;
+        }
+    }
+    return n;
+}
+
+float reduce_sum(float v, uint lid) {
+    red[lid] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            red[lid] += red[lid + s];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+float reduce_max(float v, uint lid) {
+    red[lid] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            red[lid] = max(red[lid], red[lid + s]);
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+float entry_p(uint e) {
+    return unpackHalf2x16(e >> 16).x;
+}
+
+float term(float pt, float m) {
+    if (pt > 0.0) {
+        return pt * log(pt / max(m, EPS));
+    } else {
+        return 0.0;
+    }
+}
+
+void depth_tables(uint r, uint l, uint lid) {
+    uint base = (r * D + l) * K;
+    float ztrue = 0.0;
+    for (uint k = l + 1u; k <= D; k += 1u) {
+        ztrue += A[k];
+    }
+    float hv = H[l][lid];
+    float total = max(ztrue + reduce_sum(hv, lid), EPS);
+    float all_pt = 0.0;
+    float kept_pt = 0.0;
+    float listed_m = 0.0;
+    float mine_pt = -1.0;
+    for (uint j = 1u; j < K; j += 1u) {
+        uint e = tgt[base + j];
+        float pt = entry_p(e);
+        float m = H[l][e & 0xffu];
+        all_pt += pt;
+        if (pt > 0.0) {
+            listed_m += m;
+        }
+        if (pt > 0.0 && m > 0.0) {
+            kept_pt += pt;
+        }
+        if (pt > 0.0 && (e & 0xffu) == lid) {
+            mine_pt = pt;
+        }
+    }
+    float pt0 = entry_p(tgt[base]);
+    float rest_m = max(total - ztrue - listed_m, 0.0);
+    float rest_pt = 0.0;
+    if (rest_m > 0.0) {
+        rest_pt = max(0.0, 1.0 - pt0 - all_pt);
+    }
+    bool ok = pt0 > 0.0 && ztrue > 0.0;
+    float z = max(pt0 + kept_pt + rest_pt, EPS);
+    barrier();
+    if (mine_pt >= 0.0 && hv > 0.0) {
+        H[l][lid] = mine_pt / z / hv * total;
+    } else if (mine_pt >= 0.0) {
+        H[l][lid] = 1.0;
+    } else {
+        H[l][lid] = rest_pt / z / max(rest_m, EPS) * total;
+    }
+    if (lid == 0u && ok) {
+        valid[l] = 1u;
+        invt[l] = 1.0 / total;
+        rtrue[l] = pt0 / z / ztrue;
+        ptrue[l] = ztrue / total;
+        atomicAdd(kl[l], term(pt0 / z, ztrue / total) + term(rest_pt / z, rest_m / total));
+    }
+    if (ok && mine_pt >= 0.0 && hv > 0.0) {
+        atomicAdd(kl[l], term(mine_pt / z, hv / total));
+    }
+    barrier();
+}
+
+float grad_of(uint t, uvec4 cw, uint nd) {
+    uint len = toks[t * 5u + 4u];
+    uvec4 tw = uvec4(toks[t * 5u], toks[t * 5u + 1u], toks[t * 5u + 2u], toks[t * 5u + 3u]);
+    uint lcp = common_prefix(tw, cw);
+    float g = S[min(lcp, min(len, nd))];
+    if (lcp < nd && lcp < len && valid[lcp] != 0u) {
+        g += invt[lcp] * (1.0 - H[lcp][byte_at(tw, lcp)]);
+    }
+    return g;
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uvec4 cw = uvec4(cont[r * 5u], cont[r * 5u + 1u], cont[r * 5u + 2u], cont[r * 5u + 3u]);
+    uint nd = min(cont[r * 5u + 4u], D);
+    float lz = logz[r];
+    if (lid <= D) {
+        A[lid] = 0.0;
+    }
+    if (lid < D) {
+        kl[lid] = 0.0;
+        valid[lid] = 0u;
+    }
+    for (uint i = lid; i < D * 256u; i += WG) {
+        H[i / 256u][i % 256u] = 0.0;
+    }
+    barrier();
+    for (uint t = lid; t < vocab; t += WG) {
+        uint len = toks[t * 5u + 4u];
+        if (len > 0u) {
+            float q = exp(logits[r * vocab + t] - lz);
+            uvec4 tw = uvec4(toks[t * 5u], toks[t * 5u + 1u], toks[t * 5u + 2u], toks[t * 5u + 3u]);
+            uint lcp = common_prefix(tw, cw);
+            atomicAdd(A[min(lcp, min(len, nd))], q);
+            if (lcp < nd && lcp < len) {
+                atomicAdd(H[lcp][byte_at(tw, lcp)], q);
+            }
+        }
+    }
+    barrier();
+    for (uint l = 0u; l < nd; l += 1u) {
+        depth_tables(r, l, lid);
+    }
+    if (lid == 0u) {
+        float acc = 0.0;
+        float loss = 0.0;
+        float bits = 0.0;
+        float bytes = 0.0;
+        S[0] = 0.0;
+        for (uint l = 0u; l < D; l += 1u) {
+            if (l < nd && valid[l] != 0u) {
+                acc += invt[l] - rtrue[l];
+                loss += kl[l];
+                bits -= log2(max(ptrue[l], EPS));
+                bytes += 1.0;
+            }
+            S[l + 1u] = acc;
+        }
+        kdloss[r] = lambda * loss;
+        kdbits[2u * r] = bits;
+        kdbits[2u * r + 1u] = bytes;
+    }
+    barrier();
+    float part = 0.0;
+    for (uint t = lid; t < vocab; t += WG) {
+        if (toks[t * 5u + 4u] > 0u) {
+            part += exp(logits[r * vocab + t] - lz) * grad_of(t, cw, nd);
+        }
+    }
+    float G = reduce_sum(part, lid);
+    float big = 0.0;
+    for (uint t = lid; t < vocab; t += WG) {
+        float q = exp(logits[r * vocab + t] - lz);
+        float g = 0.0;
+        if (toks[t * 5u + 4u] > 0u) {
+            g = grad_of(t, cw, nd);
+        }
+        float d = lambda * q * (g - G);
+        dkd[r * vocab + t] = d;
+        big = max(big, abs(d));
+    }
+    big = reduce_max(big, lid);
+    if (lid == 0u && slot != ~0u) {
+        atomicMax(amax[slot], floatBitsToUint(abs(gmul) * (1.0 + big)));
+    }
+}

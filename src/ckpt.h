@@ -7,7 +7,7 @@
 
 #include "model.h"
 
-#define MDA_CKPT_MAGIC 0x3a504b4341444d52ull
+#define MDA_CKPT_MAGIC 0x3b504b4341444d52ull
 #define MDA_CKPT_OVERFLOW_PATH "models/ckpt-overflow.bin"
 #define MDA_CKPT_PATH "models/ckpt.bin"
 
@@ -32,5 +32,6 @@ bool mda_ckpt_write(mda_model_t *m, uint64_t vocab_hash, uint32_t step, FILE *f)
 mda_ckpt_res_t mda_ckpt_read(mda_model_t *m, uint64_t vocab_hash, FILE *f, bool moments, const char *path);
 bool mda_ckpt_save(mda_model_t *m, uint64_t vocab_hash, uint32_t step, const char *path);
 mda_ckpt_res_t mda_ckpt_load(mda_model_t *m, uint64_t vocab_hash, const char *path, bool moments);
+mda_model_cfg_t mda_ckpt_shape(const char *path, mda_model_cfg_t base);
 
 #endif

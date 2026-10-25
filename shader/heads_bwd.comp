@@ -101,9 +101,9 @@ void main() {
         } else {
             float vg = VG[ui];
             float d0 = V0[ui];
-            g[1] = dv * vg;
-            g[5] = dv * (KV[n + ui] - d0) * vg * (1.0 - vg);
-            DV0[ui] += dv * (1.0 - vg);
+            g[1] = dv * (1.0 - vg);
+            g[5] = dv * (d0 - KV[n + ui]) * vg * (1.0 - vg);
+            DV0[ui] += dv * vg;
         }
         for (uint i = 0u; i < 6u; i += 1u) {
             RAWG[i * n + ui] = g[i];

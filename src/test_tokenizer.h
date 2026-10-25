@@ -4,8 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MDA_TEST_TOKENIZER_MERGES 4
-#define MDA_TEST_TOKENIZER_EXPECT 13
+#define MDA_TEST_TOKENIZER_MERGES 7
+#define MDA_TEST_TOKENIZER_EXPECT 19
 
 typedef struct mda_test_tokenizer_merge_t mda_test_tokenizer_merge_t;
 typedef struct mda_test_tokenizer_file_t mda_test_tokenizer_file_t;

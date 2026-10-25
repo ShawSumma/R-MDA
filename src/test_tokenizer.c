@@ -44,18 +44,18 @@ bool mda_test_tokenizer_vocab_ok(const mda_tokenizer_t *t, const mda_test_tokeni
 }
 
 bool mda_test_tokenizer_encode(const mda_tokenizer_t *t) {
-    const char text[] = "the  the 12 ab's\n\nx";
-    uint32_t want[MDA_TEST_TOKENIZER_EXPECT] = {257, ' ', 258, ' ', '1', '2', ' ', 259, '\'', 's', '\n', '\n', 'x'};
+    const char text[] = "the  the 12 ab's\n\nxAB'S(x \nx";
+    uint32_t want[MDA_TEST_TOKENIZER_EXPECT] = {257, ' ', 258, ' ', '1', '2', ' ', 259, '\'', 's', '\n', '\n', 'x', 'A', 'B', 260, 261, 262, 'x'};
     mda_tokenizer_ids_t r = mda_tokenizer_encode(t, text, sizeof(text) - 1);
     bool same = r.n == MDA_TEST_TOKENIZER_EXPECT && memcmp(r.ids, want, sizeof(want)) == 0;
-    printf("encode: %zu tokens, GPT-2 pre-tokenization and merge order %s\n", r.n, mda_util_verdict(same));
+    printf("encode: %zu tokens, Qwen pre-tokenization and merge order %s\n", r.n, mda_util_verdict(same));
     free(r.ids);
     return same;
 }
 
 bool mda_test_tokenizer_unicode(void) {
-    bool ok = mda_unicode_letter(0xe9) && mda_unicode_letter(0x4e2d) && mda_unicode_number(0x663) && mda_unicode_number(0xbd) && mda_unicode_letter('1') == false && mda_unicode_number('a') == false && mda_unicode_letter('-') == false;
-    printf("unicode letter and number classes: %s\n", mda_util_verdict(ok));
+    bool ok = mda_unicode_letter(0xe9) && mda_unicode_letter(0x4e2d) && mda_unicode_number(0x663) && mda_unicode_number(0xbd) && mda_unicode_mark(0x301) && mda_unicode_letter('1') == false && mda_unicode_number('a') == false && mda_unicode_letter('-') == false && mda_unicode_mark('a') == false;
+    printf("unicode letter, number and mark classes: %s\n", mda_util_verdict(ok));
     return ok;
 }
 
@@ -80,6 +80,21 @@ bool mda_test_tokenizer_main(void) {
             .bytes = "ab",
             .left = 'a',
             .right = 'b',
+        },
+        {
+            .bytes = "'S",
+            .left = '\'',
+            .right = 'S',
+        },
+        {
+            .bytes = "(x",
+            .left = '(',
+            .right = 'x',
+        },
+        {
+            .bytes = " \n",
+            .left = ' ',
+            .right = '\n',
         },
     };
     mda_test_tokenizer_file_t file = mda_test_tokenizer_file(merges);

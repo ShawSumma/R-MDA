@@ -1,0 +1,32 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float a[]; };
+layout(std430, binding = 1) writeonly buffer B1 { float y[]; };
+layout(push_constant) uniform pc {
+    uint rows;
+    uint n;
+    uint astride;
+    uint ao;
+    uint bo;
+    uint op;
+    float scale;
+};
+
+float silu(float v) {
+    return v / (1.0 + exp(-v));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < rows * n) {
+        uint r = i / n;
+        uint c = i % n;
+        float g = a[r * astride + ao + c];
+        if (op == 0u) {
+            y[i] = silu(g) * a[r * astride + bo + c];
+        } else {
+            y[i] = silu(g * scale);
+        }
+    }
+}

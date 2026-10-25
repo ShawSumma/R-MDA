@@ -1,0 +1,147 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float logits[]; };
+layout(std430, binding = 1) readonly buffer B1 { uint toks[]; };
+layout(std430, binding = 2) readonly buffer B2 { uint cont[]; };
+layout(std430, binding = 3) writeonly buffer B3 { uint outp[]; };
+layout(push_constant) uniform pc {
+    uint rows;
+    uint vocab;
+};
+
+const uint D = 16u;
+const uint K = 8u;
+const uint WG = 256u;
+
+shared float A[D + 1u];
+shared float H[D][256];
+shared float red[WG];
+shared float smax[8];
+shared uint sarg[8];
+
+uint byte_at(uvec4 w, uint i) {
+    return (w[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+uint common_prefix(uvec4 a, uvec4 b) {
+    uint n = 16u;
+    for (uint i = 4u; i > 0u; i -= 1u) {
+        uint x = a[i - 1u] ^ b[i - 1u];
+        if (x != 0u) {
+            n = (i - 1u) * 4u + uint(findLSB(x)) / 8u;
+        }
+    }
+    return n;
+}
+
+float reduce_max(float v, uint lid) {
+    red[lid] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            red[lid] = max(red[lid], red[lid + s]);
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+float reduce_sum(float v, uint lid) {
+    red[lid] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            red[lid] += red[lid + s];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+uint pack_entry(uint b, float p) {
+    return b | (packHalf2x16(vec2(p, 0.0)) << 16);
+}
+
+uint top_byte(float v, uint lid) {
+    float m = subgroupMax(v);
+    uint cand = 0xffffu;
+    if (v == m) {
+        cand = lid;
+    }
+    uint a = subgroupMin(cand);
+    if (gl_SubgroupInvocationID == 0u) {
+        smax[gl_SubgroupID] = m;
+        sarg[gl_SubgroupID] = a;
+    }
+    barrier();
+    float bm = smax[0];
+    uint ba = sarg[0];
+    for (uint g = 1u; g < WG / 32u; g += 1u) {
+        if (smax[g] > bm) {
+            bm = smax[g];
+            ba = sarg[g];
+        }
+    }
+    barrier();
+    return ba;
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uvec4 cw = uvec4(cont[r * 5u], cont[r * 5u + 1u], cont[r * 5u + 2u], cont[r * 5u + 3u]);
+    uint nd = min(cont[r * 5u + 4u], D);
+    for (uint i = nd * K + lid; i < D * K; i += WG) {
+        outp[r * D * K + i] = 0u;
+    }
+    if (lid <= D) {
+        A[lid] = 0.0;
+    }
+    for (uint i = lid; i < D * 256u; i += WG) {
+        H[i / 256u][i % 256u] = 0.0;
+    }
+    float m = -3.0e38;
+    for (uint t = lid; t < vocab; t += WG) {
+        m = max(m, logits[r * vocab + t]);
+    }
+    m = reduce_max(m, lid);
+    for (uint t = lid; t < vocab; t += WG) {
+        uint len = toks[t * 5u + 4u];
+        if (len > 0u) {
+            float e = exp(logits[r * vocab + t] - m);
+            uvec4 tw = uvec4(toks[t * 5u], toks[t * 5u + 1u], toks[t * 5u + 2u], toks[t * 5u + 3u]);
+            uint lcp = common_prefix(tw, cw);
+            atomicAdd(A[min(lcp, min(len, nd))], e);
+            if (lcp < nd && lcp < len) {
+                atomicAdd(H[lcp][byte_at(tw, lcp)], e);
+            }
+        }
+    }
+    barrier();
+    for (uint l = 0u; l < nd; l += 1u) {
+        float ztrue = 0.0;
+        for (uint k = l + 1u; k <= D; k += 1u) {
+            ztrue += A[k];
+        }
+        float v = H[l][lid];
+        float total = max(ztrue + reduce_sum(v, lid), 1e-30);
+        if (lid == 0u) {
+            outp[(r * D + l) * K] = pack_entry(byte_at(cw, l), ztrue / total);
+        }
+        for (uint j = 1u; j < K; j += 1u) {
+            uint b = top_byte(v, lid);
+            if (lid == b) {
+                outp[(r * D + l) * K + j] = pack_entry(b, v / total);
+                v = -1.0;
+            }
+        }
+    }
+}

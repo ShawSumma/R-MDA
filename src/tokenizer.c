@@ -105,6 +105,9 @@ void mda_tokenizer_free(mda_tokenizer_t *t) {
     }
     free(t->entries);
     free(t->merges);
+    free(t->trie_keys);
+    free(t->trie_next);
+    free(t->trie_tok);
 }
 
 uint64_t mda_tokenizer_key(uint32_t a, uint32_t b) {
@@ -165,10 +168,61 @@ void mda_tokenizer_index_bytes(mda_tokenizer_t *t) {
     }
 }
 
+uint64_t mda_tokenizer_trie_key(uint32_t node, uint8_t b) {
+    return ((uint64_t)node << 8 | b) + 1;
+}
+
+uint32_t mda_tokenizer_trie_slot(const mda_tokenizer_t *t, uint64_t key) {
+    uint32_t i = (uint32_t)(mda_hash_mix(key) & (t->trie_cap - 1));
+    while (t->trie_keys[i] != 0 && t->trie_keys[i] != key) {
+        i = (i + 1) & (t->trie_cap - 1);
+    }
+    return i;
+}
+
+uint32_t mda_tokenizer_trie_child(mda_tokenizer_t *t, uint32_t node, uint8_t b) {
+    uint64_t key = mda_tokenizer_trie_key(node, b);
+    uint32_t slot = mda_tokenizer_trie_slot(t, key);
+    if (t->trie_keys[slot] == 0) {
+        t->trie_keys[slot] = key;
+        t->trie_next[slot] = t->trie_nodes;
+        t->trie_tok[t->trie_nodes] = UINT32_MAX;
+        t->trie_nodes += 1;
+    }
+    return t->trie_next[slot];
+}
+
+void mda_tokenizer_build_trie(mda_tokenizer_t *t) {
+    uint32_t total = 1;
+    for (uint32_t i = 1; i < t->count; i += 1) {
+        total += t->entries[i].len;
+    }
+    uint32_t cap = 1;
+    while (cap < 2 * total) {
+        cap *= 2;
+    }
+    t->trie_cap = cap;
+    t->trie_keys = calloc(cap, sizeof(uint64_t));
+    t->trie_next = calloc(cap, sizeof(uint32_t));
+    t->trie_tok = malloc(total * sizeof(uint32_t));
+    t->trie_tok[0] = UINT32_MAX;
+    t->trie_nodes = 1;
+    for (uint32_t i = 1; i < t->count; i += 1) {
+        uint32_t node = 0;
+        for (uint32_t k = 0; k < t->entries[i].len; k += 1) {
+            node = mda_tokenizer_trie_child(t, node, (uint8_t)t->entries[i].bytes[k]);
+        }
+        t->trie_tok[node] = i;
+    }
+}
+
 mda_tokenizer_t mda_tokenizer_finish(mda_tokenizer_t t, FILE *f, const char *path) {
     bool merged = mda_tokenizer_read_merges(&t, f);
     fclose(f);
     mda_tokenizer_index_bytes(&t);
+    if (merged && t.n_merges == 0) {
+        mda_tokenizer_build_trie(&t);
+    }
     if (merged == false) {
         fprintf(stderr, "%s: bad merge %u\n", path, t.n_merges);
         mda_tokenizer_free(&t);
@@ -237,6 +291,10 @@ uint64_t mda_tokenizer_hash(const mda_tokenizer_t *t) {
     return h;
 }
 
+uint32_t mda_tokenizer_padded(uint32_t count) {
+    return (count + MDA_TOKENIZER_PAD - 1) / MDA_TOKENIZER_PAD * MDA_TOKENIZER_PAD;
+}
+
 mda_tokenizer_char_t mda_tokenizer_invalid(void) {
     return (mda_tokenizer_char_t) {
         .cp = 0xfffd,
@@ -295,6 +353,8 @@ mda_tokenizer_class_t mda_tokenizer_class(uint32_t cp) {
         return MDA_TOKENIZER_LETTER;
     } else if (mda_unicode_number(cp)) {
         return MDA_TOKENIZER_NUMBER;
+    } else if (mda_unicode_mark(cp)) {
+        return MDA_TOKENIZER_MARK;
     } else {
         return MDA_TOKENIZER_OTHER;
     }
@@ -326,29 +386,108 @@ uint32_t mda_tokenizer_space_end(const uint8_t *s, uint32_t p, uint32_t e) {
     }
 }
 
+uint8_t mda_tokenizer_lower(uint8_t b) {
+    if (b >= 'A' && b <= 'Z') {
+        return b - 'A' + 'a';
+    } else {
+        return b;
+    }
+}
+
 uint32_t mda_tokenizer_contraction(const uint8_t *s, uint32_t p, uint32_t e) {
     uint32_t left = e - p;
-    if (left >= 3 && s[p] == '\'' && ((s[p + 1] == 'r' && s[p + 2] == 'e') || (s[p + 1] == 'v' && s[p + 2] == 'e') || (s[p + 1] == 'l' && s[p + 2] == 'l'))) {
+    uint8_t a = 0;
+    uint8_t b = 0;
+    if (left >= 2) {
+        a = mda_tokenizer_lower(s[p + 1]);
+    }
+    if (left >= 3) {
+        b = mda_tokenizer_lower(s[p + 2]);
+    }
+    if (left >= 3 && s[p] == '\'' && ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l'))) {
         return 3;
-    } else if (left >= 2 && s[p] == '\'' && (s[p + 1] == 's' || s[p + 1] == 't' || s[p + 1] == 'm' || s[p + 1] == 'd')) {
+    } else if (left >= 2 && s[p] == '\'' && (a == 's' || a == 't' || a == 'm' || a == 'd')) {
         return 2;
     } else {
         return 0;
     }
 }
 
-uint32_t mda_tokenizer_pretoken(const uint8_t *s, uint32_t p, uint32_t e) {
-    uint32_t c = mda_tokenizer_contraction(s, p, e);
+bool mda_tokenizer_newline(uint8_t b) {
+    return b == '\r' || b == '\n';
+}
+
+bool mda_tokenizer_wordlike(mda_tokenizer_class_t cls) {
+    return cls == MDA_TOKENIZER_LETTER || cls == MDA_TOKENIZER_MARK;
+}
+
+uint32_t mda_tokenizer_word_run(const uint8_t *s, uint32_t p, uint32_t e) {
+    uint32_t q = p;
+    while (q < e && mda_tokenizer_wordlike(mda_tokenizer_class_at(s, q, e))) {
+        q += mda_tokenizer_decode(s + q, e - q).len;
+    }
+    return q;
+}
+
+uint32_t mda_tokenizer_word(const uint8_t *s, uint32_t p, uint32_t e) {
     mda_tokenizer_class_t cls = mda_tokenizer_class_at(s, p, e);
-    bool lead = s[p] == ' ' && p + 1 < e && mda_tokenizer_class_at(s, p + 1, e) != MDA_TOKENIZER_SPACE;
-    if (c > 0) {
-        return p + c;
-    } else if (lead) {
-        return mda_tokenizer_run(s, p + 1, e, mda_tokenizer_class_at(s, p + 1, e));
-    } else if (cls != MDA_TOKENIZER_SPACE) {
-        return mda_tokenizer_run(s, p, e, cls);
+    uint32_t next = p + mda_tokenizer_decode(s + p, e - p).len;
+    bool prefix = cls != MDA_TOKENIZER_LETTER && cls != MDA_TOKENIZER_NUMBER && mda_tokenizer_newline(s[p]) == false && next < e && mda_tokenizer_wordlike(mda_tokenizer_class_at(s, next, e));
+    if (prefix) {
+        return mda_tokenizer_word_run(s, next, e);
+    } else {
+        return mda_tokenizer_word_run(s, p, e);
+    }
+}
+
+uint32_t mda_tokenizer_punct(const uint8_t *s, uint32_t p, uint32_t e) {
+    uint32_t q = p + (uint32_t)(s[p] == ' ');
+    uint32_t r = mda_tokenizer_run(s, q, e, MDA_TOKENIZER_OTHER);
+    while (r > q && r < e && mda_tokenizer_newline(s[r])) {
+        r += 1;
+    }
+    if (r == q) {
+        return p;
+    } else {
+        return r;
+    }
+}
+
+uint32_t mda_tokenizer_newlines(const uint8_t *s, uint32_t p, uint32_t e) {
+    uint32_t w = mda_tokenizer_run(s, p, e, MDA_TOKENIZER_SPACE);
+    uint32_t end = p;
+    for (uint32_t i = p; i < w; i += 1) {
+        if (mda_tokenizer_newline(s[i])) {
+            end = i + 1;
+        }
+    }
+    return end;
+}
+
+uint32_t mda_tokenizer_rest(const uint8_t *s, uint32_t p, uint32_t e) {
+    uint32_t r = mda_tokenizer_punct(s, p, e);
+    uint32_t n = mda_tokenizer_newlines(s, p, e);
+    if (r > p) {
+        return r;
+    } else if (n > p) {
+        return n;
     } else {
         return mda_tokenizer_space_end(s, p, e);
+    }
+}
+
+uint32_t mda_tokenizer_pretoken(const uint8_t *s, uint32_t p, uint32_t e) {
+    uint32_t c = mda_tokenizer_contraction(s, p, e);
+    uint32_t w = mda_tokenizer_word(s, p, e);
+    mda_tokenizer_class_t cls = mda_tokenizer_class_at(s, p, e);
+    if (c > 0) {
+        return p + c;
+    } else if (w > p) {
+        return w;
+    } else if (cls == MDA_TOKENIZER_NUMBER) {
+        return p + mda_tokenizer_decode(s + p, e - p).len;
+    } else {
+        return mda_tokenizer_rest(s, p, e);
     }
 }
 
@@ -391,25 +530,63 @@ void mda_tokenizer_piece(const mda_tokenizer_t *t, const uint8_t *s, uint32_t p,
     }
 }
 
-mda_tokenizer_ids_t mda_tokenizer_encode(const mda_tokenizer_t *t, const char *text, uint32_t len) {
-    const uint8_t *s = (const uint8_t *)text;
+mda_tokenizer_match_t mda_tokenizer_longest(const mda_tokenizer_t *t, const uint8_t *s, uint32_t n) {
+    mda_tokenizer_match_t best = {
+        .len = 0,
+        .tok = UINT32_MAX,
+    };
+    uint32_t node = 0;
+    uint32_t q = 0;
+    uint32_t slot = mda_tokenizer_trie_slot(t, mda_tokenizer_trie_key(node, s[0]));
+    while (q < n && t->trie_keys[slot] != 0) {
+        node = t->trie_next[slot];
+        q += 1;
+        if (t->trie_tok[node] != UINT32_MAX) {
+            best.len = q;
+            best.tok = t->trie_tok[node];
+        }
+        if (q < n) {
+            slot = mda_tokenizer_trie_slot(t, mda_tokenizer_trie_key(node, s[q]));
+        }
+    }
+    return best;
+}
+
+mda_tokenizer_ids_t mda_tokenizer_greedy(const mda_tokenizer_t *t, const uint8_t *s, uint32_t len) {
+    mda_tokenizer_ids_t out = {
+        .ids = malloc((len + 1) * sizeof(uint32_t)),
+        .n = 0,
+    };
+    uint32_t p = 0;
+    while (p < len) {
+        mda_tokenizer_match_t m = mda_tokenizer_longest(t, s + p, len - p);
+        if (m.len == 0) {
+            p += 1;
+        } else {
+            out.ids[out.n] = m.tok;
+            out.n += 1;
+            p += m.len;
+        }
+    }
+    return out;
+}
+
+mda_tokenizer_ids_t mda_tokenizer_bpe_encode(const mda_tokenizer_t *t, const uint8_t *s, uint32_t len) {
     mda_tokenizer_ids_t out = {
         .ids = malloc((len + 1) * sizeof(uint32_t)),
         .n = 0,
     };
     uint32_t *syms = malloc((len + 1) * sizeof(uint32_t));
-    uint32_t start = 0;
-    uint32_t i = 0;
-    while (i < len) {
-        mda_tokenizer_char_t c = mda_tokenizer_decode(s + i, len - i);
-        if (mda_unicode_number(c.cp)) {
-            mda_tokenizer_piece(t, s, start, i, &out, syms);
-            mda_tokenizer_piece(t, s, i, i + c.len, &out, syms);
-            start = i + c.len;
-        }
-        i += c.len;
-    }
-    mda_tokenizer_piece(t, s, start, len, &out, syms);
+    mda_tokenizer_piece(t, s, 0, len, &out, syms);
     free(syms);
     return out;
+}
+
+mda_tokenizer_ids_t mda_tokenizer_encode(const mda_tokenizer_t *t, const char *text, uint32_t len) {
+    const uint8_t *s = (const uint8_t *)text;
+    if (t->n_merges == 0) {
+        return mda_tokenizer_greedy(t, s, len);
+    } else {
+        return mda_tokenizer_bpe_encode(t, s, len);
+    }
 }

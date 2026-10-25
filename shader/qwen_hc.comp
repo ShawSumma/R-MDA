@@ -1,0 +1,39 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float a[]; };
+layout(std430, binding = 1) readonly buffer B1 { float b[]; };
+layout(std430, binding = 2) buffer B2 { float h[]; };
+layout(push_constant) uniform pc {
+    uint rows;
+    uint d;
+    uint hc;
+    uint op;
+    uint inj_stride;
+    uint inj_off;
+};
+
+float sigmoid(float v) {
+    return 1.0 / (1.0 + exp(-v));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint r = i / d;
+    uint c = i % d;
+    if (op == 0u && i < rows * d) {
+        float acc = 0.0;
+        for (uint s = 0u; s < hc; s += 1u) {
+            uint j = r * hc * d + s * d + c;
+            acc += sigmoid(a[j]) * b[j];
+        }
+        h[i] = acc / float(hc);
+    } else if (op == 1u && i < rows * d) {
+        for (uint s = 0u; s < hc; s += 1u) {
+            float g = 2.0 * sigmoid(b[r * inj_stride + inj_off + s] / float(hc));
+            h[r * hc * d + s * d + c] += a[i] * g;
+        }
+    } else if (op == 2u && i < rows * d * hc) {
+        h[i] += a[i] + b[i];
+    }
+}

@@ -8,7 +8,7 @@ import argparse
 import struct
 from pathlib import Path
 
-HDR = struct.Struct("<Q8IIxxxxQQ")
+HDR = struct.Struct("<Q12IIxxxxQQ")
 
 
 def main() -> None:
@@ -18,7 +18,7 @@ def main() -> None:
     args = ap.parse_args()
     with args.src.open("rb") as f:
         hdr = f.read(HDR.size)
-        n_all = HDR.unpack(hdr)[11]
+        n_all = HDR.unpack(hdr)[15]
         weights = f.read(4 * n_all)
     if len(weights) != 4 * n_all:
         raise SystemExit(f"{args.src}: truncated")

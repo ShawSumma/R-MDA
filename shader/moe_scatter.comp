@@ -1,0 +1,33 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer B0 { uint idx[]; };
+layout(std430, binding = 1) readonly buffer B1 { uint off[]; };
+layout(std430, binding = 2) buffer B2 { uint fill[]; };
+layout(std430, binding = 3) readonly buffer B3 { uvec4 x16[]; };
+layout(std430, binding = 4) writeonly buffer B4 { uvec4 xp[]; };
+layout(std430, binding = 5) writeonly buffer B5 { uint slot[]; };
+layout(push_constant) uniform pc {
+    uint rows;
+    uint topk;
+    uint d8;
+};
+
+shared uint spos;
+
+void main() {
+    uint pr = gl_WorkGroupID.x;
+    uint r = pr / topk;
+    uint lid = gl_LocalInvocationID.x;
+    if (lid == 0u) {
+        uint e = idx[pr];
+        uint p = off[e] + atomicAdd(fill[e], 1u);
+        spos = p;
+        slot[pr] = p;
+    }
+    barrier();
+    uint p = spos;
+    for (uint i = lid; i < d8; i += 64u) {
+        xp[p * d8 + i] = x16[r * d8 + i];
+    }
+}

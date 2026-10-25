@@ -8,7 +8,7 @@
 #define MDA_BENCH_MM_REPS 20
 #define MDA_BENCH_PROF_BATCHES 3
 #define MDA_BENCH_ROUNDS 7
-#define MDA_BENCH_VOCAB 49152
+#define MDA_BENCH_VOCAB 65536
 
 typedef uint32_t mda_bench_phase_t;
 

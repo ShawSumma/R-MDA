@@ -7,7 +7,6 @@
 #include "vkc.h"
 #include "model.h"
 #include "fwd.h"
-#include "teacher.h"
 
 #define MDA_STEP_ADAM_B1 0.9f
 #define MDA_STEP_ADAM_B2 0.999f
@@ -18,7 +17,7 @@
 #define MDA_STEP_MUON_A 3.4445f
 #define MDA_STEP_MUON_B -4.7750f
 #define MDA_STEP_MUON_C 2.0315f
-#define MDA_STEP_MUON_PER_LAYER 7
+#define MDA_STEP_MUON_PER_LAYER 6
 
 typedef uint32_t mda_step_muon_phase_t;
 typedef struct mda_step_muon_t mda_step_muon_t;
@@ -51,17 +50,21 @@ struct mda_step_muon_t {
 
 struct mda_step_trainer_t {
     mda_model_t *m;
-    mda_teacher_t *teacher;
     mda_step_muon_t *mats;
     mda_fwd_scratch_t sc;
     mda_vkc_buf_t partials;
-    mda_vkc_buf_t align;
     mda_vkc_cmd_t first;
     mda_vkc_cmd_t more;
     mda_vkc_cmd_t opt;
     double loss;
     double ce_sum;
     double masked;
+    double kd_sum;
+    double kd_n;
+    double kd_student_bits;
+    double kd_teacher_bits;
+    double kd_bytes;
+    double kd_teacher_bytes;
     float gnorm;
     uint32_t accum;
     uint32_t n_mats;
@@ -70,7 +73,7 @@ struct mda_step_trainer_t {
 };
 
 void mda_step_opt_rec(mda_step_trainer_t *tr, float clip);
-mda_step_trainer_t mda_step_init(mda_model_t *m, float clip, uint32_t accum, bool muon, mda_teacher_t *teacher);
+mda_step_trainer_t mda_step_init(mda_model_t *m, float clip, uint32_t accum, bool muon);
 float mda_step_grad(mda_step_trainer_t *tr);
 void mda_step_begin(mda_step_trainer_t *tr, float lr, uint32_t step);
 void mda_step_micro(mda_step_trainer_t *tr, uint32_t i);

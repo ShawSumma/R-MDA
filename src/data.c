@@ -215,7 +215,7 @@ mda_data_corpus_t mda_data_corpus(mda_tokenizer_t tok, mda_tokenizer_ids_t ids, 
             .len = ids.n,
             .eval_start = eval_start,
             .tok = tok,
-            .mask_id = tok.count,
+            .mask_id = mda_tokenizer_padded(tok.count),
         };
     }
 }

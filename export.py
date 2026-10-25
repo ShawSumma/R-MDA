@@ -6,7 +6,7 @@ srcs = []
 srcs.extend(glob.glob('shader/**/*.comp', recursive=True))
 srcs.extend(glob.glob('src/**/*.c', recursive=True))
 srcs.extend(glob.glob('src/**/*.h', recursive=True))
-srcs.extend(glob.glob('tools/*.py', recursive=True))
+# srcs.extend(glob.glob('tools/*.py', recursive=True))
 srcs.extend(glob.glob('makefile', recursive=True))
 
 srcs.sort()

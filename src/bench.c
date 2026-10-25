@@ -237,7 +237,7 @@ bool mda_bench_device(mda_vkc_t *c, bool muon, uint32_t batch, const char *mode)
         return false;
     } else {
         m->causal = strcmp(mode, "ar") == 0;
-        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, muon, NULL);
+        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, muon);
         printf("training uses %.2f GB of GPU memory\n", (double)c->dev_bytes / 1e9);
         mda_bench_matmuls(m);
         if (c->fail) {

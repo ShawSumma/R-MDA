@@ -1,0 +1,83 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float Q[]; };
+layout(std430, binding = 1) readonly buffer B1 { float K[]; };
+layout(std430, binding = 2) readonly buffer B2 { float P[]; };
+layout(std430, binding = 3) writeonly buffer B3 { float O[]; };
+layout(push_constant) uniform pc {
+    uint seqlen;
+    uint heads;
+    uint kv_heads;
+    uint p_stride;
+    uint v_off;
+    uint g_off;
+    uint g_hstride;
+    float scale;
+};
+
+const uint HD = 256u;
+const uint PART = 64u;
+const uint QB = 64u;
+const uint KB = 16u;
+
+shared float ks[KB][HD];
+shared float vs[KB][HD];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint qi = lid >> 2;
+    uint part = lid & 3u;
+    uint nqb = seqlen / QB;
+    uint qb = gl_WorkGroupID.x % nqb;
+    uint sh = gl_WorkGroupID.x / nqb;
+    uint h = sh % heads;
+    uint seq = sh / heads;
+    uint kvh = h / (heads / kv_heads);
+    uint qpos = qb * QB + qi;
+    uint qrow = seq * seqlen + qpos;
+    uint qd = heads * HD;
+    uint kd = kv_heads * HD;
+    float q[PART];
+    float acc[PART];
+    [[unroll]] for (uint e = 0u; e < PART; e += 1u) {
+        q[e] = Q[qrow * qd + h * HD + part * PART + e] * scale;
+        acc[e] = 0.0;
+    }
+    float mx = -1e30;
+    float sum = 0.0;
+    uint last = qb * QB + QB - 1u;
+    for (uint t0 = 0u; t0 <= last; t0 += KB) {
+        barrier();
+        [[unroll]] for (uint j = 0u; j < KB; j += 1u) {
+            uint krow = seq * seqlen + t0 + j;
+            ks[j][lid] = K[krow * kd + kvh * HD + lid];
+            vs[j][lid] = P[krow * p_stride + v_off + kvh * HD + lid];
+        }
+        barrier();
+        for (uint j = 0u; j < KB; j += 1u) {
+            float s = 0.0;
+            [[unroll]] for (uint e = 0u; e < PART; e += 1u) {
+                s += q[e] * ks[j][part * PART + e];
+            }
+            s = subgroupClusteredAdd(s, 4u);
+            if (t0 + j <= qpos) {
+                float nm = max(mx, s);
+                float keep = exp(mx - nm);
+                float p = exp(s - nm);
+                sum = sum * keep + p;
+                [[unroll]] for (uint e = 0u; e < PART; e += 1u) {
+                    acc[e] = acc[e] * keep + p * vs[j][part * PART + e];
+                }
+                mx = nm;
+            }
+        }
+    }
+    [[unroll]] for (uint e = 0u; e < PART; e += 1u) {
+        float g = P[qrow * p_stride + g_off + h * g_hstride + part * PART + e];
+        O[qrow * qd + h * HD + part * PART + e] = acc[e] / sum / (1.0 + exp(-g));
+    }
+}

@@ -1,0 +1,38 @@
+#version 450
+layout(local_size_x = 512) in;
+
+layout(std430, binding = 0) readonly buffer B0 { uint count[]; };
+layout(std430, binding = 1) writeonly buffer B1 { uint off[]; };
+layout(std430, binding = 2) writeonly buffer B2 { uint tiles[]; };
+layout(push_constant) uniform pc {
+    uint experts;
+    uint tile;
+};
+
+shared uint s[512];
+
+void main() {
+    uint e = gl_LocalInvocationID.x;
+    uint p = 0u;
+    if (e < experts) {
+        p = (count[e] + tile - 1u) / tile * tile;
+    }
+    s[e] = p;
+    barrier();
+    for (uint d = 1u; d < 512u; d <<= 1) {
+        uint v = s[e];
+        if (e >= d) {
+            v += s[e - d];
+        }
+        barrier();
+        s[e] = v;
+        barrier();
+    }
+    uint lo = s[e] - p;
+    if (e < experts) {
+        off[e] = lo;
+        for (uint t = lo / tile; t < (lo + p) / tile; t += 1u) {
+            tiles[t] = e;
+        }
+    }
+}

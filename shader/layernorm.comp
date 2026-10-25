@@ -1,0 +1,87 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float x[]; };
+layout(std430, binding = 1) readonly buffer B1 { float w[]; };
+layout(std430, binding = 2) readonly buffer B2 { float b[]; };
+layout(std430, binding = 3) buffer B3 { float y[]; };
+layout(std430, binding = 4) buffer B4 { float stats[]; };
+layout(std430, binding = 5) buffer B5 { float dw[]; };
+layout(std430, binding = 6) buffer B6 { float db[]; };
+layout(std430, binding = 7) buffer B7 { float dacc[]; };
+layout(push_constant) uniform pc {
+    uint rows;
+    uint d;
+    uint op;
+    float eps;
+};
+
+shared float red[256];
+
+float reduce_sum(float v, uint lid) {
+    red[lid] = v;
+    barrier();
+    for (uint o = 128; o > 0; o >>= 1) {
+        if (lid < o) {
+            red[lid] += red[lid + o];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+void forward(uint row, uint lid, uint base) {
+    float s = 0.0;
+    for (uint i = lid; i < d; i += 256) {
+        s += x[base + i];
+    }
+    float mean = reduce_sum(s, lid) / float(d);
+    float v = 0.0;
+    for (uint i = lid; i < d; i += 256) {
+        float c = x[base + i] - mean;
+        v += c * c;
+    }
+    float rstd = inversesqrt(reduce_sum(v, lid) / float(d) + eps);
+    if (lid == 0) {
+        stats[2 * row] = mean;
+        stats[2 * row + 1] = rstd;
+    }
+    for (uint i = lid; i < d; i += 256) {
+        y[base + i] = (x[base + i] - mean) * rstd * w[i] + b[i];
+    }
+}
+
+void backward(uint row, uint lid, uint base) {
+    float mean = stats[2 * row];
+    float rstd = stats[2 * row + 1];
+    float sg = 0.0;
+    float sgx = 0.0;
+    for (uint i = lid; i < d; i += 256) {
+        float xh = (x[base + i] - mean) * rstd;
+        float g = y[base + i] * w[i];
+        sg += g;
+        sgx += g * xh;
+    }
+    float mg = reduce_sum(sg, lid) / float(d);
+    float mgx = reduce_sum(sgx, lid) / float(d);
+    for (uint i = lid; i < d; i += 256) {
+        float xh = (x[base + i] - mean) * rstd;
+        float dy = y[base + i];
+        dacc[base + i] += rstd * (dy * w[i] - mg - xh * mgx);
+        atomicAdd(dw[i], dy * xh);
+        atomicAdd(db[i], dy);
+    }
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (row < rows && op == 0) {
+        forward(row, lid, row * d);
+    } else if (row < rows) {
+        backward(row, lid, row * d);
+    }
+}

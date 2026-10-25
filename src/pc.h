@@ -7,7 +7,7 @@
 
 typedef uint32_t mda_pc_vec_op_t;
 typedef struct mda_pc_emb_t mda_pc_emb_t;
-typedef struct mda_pc_rms_t mda_pc_rms_t;
+typedef struct mda_pc_ln_t mda_pc_ln_t;
 typedef struct mda_pc_ts_t mda_pc_ts_t;
 typedef struct mda_pc_absmax_t mda_pc_absmax_t;
 typedef struct mda_pc_cast_t mda_pc_cast_t;
@@ -24,9 +24,6 @@ typedef struct mda_pc_repack_t mda_pc_repack_t;
 typedef struct mda_pc_wout_t mda_pc_wout_t;
 typedef struct mda_pc_lora_t mda_pc_lora_t;
 typedef struct mda_pc_colsum_t mda_pc_colsum_t;
-typedef struct mda_pc_rope_t mda_pc_rope_t;
-typedef struct mda_pc_attn_t mda_pc_attn_t;
-typedef struct mda_pc_align_t mda_pc_align_t;
 typedef struct mda_pc_elem_t mda_pc_elem_t;
 typedef struct mda_pc_ce_t mda_pc_ce_t;
 typedef struct mda_pc_argmax_t mda_pc_argmax_t;
@@ -34,7 +31,22 @@ typedef struct mda_pc_softmax_t mda_pc_softmax_t;
 typedef struct mda_pc_sumsq_t mda_pc_sumsq_t;
 typedef struct mda_pc_adam_t mda_pc_adam_t;
 typedef struct mda_pc_muon_t mda_pc_muon_t;
-typedef struct mda_pc_adaln_t mda_pc_adaln_t;
+typedef struct mda_pc_qwen_bf16_t mda_pc_qwen_bf16_t;
+typedef struct mda_pc_qwen_embed_t mda_pc_qwen_embed_t;
+typedef struct mda_pc_qwen_norm_t mda_pc_qwen_norm_t;
+typedef struct mda_pc_qwen_hc_t mda_pc_qwen_hc_t;
+typedef struct mda_pc_qwen_elem_t mda_pc_qwen_elem_t;
+typedef struct mda_pc_qwen_conv_t mda_pc_qwen_conv_t;
+typedef struct mda_pc_qwen_gdn_t mda_pc_qwen_gdn_t;
+typedef struct mda_pc_qwen_attn_t mda_pc_qwen_attn_t;
+typedef struct mda_pc_qwen_ple_t mda_pc_qwen_ple_t;
+typedef struct mda_pc_moe_route_t mda_pc_moe_route_t;
+typedef struct mda_pc_moe_scan_t mda_pc_moe_scan_t;
+typedef struct mda_pc_moe_scatter_t mda_pc_moe_scatter_t;
+typedef struct mda_pc_moe_mm_t mda_pc_moe_mm_t;
+typedef struct mda_pc_moe_combine_t mda_pc_moe_combine_t;
+typedef struct mda_pc_kd_bytes_t mda_pc_kd_bytes_t;
+typedef struct mda_pc_kd_student_t mda_pc_kd_student_t;
 
 enum {
     MDA_PC_VEC_ADD,
@@ -50,10 +62,11 @@ struct mda_pc_emb_t {
     uint32_t vocab;
 };
 
-struct mda_pc_rms_t {
+struct mda_pc_ln_t {
     uint32_t rows;
     uint32_t d;
     uint32_t op;
+    float eps;
 };
 
 struct mda_pc_ts_t {
@@ -64,6 +77,9 @@ struct mda_pc_ts_t {
     uint32_t blk;
     uint32_t nclean;
     uint32_t cache;
+    uint32_t nmix;
+    uint32_t sec;
+    uint32_t rows_per;
 };
 
 struct mda_pc_absmax_t {
@@ -183,6 +199,9 @@ struct mda_pc_wout_t {
     uint32_t seqlen;
     uint32_t op;
     uint32_t slot;
+    uint32_t lw;
+    uint32_t lb;
+    float eps;
 };
 
 struct mda_pc_lora_t {
@@ -198,30 +217,10 @@ struct mda_pc_colsum_t {
     uint32_t rows_per;
 };
 
-struct mda_pc_rope_t {
-    uint32_t rows;
-    uint32_t heads;
-    uint32_t seqlen;
-    float theta;
-};
-
-struct mda_pc_attn_t {
-    uint32_t seqlen;
-    uint32_t heads;
-    uint32_t kv_heads;
-};
-
-struct mda_pc_align_t {
-    uint32_t n;
-    uint32_t d;
-    uint32_t slot;
-};
-
 struct mda_pc_elem_t {
     uint32_t n;
     uint32_t op;
     uint32_t slot;
-    uint32_t slot2;
 };
 
 struct mda_pc_ce_t {
@@ -229,8 +228,7 @@ struct mda_pc_ce_t {
     uint32_t vocab;
     uint32_t op;
     uint32_t slot;
-    uint32_t soft;
-    float teach;
+    uint32_t kd_rows;
 };
 
 struct mda_pc_argmax_t {
@@ -249,6 +247,7 @@ struct mda_pc_softmax_t {
 struct mda_pc_sumsq_t {
     uint32_t n;
     uint32_t op;
+    uint32_t base;
     float gscale;
     float clip;
     float growth;
@@ -271,14 +270,149 @@ struct mda_pc_muon_t {
     float p1;
 };
 
-struct mda_pc_adaln_t {
-    uint32_t bt;
+struct mda_pc_qwen_bf16_t {
+    uint32_t n;
+};
+
+struct mda_pc_qwen_embed_t {
+    uint32_t rows;
     uint32_t d;
+    uint32_t hc;
+};
+
+struct mda_pc_qwen_norm_t {
+    uint32_t rows;
+    uint32_t groups;
+    uint32_t gsize;
+    uint32_t in_stride;
+    uint32_t in_off;
+    uint32_t in_gstride;
+    uint32_t out_stride;
+    uint32_t out_off;
+    uint32_t out_gstride;
+    uint32_t w_off;
+    uint32_t wstride;
     uint32_t op;
-    uint32_t s_off;
-    uint32_t sh_off;
-    uint32_t rows_per;
+    uint32_t rot;
+    uint32_t seqlen;
+    uint32_t z_stride;
+    uint32_t z_off;
+    uint32_t z_gstride;
+    float eps;
     float scale;
+    float theta;
+};
+
+struct mda_pc_qwen_hc_t {
+    uint32_t rows;
+    uint32_t d;
+    uint32_t hc;
+    uint32_t op;
+    uint32_t inj_stride;
+    uint32_t inj_off;
+};
+
+struct mda_pc_qwen_elem_t {
+    uint32_t rows;
+    uint32_t n;
+    uint32_t astride;
+    uint32_t ao;
+    uint32_t bo;
+    uint32_t op;
+    float scale;
+};
+
+struct mda_pc_qwen_conv_t {
+    uint32_t rows;
+    uint32_t ch;
+    uint32_t seqlen;
+    uint32_t k;
+    uint32_t dil;
+    uint32_t in_stride;
+    uint32_t in_off;
+    uint32_t w_off;
+};
+
+struct mda_pc_qwen_gdn_t {
+    uint32_t seqlen;
+    uint32_t vheads;
+    uint32_t kheads;
+    uint32_t qkv_stride;
+    uint32_t k_off;
+    uint32_t v_off;
+    uint32_t ps;
+    uint32_t boff;
+    uint32_t aoff;
+    uint32_t a_log;
+    uint32_t dt_bias;
+};
+
+struct mda_pc_qwen_attn_t {
+    uint32_t seqlen;
+    uint32_t heads;
+    uint32_t kv_heads;
+    uint32_t p_stride;
+    uint32_t v_off;
+    uint32_t g_off;
+    uint32_t g_hstride;
+    float scale;
+};
+
+struct mda_pc_qwen_ple_t {
+    uint32_t rows;
+    uint32_t d;
+    uint32_t hc;
+    uint32_t pstride;
+    uint32_t voff;
+};
+
+struct mda_pc_moe_route_t {
+    uint32_t rows;
+    uint32_t experts;
+    uint32_t topk;
+    uint32_t stride;
+};
+
+struct mda_pc_moe_scan_t {
+    uint32_t experts;
+    uint32_t tile;
+};
+
+struct mda_pc_moe_scatter_t {
+    uint32_t rows;
+    uint32_t topk;
+    uint32_t d8;
+};
+
+struct mda_pc_moe_mm_t {
+    uint32_t m;
+    uint32_t n;
+    uint32_t k;
+    uint32_t sa;
+    uint32_t sb;
+};
+
+struct mda_pc_moe_combine_t {
+    uint32_t rows;
+    uint32_t d;
+    uint32_t topk;
+    uint32_t pstride;
+    uint32_t sg_off;
+    uint32_t inj_stride;
+    uint32_t inj_off;
+    uint32_t hc;
+};
+
+struct mda_pc_kd_bytes_t {
+    uint32_t rows;
+    uint32_t vocab;
+};
+
+struct mda_pc_kd_student_t {
+    uint32_t rows;
+    uint32_t vocab;
+    uint32_t slot;
+    float lambda;
 };
 
 #endif

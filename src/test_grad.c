@@ -85,10 +85,14 @@ void mda_test_grad_perturb(mda_model_t *m) {
     }
     for (uint32_t l = 0; l < m->cfg.n_layer; l += 1) {
         mda_model_layer_t *ly = &m->layers[l];
-        mda_test_grad_jitter(m->c, ly->n1, 0.2f);
-        mda_test_grad_jitter(m->c, ly->n2, 0.2f);
-        mda_test_grad_jitter(m->c, ly->shift_mix, 0.4f);
-        mda_test_grad_jitter(m->c, ly->ada, 0.004f);
+        mda_test_grad_jitter(m->c, ly->ln1_w, 0.2f);
+        mda_test_grad_jitter(m->c, ly->ln1_b, 0.2f);
+        mda_test_grad_jitter(m->c, ly->ln2_w, 0.2f);
+        mda_test_grad_jitter(m->c, ly->ln2_b, 0.2f);
+        mda_test_grad_jitter(m->c, ly->att_mix, 0.4f);
+        mda_test_grad_jitter(m->c, ly->ffn_mix, 0.4f);
+        mda_test_grad_jitter(m->c, ly->lnx_w, 0.2f);
+        mda_test_grad_jitter(m->c, ly->lnx_b, 0.2f);
         mda_test_grad_jitter(m->c, ly->w0, 1.0f);
         mda_test_grad_jitter(m->c, ly->a0, 1.0f);
         mda_test_grad_jitter(m->c, ly->v0, 1.0f);
@@ -96,7 +100,10 @@ void mda_test_grad_perturb(mda_model_t *m) {
         mda_test_grad_jitter(m->c, ly->ka, 0.4f);
         mda_test_grad_jitter(m->c, ly->rk, 0.4f);
     }
-    mda_test_grad_jitter(m->c, m->n_out, 0.2f);
+    mda_test_grad_jitter(m->c, m->ln0_w, 0.2f);
+    mda_test_grad_jitter(m->c, m->ln0_b, 0.2f);
+    mda_test_grad_jitter(m->c, m->ln_out_w, 0.2f);
+    mda_test_grad_jitter(m->c, m->ln_out_b, 0.2f);
 }
 
 uint32_t mda_test_grad_fp16(mda_step_trainer_t *tr) {
@@ -374,10 +381,10 @@ bool mda_test_grad_muon(mda_step_trainer_t *tr3, const mda_data_corpus_t *cp) {
     mda_fwd_opt_t *o = tr3->sc.opt.ptr;
     mda_model_layer_t *ly = &m->layers[0];
     bool wk = mda_test_grad_muon_param(m->c, ly->wk, w0, o->scale, lr);
-    bool gate = mda_test_grad_muon_param(m->c, ly->w_gate, w0, o->scale, lr);
-    bool down = mda_test_grad_muon_param(m->c, ly->w_down, w0, o->scale, lr);
+    bool key = mda_test_grad_muon_param(m->c, ly->w_key, w0, o->scale, lr);
+    bool val = mda_test_grad_muon_param(m->c, ly->w_val, w0, o->scale, lr);
     free(w0);
-    return wk && gate && down;
+    return wk && key && val;
 }
 
 bool mda_test_grad_skip(mda_step_trainer_t *tr) {
@@ -417,7 +424,7 @@ bool mda_test_grad_blocks(mda_vkc_t *c, mda_model_cfg_t cfg, const mda_data_corp
     if (m == NULL || mda_model_set_dec(m, dec) == false) {
         return false;
     } else {
-        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, false, NULL);
+        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, false);
         mda_test_grad_perturb(m);
         mda_data_batch(&tr.sc.batch, cp, MDA_DATA_SPLIT_TRAIN, MDA_DATA_SCHED_BELL, 5);
         m->dirty16 = true;
@@ -574,6 +581,170 @@ bool mda_test_grad_cache(mda_vkc_t *c, mda_model_cfg_t cfg, const mda_data_corpu
     }
 }
 
+void mda_test_grad_kd_inputs(mda_model_t *m, mda_fwd_scratch_t *sc) {
+    uint32_t rows = mda_fwd_kd_rows(m);
+    uint32_t vocab = m->cfg.vocab;
+    uint32_t *toks = calloc((size_t)vocab * 5, sizeof(uint32_t));
+    for (uint32_t t = 1; t < vocab; t += 1) {
+        uint8_t s[16];
+        memset(s, 0, sizeof(s));
+        uint32_t len = 1 + t % 3;
+        for (uint32_t k = 0; k < len; k += 1) {
+            s[k] = (uint8_t)('a' + mda_hash_u64(MDA_HASH_TEST, t, k) % 3);
+        }
+        memcpy(&toks[t * 5], s, 16);
+        toks[t * 5 + 4] = len;
+    }
+    mda_vkc_write(m->c, &sc->kd_toks, toks);
+    free(toks);
+    uint32_t bt = m->cfg.batch * m->cfg.seqlen;
+    for (uint32_t i = 0; i < bt; i += 1) {
+        sc->batch.target[i] = 0;
+        sc->batch.mask[i] = 0.0f;
+        sc->batch.weight[i] = 1.0f;
+    }
+    uint32_t *cont = sc->kd_cont.ptr;
+    uint32_t *tgt = sc->kd_tgt.ptr;
+    memset(tgt, 0, (size_t)rows * MDA_KD_ENTRY * sizeof(uint32_t));
+    for (uint32_t r = 0; r < rows; r += 1) {
+        uint8_t s[16];
+        for (uint32_t k = 0; k < 16; k += 1) {
+            s[k] = (uint8_t)('a' + mda_hash_u64(MDA_HASH_TEST, 1000 + r, k) % 3);
+        }
+        memcpy(&cont[r * 5], s, 16);
+        cont[r * 5 + 4] = 3;
+        for (uint32_t l = 0; l < 3; l += 1) {
+            uint32_t *e = tgt + ((size_t)r * MDA_KD_DEPTH + l) * MDA_KD_K;
+            uint32_t other = 'a' + (s[l] - 'a' + 1) % 3;
+            e[0] = s[l] | 0x3800u << 16;
+            e[1] = other | 0x34cdu << 16;
+        }
+    }
+}
+
+double mda_test_grad_kd_loss(mda_model_t *m, mda_fwd_scratch_t *sc, const float *z, const float *u, float eps) {
+    uint32_t rows = mda_fwd_kd_rows(m);
+    uint32_t n = rows * m->cfg.vocab;
+    uint32_t all = m->cfg.batch * m->cfg.seqlen * m->cfg.vocab;
+    float *w = calloc(all, sizeof(float));
+    for (uint32_t i = 0; i < n; i += 1) {
+        w[i] = z[i] + eps * u[i];
+    }
+    mda_vkc_write(m->c, &sc->logits, w);
+    free(w);
+    mda_fwd_ce(m, sc, 0, MDA_PC_NO_SLOT);
+    mda_fwd_kd_rec(m, sc);
+    const float *kl = sc->kd_loss.ptr;
+    double total = 0.0;
+    for (uint32_t r = 0; r < rows; r += 1) {
+        total += kl[r];
+    }
+    return total;
+}
+
+double mda_test_grad_kd_host(const uint32_t *toks, const uint32_t *cont, const uint32_t *tgt, const float *z, uint32_t vocab) {
+    double mx = -1e30;
+    for (uint32_t t = 0; t < vocab; t += 1) {
+        mx = fmax(mx, z[t]);
+    }
+    double se = 0.0;
+    for (uint32_t t = 0; t < vocab; t += 1) {
+        se += exp(z[t] - mx);
+    }
+    const uint8_t *cb = (const uint8_t *)cont;
+    double loss = 0.0;
+    for (uint32_t l = 0; l < cont[4]; l += 1) {
+        double mass[256];
+        memset(mass, 0, sizeof(mass));
+        for (uint32_t t = 0; t < vocab; t += 1) {
+            const uint8_t *tb = (const uint8_t *)&toks[t * 5];
+            uint32_t len = toks[t * 5 + 4];
+            uint32_t k = 0;
+            while (k < l && k < len && tb[k] == cb[k]) {
+                k += 1;
+            }
+            if (k == l && len > l) {
+                mass[tb[l]] += exp(z[t] - mx) / se;
+            }
+        }
+        double total = 0.0;
+        for (uint32_t b = 0; b < 256; b += 1) {
+            total += mass[b];
+        }
+        const uint32_t *e = tgt + (size_t)l * MDA_KD_K;
+        double pt[MDA_KD_K + 1];
+        double m[MDA_KD_K + 1];
+        double listed_pt = 0.0;
+        double listed_m = 0.0;
+        for (uint32_t j = 0; j < MDA_KD_K; j += 1) {
+            pt[j] = mda_kd_prob(e[j]);
+            m[j] = 0.0;
+            if (pt[j] > 0.0) {
+                m[j] = mass[e[j] & 0xff];
+                listed_pt += pt[j];
+                listed_m += m[j];
+            }
+        }
+        pt[MDA_KD_K] = fmax(0.0, 1.0 - listed_pt);
+        m[MDA_KD_K] = total - listed_m;
+        double z = 0.0;
+        for (uint32_t j = 0; j <= MDA_KD_K; j += 1) {
+            if (pt[j] > 0.0 && m[j] > 1e-30) {
+                z += pt[j];
+            }
+        }
+        for (uint32_t j = 0; j <= MDA_KD_K && m[0] > 0.0; j += 1) {
+            if (pt[j] > 0.0 && m[j] > 1e-30) {
+                loss += pt[j] / z * log(pt[j] / z / (m[j] / total));
+            }
+        }
+    }
+    return loss;
+}
+
+bool mda_test_grad_kd(mda_vkc_t *c, mda_model_cfg_t cfg) {
+    mda_model_t *m = mda_model_init(c, mda_model_cfg_block(cfg, MDA_MODEL_BLOCK));
+    if (m == NULL) {
+        return false;
+    } else {
+        m->kd = true;
+        m->kd_weight = 1.0f;
+        mda_fwd_scratch_t sc = mda_fwd_alloc(m, 1);
+        mda_test_grad_kd_inputs(m, &sc);
+        uint32_t n = mda_fwd_kd_rows(m) * cfg.vocab;
+        float *z = malloc(n * sizeof(float));
+        float *u = calloc(n, sizeof(float));
+        for (uint32_t i = 0; i < n; i += 1) {
+            z[i] = mda_hash_normal(MDA_HASH_TEST, 77, i);
+        }
+        double l0 = mda_test_grad_kd_loss(m, &sc, z, u, 0.0f);
+        float *g = mda_vkc_read(c, &sc.dkd);
+        uint32_t *toks = mda_vkc_read(c, &sc.kd_toks);
+        double host = 0.0;
+        for (uint32_t r = 0; r < mda_fwd_kd_rows(m); r += 1) {
+            host += mda_test_grad_kd_host(toks, (const uint32_t *)sc.kd_cont.ptr + r * 5, (const uint32_t *)sc.kd_tgt.ptr + (size_t)r * MDA_KD_ENTRY, z + (size_t)r * cfg.vocab, cfg.vocab);
+        }
+        free(toks);
+        printf("byte KD loss: kernel %.6f host %.6f\n", l0, host);
+        double analytic = 0.0;
+        for (uint32_t i = 0; i < n; i += 1) {
+            u[i] = mda_test_grad_sign(g[i] >= 0.0f);
+            analytic += (double)g[i] * u[i];
+        }
+        float eps = 1e-2f;
+        double big = (mda_test_grad_kd_loss(m, &sc, z, u, eps) - mda_test_grad_kd_loss(m, &sc, z, u, -eps)) / (2.0 * eps);
+        double half = (mda_test_grad_kd_loss(m, &sc, z, u, 0.5f * eps) - mda_test_grad_kd_loss(m, &sc, z, u, -0.5f * eps)) / eps;
+        double numeric = (4.0 * half - big) / 3.0;
+        double rel = fabs(analytic - numeric) / fmax(fabs(analytic), 1e-12);
+        bool ok = c->fail == false && rel < 0.01 && fabs(l0 - host) <= 1e-3 * fabs(host);
+        printf("byte KD gradient: analytic %+.6e numeric %+.6e rel %.4f %s\n", analytic, numeric, rel, mda_util_verdict(ok));
+        free(z);
+        free(u);
+        free(g);
+        return ok;
+    }
+}
+
 bool mda_test_grad_trainer(mda_step_trainer_t *tr, mda_step_trainer_t *tr2, mda_step_trainer_t *tr3) {
     mda_model_t *m = tr->m;
     mda_test_grad_perturb(m);
@@ -610,8 +781,9 @@ bool mda_test_grad_trainer(mda_step_trainer_t *tr, mda_step_trainer_t *tr2, mda_
     mda_model_cfg_t wide = m->cfg;
     wide.batch = 4;
     bool split_cache_ok = mda_test_grad_cache(m->c, wide, &cp, 1);
+    bool kd_ok = mda_test_grad_kd(m->c, m->cfg);
     free(cids);
-    return m->c->fail == false && loss_ok && fp16_fails == 0 && fd_fails == 0 && accum_ok && opt_ok && muon_ok && skip_ok && causal_ok && block_ok && split_ok && one_ok && order_ok && cache_ok && split_cache_ok;
+    return m->c->fail == false && loss_ok && fp16_fails == 0 && fd_fails == 0 && accum_ok && opt_ok && muon_ok && skip_ok && causal_ok && block_ok && split_ok && one_ok && order_ok && cache_ok && split_cache_ok && kd_ok;
 }
 
 bool mda_test_grad_device(mda_vkc_t *c) {
@@ -621,16 +793,22 @@ bool mda_test_grad_device(mda_vkc_t *c) {
         .n_head = 2,
         .seqlen = 32,
         .batch = 2,
-        .ffn_hidden = 192,
+        .ffn_hidden = 256,
         .vocab = 64,
+        .lora = {
+            64,
+            64,
+            64,
+            128,
+        },
     };
     mda_model_t *m = mda_model_init(c, cfg);
     if (m == NULL) {
         return false;
     } else {
-        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, false, NULL);
-        mda_step_trainer_t tr2 = mda_step_init(m, 1.0f, 2, false, NULL);
-        mda_step_trainer_t tr3 = mda_step_init(m, 1.0f, 1, true, NULL);
+        mda_step_trainer_t tr = mda_step_init(m, 1.0f, 1, false);
+        mda_step_trainer_t tr2 = mda_step_init(m, 1.0f, 2, false);
+        mda_step_trainer_t tr3 = mda_step_init(m, 1.0f, 1, true);
         if (c->fail) {
             return false;
         } else {

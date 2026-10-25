@@ -1,0 +1,93 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float x[]; };
+layout(std430, binding = 1) readonly buffer B1 { float w[]; };
+layout(std430, binding = 2) writeonly buffer B2 { float y[]; };
+layout(std430, binding = 3) readonly buffer B3 { float z[]; };
+layout(push_constant) uniform pc {
+    uint rows;
+    uint groups;
+    uint gsize;
+    uint in_stride;
+    uint in_off;
+    uint in_gstride;
+    uint out_stride;
+    uint out_off;
+    uint out_gstride;
+    uint w_off;
+    uint wstride;
+    uint op;
+    uint rot;
+    uint seqlen;
+    uint z_stride;
+    uint z_off;
+    uint z_gstride;
+    float eps;
+    float scale;
+    float theta;
+};
+
+shared float red[256];
+
+float reduce_sum(float v, uint lid) {
+    red[lid] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            red[lid] += red[lid + s];
+        }
+        barrier();
+    }
+    return red[0];
+}
+
+float weight(uint wi) {
+    if (op == 0u || op == 3u) {
+        return 1.0 + w[wi];
+    } else if (op == 2u) {
+        return w[wi];
+    } else {
+        return 1.0;
+    }
+}
+
+float factor(float ss) {
+    if (op == 1u) {
+        return scale * inversesqrt(ss + 1e-6);
+    } else {
+        return inversesqrt(ss / float(gsize) + eps);
+    }
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint r = gl_WorkGroupID.x / groups;
+    uint g = gl_WorkGroupID.x % groups;
+    uint xi = r * in_stride + in_off + g * in_gstride;
+    uint yi = r * out_stride + out_off + g * out_gstride;
+    uint zi = r * z_stride + z_off + g * z_gstride;
+    uint wi = w_off + g * wstride;
+    float acc = 0.0;
+    for (uint c = lid; c < gsize; c += 256u) {
+        acc += x[xi + c] * x[xi + c];
+    }
+    float f = factor(reduce_sum(acc, lid));
+    uint half_rot = rot / 2u;
+    float pos = float(r % seqlen);
+    for (uint c = lid; c < gsize; c += 256u) {
+        float v = x[xi + c] * f * weight(wi + c);
+        if (op == 2u) {
+            y[yi + c] = v / (1.0 + exp(-z[zi + c]));
+        } else if (op == 3u && c < half_rot) {
+            float u = x[xi + c + half_rot] * f * weight(wi + c + half_rot);
+            float ang = pos * pow(theta, -float(2u * c) / float(rot));
+            float cs = cos(ang);
+            float sn = sin(ang);
+            y[yi + c] = v * cs - u * sn;
+            y[yi + c + half_rot] = u * cs + v * sn;
+        } else if (op != 3u || c >= rot) {
+            y[yi + c] = v;
+        }
+    }
+}

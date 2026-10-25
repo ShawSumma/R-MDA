@@ -2,27 +2,13 @@
 #extension GL_EXT_shader_atomic_float : require
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer buf_x {
-    float x[];
-};
-layout(std430, binding = 1) readonly buffer buf_mix {
-    float mix[];
-};
-layout(std430, binding = 2) buffer buf_out {
-    float outp[];
-};
-layout(std430, binding = 3) buffer buf_dx {
-    float dx[];
-};
-layout(std430, binding = 4) buffer buf_dmix {
-    float dmix[];
-};
-layout(std430, binding = 5) readonly buffer buf_carry_in {
-    float carry_in[];
-};
-layout(std430, binding = 6) writeonly buffer buf_carry_out {
-    float carry_out[];
-};
+layout(std430, binding = 0) readonly buffer B0 { float x[]; };
+layout(std430, binding = 1) readonly buffer B1 { float mix[]; };
+layout(std430, binding = 2) buffer B2 { float outp[]; };
+layout(std430, binding = 3) buffer B3 { float dx[]; };
+layout(std430, binding = 4) buffer B4 { float dmix[]; };
+layout(std430, binding = 5) readonly buffer B5 { float carry_in[]; };
+layout(std430, binding = 6) writeonly buffer B6 { float carry_out[]; };
 layout(push_constant) uniform pc {
     uint bt;
     uint d;
@@ -31,6 +17,9 @@ layout(push_constant) uniform pc {
     uint blk;
     uint nclean;
     uint cache;
+    uint nmix;
+    uint sec;
+    uint rows_per;
 };
 
 bool clean_row(uint row) {
@@ -52,23 +41,56 @@ float previous(uint row, uint col) {
     }
 }
 
-void main() {
-    uint idx = gl_GlobalInvocationID.x;
+void forward(uint idx) {
     uint row = idx / d;
     uint col = idx % d;
-    if (idx < bt * d && op == 0) {
-        float m = mix[col];
-        outp[idx] = m * x[idx] + (1.0 - m) * previous(row, col);
-        if (cache == 1u && clean_row(row) && row % seqlen == seqlen - 1u) {
-            carry_out[(row / seqlen) * d + col] = x[idx];
+    float xi = x[idx];
+    float p = previous(row, col);
+    for (uint s = 0u; s < nmix; s += 1u) {
+        outp[s * sec + idx] = xi + (p - xi) * mix[s * d + col];
+    }
+    if (cache == 1u && clean_row(row) && row % seqlen == seqlen - 1u) {
+        carry_out[(row / seqlen) * d + col] = xi;
+    }
+}
+
+void backward_x(uint idx) {
+    uint row = idx / d;
+    uint col = idx % d;
+    bool feeds = row + 1u < bt && first(row + 1u) == false;
+    float g = 0.0;
+    for (uint s = 0u; s < nmix; s += 1u) {
+        float m = mix[s * d + col];
+        g += (1.0 - m) * outp[s * sec + idx];
+        if (feeds) {
+            g += m * outp[s * sec + idx + d];
         }
-    } else if (idx < bt * d) {
-        float m = mix[col];
-        float dout = outp[idx];
-        atomicAdd(dmix[col], (x[idx] - previous(row, col)) * dout);
-        atomicAdd(dx[idx], m * dout);
-        if (first(row) == false) {
-            atomicAdd(dx[(row - 1u) * d + col], (1.0 - m) * dout);
+    }
+    dx[idx] += g;
+}
+
+void backward_mix(uint gid) {
+    uint col = gid % d;
+    uint s = (gid / d) % nmix;
+    uint r0 = gid / (d * nmix) * rows_per;
+    if (r0 < bt) {
+        uint r1 = min(r0 + rows_per, bt);
+        float acc = 0.0;
+        for (uint r = r0; r < r1; r += 1u) {
+            uint idx = r * d + col;
+            acc += (previous(r, col) - x[idx]) * outp[s * sec + idx];
         }
+        atomicAdd(dmix[s * d + col], acc);
+    }
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (op == 0u && gid < bt * d) {
+        forward(gid);
+    } else if (op == 1u && gid < bt * d) {
+        backward_x(gid);
+    } else if (op == 2u) {
+        backward_mix(gid);
     }
 }

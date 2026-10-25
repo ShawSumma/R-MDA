@@ -1,0 +1,62 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float proj[]; };
+layout(std430, binding = 1) writeonly buffer B1 { uint idx[]; };
+layout(std430, binding = 2) writeonly buffer B2 { float wt[]; };
+layout(std430, binding = 3) buffer B3 { uint count[]; };
+layout(push_constant) uniform pc {
+    uint rows;
+    uint experts;
+    uint topk;
+    uint stride;
+};
+
+const uint PER = 16u;
+const uint MAXK = 16u;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    float l[PER];
+    for (uint j = 0u; j < PER; j += 1u) {
+        l[j] = proj[r * stride + lane * PER + j];
+    }
+    uint taken = 0u;
+    uint sel[MAXK];
+    float sv[MAXK];
+    for (uint k = 0u; k < topk; k += 1u) {
+        float lb = -3.0e38;
+        uint li = ~0u;
+        for (uint j = 0u; j < PER; j += 1u) {
+            if (((taken >> j) & 1u) == 0u && l[j] > lb) {
+                lb = l[j];
+                li = lane * PER + j;
+            }
+        }
+        float gm = subgroupMax(lb);
+        uint cand = ~0u;
+        if (lb == gm) {
+            cand = li;
+        }
+        uint gi = subgroupMin(cand);
+        if (gi / PER == lane) {
+            taken = taken | (1u << (gi % PER));
+        }
+        sel[k] = gi;
+        sv[k] = gm;
+    }
+    if (lane == 0u) {
+        float z = 0.0;
+        for (uint k = 0u; k < topk; k += 1u) {
+            z += exp(sv[k] - sv[0]);
+        }
+        for (uint k = 0u; k < topk; k += 1u) {
+            idx[r * topk + k] = sel[k];
+            wt[r * topk + k] = exp(sv[k] - sv[0]) / z;
+            atomicAdd(count[sel[k]], 1u);
+        }
+    }
+}

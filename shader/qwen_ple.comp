@@ -1,0 +1,45 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { float kn[]; };
+layout(std430, binding = 1) readonly buffer B1 { float qn[]; };
+layout(std430, binding = 2) readonly buffer B2 { float pv[]; };
+layout(std430, binding = 3) writeonly buffer B3 { float gated[]; };
+layout(push_constant) uniform pc {
+    uint rows;
+    uint d;
+    uint hc;
+    uint pstride;
+    uint voff;
+};
+
+shared float red[256];
+
+float reduce_sum(float v, uint lid) {
+    red[lid] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            red[lid] += red[lid + s];
+        }
+        barrier();
+    }
+    return red[0];
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint r = gl_WorkGroupID.x / hc;
+    uint s = gl_WorkGroupID.x % hc;
+    uint base = r * hc * d + s * d;
+    float acc = 0.0;
+    for (uint c = lid; c < d; c += 256u) {
+        acc += kn[base + c] * qn[base + c];
+    }
+    float g = reduce_sum(acc, lid) / sqrt(float(d));
+    float a = sign(g) * sqrt(max(abs(g), 1e-6));
+    float sg = 1.0 / (1.0 + exp(-a));
+    for (uint c = lid; c < d; c += 256u) {
+        gated[base + c] = sg * pv[r * pstride + voff + c];
+    }
+}

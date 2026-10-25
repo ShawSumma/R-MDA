@@ -62,7 +62,7 @@ void main() {
         k = KV[ui];
         kap = k * WALL[kk + ch];
     }
-    float scale = 1.0 / (sqrt(group_sum(kap * kap, lid)) + 1e-6);
+    float scale = 1.0 / max(sqrt(group_sum(kap * kap, lid)), 1e-12);
     float a = 0.0;
     float kt = 0.0;
     float r = 0.0;
@@ -79,7 +79,7 @@ void main() {
             V0[ui] = vp;
         } else {
             float vg = sigmoidf(RAW[5u * n + ui] + WALL[v0 + ch]);
-            v = V0[ui] + vg * (vp - V0[ui]);
+            v = vp + vg * (V0[ui] - vp);
             VG[ui] = vg;
         }
         HEADS[pi] = kap * scale;

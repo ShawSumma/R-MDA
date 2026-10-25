@@ -94,6 +94,12 @@ bool mda_test_ckpt_device(mda_vkc_t *c) {
         .batch = 2,
         .ffn_hidden = 128,
         .vocab = 64,
+        .lora = {
+            64,
+            64,
+            64,
+            64,
+        },
     };
     mda_model_t *m = mda_model_init(c, cfg);
     if (m == NULL) {

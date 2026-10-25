@@ -1,0 +1,24 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer B0 { uint ids[]; };
+layout(std430, binding = 1) readonly buffer B1 { uint emb[]; };
+layout(std430, binding = 2) writeonly buffer B2 { float H[]; };
+layout(push_constant) uniform pc {
+    uint rows;
+    uint d;
+    uint hc;
+};
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < rows * d) {
+        uint r = i / d;
+        uint c = i % d;
+        uint e = ids[r] * d + c;
+        float v = uintBitsToFloat(((emb[e >> 1] >> ((e & 1u) * 16u)) & 0xffffu) << 16);
+        for (uint s = 0u; s < hc; s += 1u) {
+            H[r * hc * d + s * d + c] = v;
+        }
+    }
+}

@@ -1,6 +1,6 @@
-"""Write src/unicode.c: the code point ranges of Unicode letters (L*) and numbers (N*) from
-Python's unicodedata, the classes the GPT-2 pre-tokenizer regex uses as \\p{L} and \\p{N}.
-Rerun after a Python upgrade changes the Unicode version.
+"""Write src/unicode.c: the code point ranges of Unicode letters (L*), numbers (N*) and
+marks (M*) from Python's unicodedata, the classes the Qwen pre-tokenizer regex uses as
+\\p{L}, \\p{N} and \\p{M}. Rerun after a Python upgrade changes the Unicode version.
 
     python3 tools/gen_unicode.py
 """
@@ -31,11 +31,14 @@ def table(name: str, rs: list[tuple[int, int]]) -> str:
 def main() -> None:
     letters = ranges("L")
     numbers = ranges("N")
+    marks = ranges("M")
     OUT.write_text(
         '#include "unicode.h"\n\n'
         + table("mda_unicode_letters", letters)
         + "\n"
         + table("mda_unicode_numbers", numbers)
+        + "\n"
+        + table("mda_unicode_marks", marks)
         + f"""
 bool mda_unicode_in(const uint32_t (*rs)[2], uint32_t n, uint32_t cp) {{
     uint32_t lo = 0;
@@ -58,9 +61,13 @@ bool mda_unicode_letter(uint32_t cp) {{
 bool mda_unicode_number(uint32_t cp) {{
     return mda_unicode_in(mda_unicode_numbers, {len(numbers)}, cp);
 }}
+
+bool mda_unicode_mark(uint32_t cp) {{
+    return mda_unicode_in(mda_unicode_marks, {len(marks)}, cp);
+}}
 """
     )
-    print(f"{OUT}: Unicode {unicodedata.unidata_version}, {len(letters)} letter and {len(numbers)} number ranges")
+    print(f"{OUT}: Unicode {unicodedata.unidata_version}, {len(letters)} letter, {len(numbers)} number and {len(marks)} mark ranges")
 
 
 if __name__ == "__main__":
